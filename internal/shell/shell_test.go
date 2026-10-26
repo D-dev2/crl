@@ -116,15 +116,12 @@ func TestMintRequestsFilterAndHistory(t *testing.T) {
 	}
 }
 
-func TestMintShowMasksSecrets(t *testing.T) {
+func TestMintShowIncludesFullHeaders(t *testing.T) {
 	sh, out, _, hist, _ := newTestShell(t, "")
 	addCapture(t, hist)
 	sh.Execute("mint.request.show 1")
 	text := out.String()
-	if strings.Contains(text, "supersecret") || strings.Contains(text, "session=abc") {
-		t.Fatalf("show leaked secret:\n%s", text)
-	}
-	for _, want := range []string{"Capture #1", "Bearer ***", "Set-Cookie: ***", "token=***", "200 OK", "24ms", "/users/v1/login"} {
+	for _, want := range []string{"Capture #1", "Bearer supersecret", "Cookie: session=abc", "Set-Cookie: session=abc", "token=supersecret", "200 OK", "24ms", "/users/v1/login"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("show missing %q:\n%s", want, text)
 		}
@@ -165,8 +162,8 @@ func TestMintSelectAndUse(t *testing.T) {
 	}
 	out.Reset()
 	sh.Execute("crl.show")
-	if strings.Contains(out.String(), "supersecret") || strings.Contains(out.String(), "session=abc") {
-		t.Fatalf("crl.show leaked secret:\n%s", out.String())
+	if !strings.Contains(out.String(), "Bearer supersecret") || !strings.Contains(out.String(), "session=abc") {
+		t.Fatalf("crl.show did not show full headers:\n%s", out.String())
 	}
 }
 
@@ -307,7 +304,7 @@ func TestProxyPriorityInShow(t *testing.T) {
 	}
 }
 
-func TestCRLCommandsAndMasking(t *testing.T) {
+func TestCRLCommandsShowFullHeaders(t *testing.T) {
 	sh, out, _, _, builder := newTestShell(t, "")
 	sh.Execute("crl.host http://127.0.0.1:5002/a%2Fb?x=1&x=2&empty=&token=abc")
 	sh.Execute("crl.method PUT")
@@ -315,11 +312,8 @@ func TestCRLCommandsAndMasking(t *testing.T) {
 	sh.Execute("crl.json {\"a\":1}")
 	sh.Execute("crl.show")
 	text := out.String()
-	if strings.Contains(text, "verysecret") || strings.Contains(text, "token=abc") {
-		t.Fatalf("crl.show leaked secret:\n%s", text)
-	}
-	if !strings.Contains(text, "Bearer ***") || !strings.Contains(text, "token=***") {
-		t.Fatalf("masking missing:\n%s", text)
+	if !strings.Contains(text, "Bearer verysecret") || !strings.Contains(text, "token=abc") {
+		t.Fatalf("full header or URL values missing:\n%s", text)
 	}
 	if builder.URL() != "http://127.0.0.1:5002/a%2Fb?x=1&x=2&empty=&token=abc" {
 		t.Fatalf("URL changed: %q", builder.URL())
@@ -328,6 +322,80 @@ func TestCRLCommandsAndMasking(t *testing.T) {
 	sh.Execute("crl.table")
 	if !strings.Contains(out.String(), "MÉTHODE") || !strings.Contains(out.String(), "PUT") {
 		t.Fatalf("table output:\n%s", out.String())
+	}
+}
+
+func TestJSONClearAliasesAndReset(t *testing.T) {
+	sh, out, _, _, builder := newTestShell(t, "")
+	sh.Execute("crl.method POST")
+	sh.Execute("crl.head X-Keep: yes")
+	sh.Execute(`crl.json {"a":1}`)
+	sh.Execute("crl.json clear")
+	if builder.BodySet() || builder.BodySize() != 0 || builder.Method() != "POST" || builder.Headers()[0].Value != "yes" {
+		t.Fatalf("clear modified unrelated request state: method=%q headers=%#v bodySet=%v", builder.Method(), builder.Headers(), builder.BodySet())
+	}
+	sh.Execute("crl.show")
+	if !strings.Contains(out.String(), "Corps (vide / non défini)") {
+		t.Fatalf("empty body not reported:\n%s", out.String())
+	}
+	sh.Execute(`crl.json {"b":2}`)
+	if !builder.BodySet() || string(builder.Body()) != `{"b":2}` || builder.ContentType() != "application/json" {
+		t.Fatalf("new JSON not configured: %#v", builder)
+	}
+	sh.Execute("crl.body.clear")
+	if builder.BodySet() {
+		t.Fatal("crl.body.clear did not clear body")
+	}
+}
+
+func TestMintWatchOffQueuesEventsAndMintRequestsRemainAvailable(t *testing.T) {
+	hist := mint.NewHistory(mint.DefaultHistoryConfig())
+	mgr, err := mint.NewManager(mint.DefaultConfig(), hist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Close()
+	notifications := make(chan mint.Notification, 2)
+	var out bytes.Buffer
+	sh, err := New(Options{In: strings.NewReader(""), Out: &out, Manager: mgr, Notifications: notifications})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(sh.Close)
+	sh.Execute("mint.watch off")
+	notifications <- mint.Notification{Kind: "request", ID: 7, Method: "GET", URL: "http://example.test/path"}
+	sh.drainNotifications(false)
+	if len(sh.pendingEvents) != 1 {
+		t.Fatalf("queued events = %d", len(sh.pendingEvents))
+	}
+	sh.Execute("mint.events")
+	if len(sh.pendingEvents) != 0 || !strings.Contains(out.String(), "#7") {
+		t.Fatalf("events not displayed/cleared:\n%s", out.String())
+	}
+	addCapture(t, hist)
+	out.Reset()
+	sh.Execute("mint.requests")
+	if !strings.Contains(out.String(), "/users/v1/login") {
+		t.Fatalf("watch off hid stored captures:\n%s", out.String())
+	}
+}
+
+func TestReportMintCaptureShowsObservedHeaderDifferences(t *testing.T) {
+	sh, out, _, hist, builder := newTestShell(t, "")
+	started := time.Now()
+	_ = builder.SetURL("http://example.test/path")
+	_ = builder.SetMethod("GET")
+	_ = builder.SetHeader("Authorization", "Bearer prepared")
+	hist.AddRequest(mint.BridgeEvent{
+		Type: "request", FlowID: "diff-flow", Timestamp: started,
+		Method: "GET", URL: "http://example.test/path",
+		Headers: []mint.Header{{Name: "Authorization", Value: "Bearer captured"}, {Name: "X-Extra", Value: "seen"}},
+	})
+	sh.reportMintCapture(started)
+	for _, want := range []string{"Capture réellement observée", "Authorization", "X-Extra", "valeur préparée absente ou différente"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("missing %q:\n%s", want, out.String())
+		}
 	}
 }
 
@@ -348,20 +416,28 @@ func TestLaunchUsesCurl(t *testing.T) {
 		t.Skip("curl absent")
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer replay-token" || r.Header.Get("Cookie") != "session=replay-cookie" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
 		w.Header().Set("X-Server", "test")
 		w.WriteHeader(http.StatusCreated)
 		_, _ = w.Write([]byte("hello-from-server"))
 	}))
 	defer srv.Close()
 
-	sh, out, _, _, builder := newTestShell(t, "")
-	_ = builder.SetURL(srv.URL + "/x?y=1")
-	if err := builder.SetMethod("POST"); err != nil {
-		t.Fatal(err)
-	}
-	if err := builder.SetJSON(`{"a":1}`); err != nil {
-		t.Fatal(err)
-	}
+	sh, out, _, hist, _ := newTestShell(t, "")
+	hist.AddRequest(mint.BridgeEvent{
+		Type: "request", FlowID: "replay-flow", Timestamp: time.Now(),
+		Method: "POST", URL: srv.URL + "/x?y=1",
+		Headers: []mint.Header{
+			{Name: "Authorization", Value: "Bearer replay-token"},
+			{Name: "Cookie", Value: "session=replay-cookie"},
+			{Name: "Content-Type", Value: "application/json"},
+		},
+		Body: []byte(`{"a":1}`), BodySize: 7,
+	})
+	sh.Execute("mint.use 1 --force")
 	sh.Execute("crl.launch")
 	text := out.String()
 	for _, want := range []string{"201", "X-Server: test", "hello-from-server"} {
@@ -431,8 +507,8 @@ func TestLaunchHTTPResponseLayoutAndPrettyJSON(t *testing.T) {
 	if strings.Contains(text, `{"b":2`) {
 		t.Fatalf("JSON not pretty-printed:\n%s", text)
 	}
-	if strings.Contains(text, "token=secret") || strings.Contains(text, "session=secret") {
-		t.Fatalf("launch leaked secret:\n%s", text)
+	if !strings.Contains(text, "Set-Cookie: session=secret") {
+		t.Fatalf("full response header missing:\n%s", text)
 	}
 	if strings.Contains(text, "\033[") {
 		t.Fatalf("launch emitted ANSI on a non-terminal buffer:\n%s", text)
@@ -494,6 +570,39 @@ func TestLaunchHTTPErrorHTML(t *testing.T) {
 	}
 	if strings.Contains(text, "Corps de la réponse — JSON") {
 		t.Fatalf("HTML response presented as JSON:\n%s", text)
+	}
+}
+
+func TestLaunchHTTPStatusDiagnostics(t *testing.T) {
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skip("curl absent")
+	}
+	for _, code := range []int{200, 400, 401, 403, 404} {
+		t.Run(strconv.Itoa(code), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("X-Diagnostic", "visible")
+				w.Header().Set("Content-Type", "text/plain")
+				w.WriteHeader(code)
+				_, _ = w.Write([]byte("body-" + strconv.Itoa(code)))
+			}))
+			defer srv.Close()
+			sh, out, _, _, builder := newTestShell(t, "")
+			_ = builder.SetURL(srv.URL + "/path?q=1")
+			_ = builder.SetMethod("GET")
+			sh.Execute("crl.launch")
+			text := out.String()
+			for _, want := range []string{strconv.Itoa(code), "GET", "/path?q=1", "X-Diagnostic: visible", "body-" + strconv.Itoa(code), "Durée"} {
+				if !strings.Contains(text, want) {
+					t.Fatalf("missing %q:\n%s", want, text)
+				}
+			}
+			if code == 403 && !strings.Contains(text, "ne prouve pas que l'authentification est absente") {
+				t.Fatalf("403 diagnostic overclaims:\n%s", text)
+			}
+			if code == 404 && !strings.Contains(text, "vérifiez le chemin, les paramètres") {
+				t.Fatalf("404 diagnostic missing:\n%s", text)
+			}
+		})
 	}
 }
 

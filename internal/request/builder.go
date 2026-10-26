@@ -279,7 +279,7 @@ func (b *Builder) Import(c CapturedRequest) error {
 	b.headers = nil
 	for _, h := range c.Headers {
 		name := strings.TrimSpace(h.Name)
-		value := strings.TrimSpace(h.Value)
+		value := h.Value
 		if err := ValidateHeader(name, value); err != nil {
 			return fmt.Errorf("en-tête capturé invalide (%s) : %w", name, err)
 		}

@@ -79,6 +79,23 @@ if ! command -v mitmdump >/dev/null 2>&1; then
 	echo "avertissement : mitmdump est absent ; Mint restera désactivé jusqu'à l'installation de mitmproxy." >&2
 fi
 
+# Évite une compilation obscure si le binaire Go et son GOROOT proviennent de
+# versions différentes (par exemple /usr/local/go/bin/go avec un GOROOT asdf).
+GO_VERSION=$("$GO_BIN" version | awk '{print $3}')
+GO_ROOT=$("$GO_BIN" env GOROOT)
+if [ -r "$GO_ROOT/VERSION" ]; then
+	ROOT_VERSION=$(sed -n '1p' "$GO_ROOT/VERSION")
+	if [ "$GO_VERSION" != "$ROOT_VERSION" ]; then
+		cat >&2 <<EOF
+erreur : installation Go incohérente.
+Le compilateur sélectionné est $GO_VERSION, mais $GO_ROOT contient $ROOT_VERSION.
+Sélectionnez le binaire Go et le GOROOT de la même installation, puis relancez.
+Vous pouvez choisir le binaire avec : GO=/chemin/vers/go sh scripts/install.sh
+EOF
+		exit 1
+	fi
+fi
+
 mkdir -p "$BINDIR" "$DATADIR"
 TMP_BUILD=$(mktemp "${TMPDIR:-/tmp}/crl-build.XXXXXX")
 TMP_INSTALL=$(mktemp "$BINDIR/.crl-install.XXXXXX")

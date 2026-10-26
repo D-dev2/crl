@@ -206,8 +206,10 @@ crl.launch
 
 `crl.output auto` rétablit la détection automatique.
 
-`crl.show` et `crl.table` masquent les valeurs sensibles. Les données réelles
-sont conservées pour `crl.launch`.
+`crl.show` et `mint.request.show` affichent les valeurs complètes des en-têtes
+de requête et de réponse, y compris les valeurs d'authentification et les
+cookies. Attention à ne pas partager ces sorties. Les tableaux et notifications
+Mint restent limités aux informations d'identification d'une requête.
 
 ### Capturer une requête avec Mint et l'importer
 
@@ -239,17 +241,18 @@ utilise automatiquement le proxy Mint. L'historique reste disponible après
 | `crl.host` | affiche l'URL courante (masquée) |
 | `crl.method <méthode>` | définit la méthode HTTP (normalisée en majuscules) |
 | `crl.head <Nom: valeur>` | ajoute ou remplace un en-tête (alias : `crl.header`) |
-| `crl.head` | liste les en-têtes (valeurs sensibles masquées) |
+| `crl.head` | liste les en-têtes avec leurs valeurs complètes |
 | `crl.head clear [Nom]` | supprime un en-tête nommé, ou tous sans argument |
 | `crl.head.clear [Nom]` | variante explicite de la commande précédente |
 | `crl.json <json>` | définit un corps JSON valide et `Content-Type: application/json` |
+| `crl.json clear` | efface le corps sans modifier méthode ni en-têtes |
 | `crl.body <texte>` | définit un corps brut, sans modifier le `Content-Type` |
 | `crl.body` | affiche le corps courant |
 | `crl.body.clear` | supprime le corps |
 | `crl.proxy <url\|none\|auto>` | proxy explicite ; `none` désactive tout proxy ; `auto`, `clear` ou `unset` réactive le proxy Mint automatique |
 | `crl.proxy` | affiche le proxy explicite et le proxy effectif |
 | `crl.ca <fichier\|off>` | utilise un fichier CA PEM pour curl, sans désactiver la vérification TLS ; `off`/`none`/`clear` revient au bundle système |
-| `crl.show` | affiche la requête préparée, sans l'envoyer |
+| `crl.show` | affiche la requête préparée et ses en-têtes complets, sans l'envoyer |
 | `crl.table` | affiche un tableau récapitulatif |
 | `crl.output [auto\|raw\|pretty]` | choisit le format d'affichage du corps des réponses ; sans argument, affiche le mode courant |
 | `crl.launch` | envoie la requête avec `curl` et présente la réponse |
@@ -272,6 +275,11 @@ Notes :
   l'affichage : les octets bruts restent disponibles dans le fichier indiqué.
 - Un statut HTTP 4xx ou 5xx est une réponse réelle du serveur, pas une erreur de
   connexion. Les délais dépassés et les erreurs réseau sont présentés séparément.
+- Les réponses 400, 401, 403 et 404 affichent une indication de diagnostic.
+  Quand `crl.launch` utilise le proxy Mint, CRL cherche une capture récente de
+  même méthode et URL et signale les différences d'en-têtes observées. En cas de
+  trafic concurrent ou de capture absente, la corrélation n'est pas certaine ;
+  vérifiez `mint.requests` et `mint.request.show <id>` manuellement.
 - L'affichage du corps est limité à 32 Kio ; toute troncature est signalée et le
   chemin du corps complet est affiché. Le fichier temporaire est supprimé au
   prochain `crl.launch` ou à la fermeture du shell.
@@ -286,8 +294,10 @@ Notes :
 | `mint.proxy config` | configuration effective et prérequis |
 | `mint.proxy.port <port>` | change le port d'écoute ; refusé si le proxy n'est pas arrêté |
 | `mint.requests` | liste les captures, filtre appliqué |
+| `mint.watch on\|off` | active ou suspend les notifications automatiques ; les captures restent enregistrées |
+| `mint.events` | affiche les notifications mises en attente pendant `mint.watch off` |
 | `mint.history` | liste tout l'historique, sans filtre |
-| `mint.request.show <id>` | détail d'une capture (alias : `mint.show`) |
+| `mint.request.show <id>` | détail complet d'une capture (alias : `mint.show`) |
 | `mint.select <id>` | sélectionne une capture |
 | `mint.selected` | affiche la capture sélectionnée |
 | `mint.filter <texte>` | filtre localement par hôte, URL, chemin ou chaîne de requête |
@@ -543,9 +553,10 @@ capture est alors marquée incomplète ou en attente.
   de confiance côté client.
 - **Pas d'interception transparente** : Mint ne modifie pas les règles réseau du
   système.
-- **Corps affichés en clair** : `mint.request.show` masque les en-têtes et les
-  paramètres d'URL sensibles, mais affiche les corps de requête et de réponse
-  tels quels. Ne montrez pas l'écran si un corps contient un secret.
+- **Données sensibles affichées** : les commandes d'inspection affichent les
+  valeurs d'en-têtes et les corps tels quels. Protégez leurs sorties si elles
+  contiennent des secrets. Les URL dans les tableaux restent formatées pour
+  limiter le bruit.
 - **Troncature** : les corps dépassant `MINT_MAX_BODY_BYTES` sont tronqués et
   signalés. Un corps de requête tronqué bloque l'import.
 - **Filtre local** : `mint.filter` ne fait qu'un filtrage de texte insensible à
@@ -665,6 +676,32 @@ Fichiers importants :
 | `scripts/install-fish-path.sh` | configuration du PATH universel de Fish |
 
 ## Dépannage
+
+**`compile: version "go1.22.2" does not match go tool version "go1.23.6"`**
+
+Le compilateur et la bibliothèque standard proviennent de deux installations Go
+différentes. Changer la ligne `go` de `go.mod` ou vider le cache ne corrige pas
+un `GOROOT` qui pointe vers une ancienne installation. Le script d'installation
+vérifie maintenant ce décalage et affiche une erreur explicite. Vérifiez les
+chemins avec :
+
+```sh
+type -a go
+go version
+go env GOROOT GOTOOLDIR GOCACHE
+env | grep '^GO'
+```
+
+Sélectionnez ensuite le binaire et le `GOROOT` d'une même installation. Avec
+asdf, installez la version requise puis donnez son binaire au script :
+
+```sh
+asdf install golang 1.23.6
+GOROOT=/chemin/vers/goroot GO=/chemin/vers/go/bin/go sh scripts/install.sh
+```
+
+Remplacez les deux chemins par ceux de l'installation asdf. `go version` et
+`go env GOROOT` doivent désigner la même version de Go.
 
 **`mitmdump introuvable dans PATH`**
 

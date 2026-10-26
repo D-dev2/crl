@@ -59,6 +59,8 @@ type Shell struct {
 
 	outputMode      response.Mode
 	lastResponseDir string
+	mintWatch       bool
+	pendingEvents   []mint.Notification
 }
 
 type trackingWriter struct {
@@ -102,6 +104,7 @@ func New(opts Options) (*Shell, error) {
 		manager:    opts.Manager,
 		history:    opts.Manager.History(),
 		notifs:     opts.Notifications,
+		mintWatch:  true,
 		scanner:    bufio.NewScanner(opts.In),
 		pal:        termstyle.New(opts.Out),
 		outputMode: response.ModeAuto,
@@ -170,7 +173,11 @@ func (s *Shell) runInteractive(ctx context.Context) error {
 				s.notifs = nil
 				continue
 			}
-			s.editor.Notify(s.formatNotification(n))
+			if s.mintWatch {
+				s.editor.Notify(s.formatNotification(n))
+			} else {
+				s.pendingEvents = append(s.pendingEvents, n)
+			}
 		case data, ok := <-s.inputCh:
 			if !ok {
 				fmt.Fprint(s.out, "\r\n")
@@ -243,6 +250,10 @@ func (s *Shell) drainNotifications(interactive bool) {
 				s.notifs = nil
 				return
 			}
+			if !s.mintWatch {
+				s.pendingEvents = append(s.pendingEvents, n)
+				continue
+			}
 			lines := s.formatNotification(n)
 			if interactive && s.editor != nil {
 				// Les notifications sont affichées après la commande : on ne
@@ -257,6 +268,39 @@ func (s *Shell) drainNotifications(interactive bool) {
 			return
 		}
 	}
+}
+
+func (s *Shell) cmdMintWatch(rest string) {
+	switch strings.ToLower(strings.TrimSpace(rest)) {
+	case "on":
+		s.mintWatch = true
+		s.printf("[Mint] Notifications automatiques activées.\n")
+	case "off":
+		s.mintWatch = false
+		s.printf("[Mint] Notifications automatiques désactivées ; les captures restent enregistrées.\n")
+	case "":
+		state := "off"
+		if s.mintWatch {
+			state = "on"
+		}
+		s.printf("[Mint] mint.watch %s.\n", state)
+	default:
+		s.errorf("usage : mint.watch on|off")
+	}
+}
+
+func (s *Shell) cmdMintEvents() {
+	if len(s.pendingEvents) == 0 {
+		s.printf("[Mint] Aucun événement en attente.\n")
+		return
+	}
+	for _, event := range s.pendingEvents {
+		for _, line := range s.formatNotification(event) {
+			s.printf("%s\n", line)
+		}
+	}
+	s.printf("[Mint] %d événement(s) affiché(s).\n", len(s.pendingEvents))
+	s.pendingEvents = nil
 }
 
 func (s *Shell) formatNotification(n mint.Notification) []string {
@@ -313,7 +357,12 @@ func (s *Shell) Execute(line string) bool {
 	case "crl.head.clear", "crl.header.clear":
 		s.cmdHeaderClear(rest)
 	case "crl.json":
-		s.cmdJSON(rest)
+		if strings.EqualFold(strings.TrimSpace(rest), "clear") {
+			s.builder.ClearBody()
+			s.printf("[CRL] Corps supprimé.\n")
+		} else {
+			s.cmdJSON(rest)
+		}
 	case "crl.body":
 		s.cmdBody(rest)
 	case "crl.body.clear":
@@ -373,6 +422,10 @@ func (s *Shell) executeMint(cmd, rest string) {
 		s.cmdMintPort(rest)
 	case "mint.requests":
 		s.cmdMintRequests(false)
+	case "mint.watch":
+		s.cmdMintWatch(rest)
+	case "mint.events":
+		s.cmdMintEvents()
 	case "mint.history":
 		s.cmdMintRequests(true)
 	case "mint.request.show", "mint.show":
@@ -564,7 +617,7 @@ func (s *Shell) cmdShow() {
 	s.printf("%s\n", p.Dim("Aucune requête envoyée — utilisez crl.launch pour l'exécuter."))
 	s.rule(78)
 	s.field("Méthode", p.Method(s.builder.Method()))
-	s.field("URL", p.Cyan(display.MaskURL(s.builder.URL())))
+	s.field("URL", p.Cyan(sanitizeTerminal(s.builder.URL())))
 	s.field("Proxy", s.proxyValue(res))
 	s.field("Sortie", p.Cyan(s.outputMode.ShortLabel()))
 	if s.builder.CAFile() != "" {
@@ -583,6 +636,8 @@ func (s *Shell) cmdShow() {
 		s.printf("\n  %s\n", p.BoldCyan(fmt.Sprintf("Corps (%d octets)", s.builder.BodySize())))
 		rendered, _ := display.RenderBody(s.builder.Body(), 4096)
 		s.printIndented(rendered, "    ")
+	} else {
+		s.printf("\n  %s\n", p.BoldCyan("Corps (vide / non défini)"))
 	}
 	s.printf("\n")
 	s.rule(78)
@@ -682,7 +737,7 @@ func (s *Shell) cmdLaunch(rest string) {
 	s.printf("%s\n", p.BoldGreen("[CRL] Requête envoyée"))
 	s.rule(78)
 	s.field("Méthode", p.Method(s.builder.Method()))
-	s.field("URL", p.Cyan(display.MaskURL(s.builder.URL())))
+	s.field("URL", p.Cyan(sanitizeTerminal(s.builder.URL())))
 	s.field("Proxy", s.proxyValue(res))
 	s.field("Sortie", p.Cyan(s.outputMode.ShortLabel()))
 	s.field("Requête", fmt.Sprintf("%d en-tête(s), corps %s", len(s.builder.Headers()), display.FormatBytes(int64(s.builder.BodySize()))))
@@ -701,6 +756,9 @@ func (s *Shell) cmdLaunch(rest string) {
 	started := time.Now()
 	runErr := cmd.Run()
 	elapsed := time.Since(started)
+	if res.Source == "Mint (automatique)" {
+		s.reportMintCapture(started)
+	}
 	s.lastResponseDir = dir
 	_ = os.Chmod(headerPath, 0o600)
 	_ = os.Chmod(bodyPath, 0o600)
@@ -742,6 +800,45 @@ func (s *Shell) cmdLaunch(rest string) {
 		return
 	}
 	s.printHTTPResponse(status, headers, meta, bodyPreview, total, bodyPath)
+}
+
+// reportMintCapture compare uniquement une capture récente de même méthode et
+// URL. En présence de trafic concurrent, l'absence de correspondance est
+// signalée au lieu d'attribuer arbitrairement une capture à crl.launch.
+func (s *Shell) reportMintCapture(started time.Time) {
+	captures := s.history.List()
+	for i := len(captures) - 1; i >= 0; i-- {
+		c := captures[i]
+		if c.StartedAt.Before(started.Add(-time.Second)) || !c.Request.Received {
+			continue
+		}
+		if c.Request.Method != s.builder.Method() || c.Request.URL != s.builder.URL() {
+			continue
+		}
+		s.printf("\n[Mint] Capture réellement observée : #%d (%s %s). Comparez les en-têtes avec crl.show ; détail : mint.request.show %d.\n", c.ID, c.Request.Method, sanitizeTerminal(c.Request.URL), c.ID)
+		matched := make([]bool, len(c.Request.Headers))
+		for _, expected := range s.builder.Headers() {
+			found := false
+			for i, actual := range c.Request.Headers {
+				if !matched[i] && strings.EqualFold(expected.Name, actual.Name) && expected.Value == actual.Value {
+					found = true
+					matched[i] = true
+					break
+				}
+			}
+			if !found {
+				s.printf("[Mint] Différence observée pour l'en-tête %s : valeur préparée absente ou différente dans la capture.\n", sanitizeTerminal(expected.Name))
+			}
+		}
+		for i, actual := range c.Request.Headers {
+			if matched[i] {
+				continue
+			}
+			s.printf("[Mint] En-tête observé en plus ou avec une valeur différente : %s.\n", sanitizeTerminal(actual.Name))
+		}
+		return
+	}
+	s.printf("\n[Mint] Aucune capture Mint récente de même méthode et URL n'a été corrélée à cette requête. Consultez mint.requests ; en cas de trafic concurrent, vérifiez mint.request.show manuellement.\n")
 }
 
 func curlExitCode(err error) int {
@@ -787,6 +884,8 @@ func (s *Shell) printHTTPResponse(status response.Status, headers response.Heade
 	s.printf("\n%s\n", p.BoldGreen("[CRL] Réponse HTTP"))
 	s.rule(78)
 	s.field("Statut", p.StatusCode(status.Code, sanitizeTerminal(status.Label())))
+	s.field("Méthode", p.Method(s.builder.Method()))
+	s.field("URL demandée", p.Cyan(sanitizeTerminal(s.builder.URL())))
 	s.field("Durée", p.Cyan(durationLabel(meta.Duration)))
 	s.field("Taille", p.Bold(display.FormatBytes(total)))
 	if contentType := headers.ContentType(); contentType != "" {
@@ -796,7 +895,7 @@ func (s *Shell) printHTTPResponse(status response.Status, headers response.Heade
 		s.field("HTTP", p.Dim(sanitizeTerminal(status.Proto)))
 	}
 	if meta.EffectiveURL != "" {
-		s.field("URL finale", p.Cyan(sanitizeTerminal(display.MaskURL(meta.EffectiveURL))))
+		s.field("URL finale", p.Cyan(sanitizeTerminal(meta.EffectiveURL)))
 	}
 
 	s.printf("\n  %s\n", p.BoldBlue(fmt.Sprintf("En-têtes de réponse (%d)", len(headers))))
@@ -812,6 +911,16 @@ func (s *Shell) printHTTPResponse(status response.Status, headers response.Heade
 		s.printf("  %s\n", p.BoldRed("Erreur HTTP côté serveur : ce n'est pas une erreur de connexion."))
 	} else if status.Code >= 400 {
 		s.printf("  %s\n", p.BoldYellow("Erreur HTTP côté client : la réponse a bien été reçue."))
+		switch status.Code {
+		case 400:
+			s.printf("  %s\n", p.Dim("400 : inspectez le corps et les en-têtes de réponse pour le détail fourni par le serveur."))
+		case 401:
+			s.printf("  %s\n", p.Dim("401 : comparez la requête préparée avec mint.requests puis mint.request.show <id> si Mint a capturé l'échange."))
+		case 403:
+			s.printf("  %s\n", p.Dim("403 : accès refusé par le serveur ; cela ne prouve pas que l'authentification est absente. Inspectez la requête et les règles d'accès."))
+		case 404:
+			s.printf("  %s\n", p.Dim(fmt.Sprintf("404 : vérifiez le chemin, les paramètres et la méthode %s ; ce statut ne prouve pas à lui seul que la ressource n'existe pas.", s.builder.Method())))
+		}
 	} else if status.Code >= 300 && status.Code < 400 {
 		s.printf("  %s\n", p.Cyan("Redirection reçue ; curl ne la suit pas automatiquement."))
 	}
@@ -1093,7 +1202,7 @@ func (s *Shell) cmdMintShow(rest string) {
 		s.field("Flux", p.Dim(c.FlowID))
 	}
 	s.field("Date", c.StartedAt.Local().Format("2006-01-02 15:04:05.000"))
-	s.field("URL", p.Cyan(display.MaskURL(c.Request.URL)))
+	s.field("URL", p.Cyan(sanitizeTerminal(c.Request.URL)))
 	s.field("Hôte", c.Request.Host)
 	s.field("Chemin", p.Cyan(display.MaskURL(c.PathAndQuery())))
 	if reasons := c.IncompleteReasons(); len(reasons) > 0 {
@@ -1139,7 +1248,6 @@ func (s *Shell) cmdMintShow(rest string) {
 	if c.Err != "" {
 		s.printf("\n  %s %s\n", p.BoldRed("ERREUR"), p.Red(truncate(sanitizeTerminal(c.Err), 1000)))
 	}
-	s.printf("\n%s\n", p.Dim("[Mint] Authorization/Cookie/Set-Cookie sont masqués à l'affichage ; les données internes restent intactes."))
 }
 
 func (s *Shell) cmdMintSelect(rest string) {
@@ -1380,11 +1488,7 @@ func (s *Shell) rule(width int) {
 }
 
 func (s *Shell) headerValue(name, value string) string {
-	masked := sanitizeTerminal(display.MaskHeaderValue(name, value))
-	if display.HeaderSensitive(name) {
-		return s.pal.BoldYellow(masked)
-	}
-	return masked
+	return sanitizeTerminal(value)
 }
 
 func (s *Shell) headerLine(name, value string) string {
@@ -1452,11 +1556,12 @@ func (s *Shell) printHelp() {
   crl.method <méthode>        Définir la méthode HTTP
   crl.head <Nom: valeur>      Ajouter/remplacer un en-tête
   crl.head clear [Nom]        Supprimer un ou tous les en-têtes
-  crl.json <json>             Définir un corps JSON et son Content-Type
+  crl.json <json>|clear       Définir ou effacer le corps JSON
+  crl.body.clear              Alias pour effacer le corps
   crl.body <texte>            Définir un corps brut (crl.body.clear pour l'effacer)
   crl.proxy <url|none|auto>   Proxy explicite (aucun, ou retour au proxy Mint auto)
   crl.ca <fichier|off>        CA de confiance pour curl (TLS toujours vérifié)
-  crl.show                    Afficher la requête préparée (secrets masqués)
+  crl.show                    Afficher la requête préparée et ses en-têtes
   crl.table                   Afficher un tableau récapitulatif
   crl.output [mode]           auto|raw|pretty (sans argument : mode courant)
   crl.launch                  Envoyer la requête et présenter la réponse
@@ -1469,8 +1574,10 @@ Commandes Mint
   mint.proxy.config           Afficher la configuration effective
   mint.proxy.port <port>      Changer le port (proxy arrêté)
   mint.requests               Lister les captures (filtre appliqué)
+  mint.watch on|off           Activer ou suspendre les notifications automatiques
+  mint.events                 Afficher les notifications mises en attente
   mint.history                Lister tout l'historique
-  mint.request.show <id>      Détail d'une capture (secrets masqués)
+  mint.request.show <id>      Détail complet d'une capture
   mint.select <id>            Sélectionner une capture
   mint.selected               Afficher la sélection
   mint.filter <texte|clear>   Filtrer hôte/URL/chemin sans effacer l'historique
@@ -1490,6 +1597,8 @@ func (s *Shell) printMintHelp() {
   mint.proxy.port <port>      Changer le port d'écoute (proxy arrêté)
 
   mint.requests               Tableau des captures (filtre appliqué)
+  mint.watch on|off           Notifications automatiques (captures conservées)
+  mint.events                 Afficher les notifications mises en attente
   mint.history                Tableau de tout l'historique
   mint.request.show <id>      Requête, réponse, en-têtes et corps
   mint.select <id>            Sélectionner une capture
@@ -1499,8 +1608,9 @@ func (s *Shell) printMintHelp() {
   mint.clear                  Effacer les captures (confirmation)
   mint.use <id>               Importer dans le constructeur, sans envoyer
 
-Les notifications de capture s'affichent sans interrompre la saisie.
-Les valeurs Authorization, Cookie et Set-Cookie sont masquées à l'affichage.
+Les notifications affichées rafraîchissent le prompt sans perdre la saisie.
+mint.watch off suspend l'affichage ; mint.requests conserve l'accès aux captures.
+Les commandes d'inspection affichent les valeurs complètes des en-têtes.
 mint.proxy config affiche l'état du processus, de l'addon et du pont local.
 `)
 }

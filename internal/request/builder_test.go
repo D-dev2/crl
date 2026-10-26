@@ -54,8 +54,9 @@ func TestHeadersReplaceAndDuplicatePreservationOnImport(t *testing.T) {
 		URL:    "http://example.test/a?b=1",
 		Method: "POST",
 		Headers: []Header{
-			{Name: "Cookie", Value: "a=1"},
-			{Name: "Cookie", Value: "b=2"},
+			{Name: "Cookie", Value: "a=1; session=first"},
+			{Name: "Cookie", Value: "b=2 "},
+			{Name: "Authorization", Value: "Bearer exact-token"},
 			{Name: "Content-Type", Value: "application/json"},
 		},
 		Body:        []byte(`{"a":1}`),
@@ -65,7 +66,7 @@ func TestHeadersReplaceAndDuplicatePreservationOnImport(t *testing.T) {
 		t.Fatal(err)
 	}
 	headers = b.Headers()
-	if len(headers) != 3 || headers[0].Value != "a=1" || headers[1].Value != "b=2" {
+	if len(headers) != 4 || headers[0].Value != "a=1; session=first" || headers[1].Value != "b=2 " || headers[2].Value != "Bearer exact-token" {
 		t.Fatalf("duplicate headers lost: %#v", headers)
 	}
 	if string(b.Body()) != `{"a":1}` {
