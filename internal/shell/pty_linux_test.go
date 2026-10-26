@@ -1,0 +1,241 @@
+//go:build linux
+
+package shell
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"os"
+	"strings"
+	"sync"
+	"syscall"
+	"testing"
+	"time"
+	"unsafe"
+
+	"crl-cli/internal/mint"
+	"crl-cli/internal/request"
+)
+
+func openPTY(t *testing.T) (*os.File, *os.File) {
+	t.Helper()
+	master, err := os.OpenFile("/dev/ptmx", os.O_RDWR|syscall.O_NOCTTY, 0)
+	if err != nil {
+		t.Skipf("pty indisponible : %v", err)
+	}
+
+	var unlock int32
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, master.Fd(), syscall.TIOCSPTLCK, uintptr(unsafe.Pointer(&unlock))); errno != 0 {
+		master.Close()
+		t.Fatalf("déverrouillage du pty : %v", errno)
+	}
+	var number uint32
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, master.Fd(), syscall.TIOCGPTN, uintptr(unsafe.Pointer(&number))); errno != 0 {
+		master.Close()
+		t.Fatalf("numéro du pty : %v", errno)
+	}
+	slave, err := os.OpenFile(fmt.Sprintf("/dev/pts/%d", number), os.O_RDWR|syscall.O_NOCTTY, 0)
+	if err != nil {
+		master.Close()
+		t.Fatalf("ouverture du pty esclave : %v", err)
+	}
+
+	ws := struct {
+		Row, Col, Xpixel, Ypixel uint16
+	}{Row: 24, Col: 100}
+	_, _, _ = syscall.Syscall(syscall.SYS_IOCTL, slave.Fd(), syscall.TIOCSWINSZ, uintptr(unsafe.Pointer(&ws)))
+	return master, slave
+}
+
+type ptyCollector struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (c *ptyCollector) write(p []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, _ = c.buf.Write(p)
+}
+
+func (c *ptyCollector) String() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.String()
+}
+
+func waitPTYText(t *testing.T, got *ptyCollector, want string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if strings.Contains(got.String(), want) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("sortie PTY sans %q :\n%q", want, got.String())
+}
+
+// ptyCurrentLine approxime la ligne visible : le dernier \r revient en début
+// de ligne, puis la séquence ANSI d'effacement est retirée.
+func ptyCurrentLine(output string) string {
+	if i := strings.LastIndexByte(output, '\r'); i >= 0 {
+		output = output[i+1:]
+	}
+	output = strings.ReplaceAll(output, "\x1b[K", "")
+	return output
+}
+
+func waitPTYLine(t *testing.T, got *ptyCollector, want string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if ptyCurrentLine(got.String()) == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("ligne PTY = %q, attendu %q\nsortie :\n%q",
+		ptyCurrentLine(got.String()), want, got.String())
+}
+
+// TestInteractiveTypingOneKeyAtATime protège contre une régression où le
+// tampon de l'éditeur était réinitialisé après chaque lecture : les caractères
+// tapés un par un n'apparaissaient jamais à l'écran, alors qu'un collage d'une
+// ligne complète fonctionnait.
+func TestInteractiveTypingOneKeyAtATime(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	master, slave := openPTY(t)
+	defer master.Close()
+	defer slave.Close()
+
+	hist := mint.NewHistory(mint.DefaultHistoryConfig())
+	mgr, err := mint.NewManager(mint.DefaultConfig(), hist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sh, err := New(Options{
+		In:      slave,
+		Out:     slave,
+		Builder: request.New(),
+		Manager: mgr,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := &ptyCollector{}
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := master.Read(buf)
+			if n > 0 {
+				got.write(buf[:n])
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- sh.Run(ctx) }()
+
+	waitPTYLine(t, got, "crl > ", 3*time.Second)
+
+	typed := "help"
+	for i := range typed {
+		if _, err := master.Write([]byte{typed[i]}); err != nil {
+			t.Fatalf("écriture PTY : %v", err)
+		}
+		waitPTYLine(t, got, "crl > "+typed[:i+1], 3*time.Second)
+	}
+	if _, err := master.Write([]byte("\r")); err != nil {
+		t.Fatal(err)
+	}
+	waitPTYText(t, got, "Commandes CRL-CLI", 3*time.Second)
+
+	if _, err := master.Write([]byte("exit\r")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("shell : %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("le shell ne s'est pas arrêté après exit")
+	}
+}
+
+// TestInteractiveLongPasteShowsPromptOnce protège contre un collage qui
+// redessinait tout le tampon à chaque caractère, laissant plusieurs prompts et
+// des fragments de la ligne collée dans le terminal.
+func TestInteractiveLongPasteShowsPromptOnce(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	master, slave := openPTY(t)
+	defer master.Close()
+	defer slave.Close()
+
+	hist := mint.NewHistory(mint.DefaultHistoryConfig())
+	mgr, err := mint.NewManager(mint.DefaultConfig(), hist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sh, err := New(Options{
+		In:      slave,
+		Out:     slave,
+		Builder: request.New(),
+		Manager: mgr,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := &ptyCollector{}
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := master.Read(buf)
+			if n > 0 {
+				got.write(buf[:n])
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- sh.Run(ctx) }()
+
+	waitPTYLine(t, got, "crl > ", 3*time.Second)
+	paste := strings.Repeat("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.", 30)
+	if _, err := master.Write([]byte(paste)); err != nil {
+		t.Fatalf("écriture PTY : %v", err)
+	}
+	waitPTYText(t, got, paste, 3*time.Second)
+	if count := strings.Count(got.String(), "crl > "); count != 1 {
+		t.Fatalf("le collage a produit %d prompts :\n%q", count, got.String())
+	}
+
+	if _, err := master.Write([]byte("\x03")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := master.Write([]byte("exit\r")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("shell : %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("le shell ne s'est pas arrêté après exit")
+	}
+}

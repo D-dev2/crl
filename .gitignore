@@ -1,0 +1,31 @@
+# Binaire produit par `go build ./cmd/crl`
+/crl
+
+# Artefacts de test et de compilation
+*.test
+*.out
+/dist/
+/bin/
+/coverage.*
+*.prof
+*.tmp
+*.log
+
+# Répertoires/fichiers temporaires locaux
+.crl-response-*/
+.tmp/
+/tmp/
+
+# Secrets et configurations locales — ne jamais publier
+.env
+.env.*
+*.pem
+*.key
+*.crt
+cookies.txt
+.netrc
+
+# Éditeurs et systèmes
+.DS_Store
+.idea/
+.vscode/
