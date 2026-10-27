@@ -2,6 +2,7 @@ package shell
 
 import (
 	"bytes"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -73,6 +75,21 @@ func addCapture(t *testing.T, hist *mint.History) {
 	})
 }
 
+func newTestHTTPServer(t *testing.T, handler http.Handler) *httptest.Server {
+	t.Helper()
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) {
+			t.Skipf("environnement sans accès aux sockets loopback : %v", err)
+		}
+		t.Fatalf("impossible d'ouvrir un socket loopback pour le test : %v", err)
+	}
+	server := httptest.NewUnstartedServer(handler)
+	server.Listener = listener
+	server.Start()
+	return server
+}
+
 func TestMintRequestsFilterAndHistory(t *testing.T) {
 	sh, out, _, hist, _ := newTestShell(t, "")
 	addCapture(t, hist)
@@ -124,6 +141,25 @@ func TestMintShowIncludesFullHeaders(t *testing.T) {
 	for _, want := range []string{"Capture #1", "Bearer supersecret", "Cookie: session=abc", "Set-Cookie: session=abc", "token=supersecret", "200 OK", "24ms", "/users/v1/login"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("show missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestMintShowDisplaysProxyAndCustomHeaderValues(t *testing.T) {
+	sh, out, _, hist, _ := newTestShell(t, "")
+	hist.AddRequest(mint.BridgeEvent{
+		Type: "request", FlowID: "custom-headers", Timestamp: time.Now(),
+		Method: "GET", URL: "http://example.test/custom",
+		Headers: []mint.Header{
+			{Name: "Proxy-Authorization", Value: "Basic proxy-value"},
+			{Name: "X-Custom-Token", Value: "custom-value"},
+		},
+	})
+	sh.Execute("mint.request.show 1")
+	text := out.String()
+	for _, want := range []string{"Proxy-Authorization: Basic proxy-value", "X-Custom-Token: custom-value"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("valeur complète %q absente :\n%s", want, text)
 		}
 	}
 }
@@ -309,19 +345,32 @@ func TestCRLCommandsShowFullHeaders(t *testing.T) {
 	sh.Execute("crl.host http://127.0.0.1:5002/a%2Fb?x=1&x=2&empty=&token=abc")
 	sh.Execute("crl.method PUT")
 	sh.Execute("crl.head Authorization: Bearer verysecret")
+	sh.Execute("crl.head Proxy-Authorization: Basic proxysecret")
+	sh.Execute("crl.head X-Custom-Token: customsecret")
 	sh.Execute("crl.json {\"a\":1}")
 	sh.Execute("crl.show")
 	text := out.String()
-	if !strings.Contains(text, "Bearer verysecret") || !strings.Contains(text, "token=abc") {
-		t.Fatalf("full header or URL values missing:\n%s", text)
+	for _, want := range []string{"Bearer verysecret", "Basic proxysecret", "customsecret", "token=abc"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("full header or URL value %q missing:\n%s", want, text)
+		}
 	}
 	if builder.URL() != "http://127.0.0.1:5002/a%2Fb?x=1&x=2&empty=&token=abc" {
 		t.Fatalf("URL changed: %q", builder.URL())
 	}
 	out.Reset()
 	sh.Execute("crl.table")
-	if !strings.Contains(out.String(), "MÉTHODE") || !strings.Contains(out.String(), "PUT") {
-		t.Fatalf("table output:\n%s", out.String())
+	table := out.String()
+	if !strings.Contains(table, "MÉTHODE") || !strings.Contains(table, "PUT") {
+		t.Fatalf("table output:\n%s", table)
+	}
+	if !strings.Contains(table, "Authorization") || !strings.Contains(table, "crl.show affiche le détail complet") {
+		t.Fatalf("table ne résume pas les en-têtes :\n%s", table)
+	}
+	for _, secret := range []string{"verysecret", "proxysecret", "customsecret"} {
+		if strings.Contains(table, secret) {
+			t.Fatalf("le tableau récapitulatif expose %q :\n%s", secret, table)
+		}
 	}
 }
 
@@ -334,6 +383,9 @@ func TestJSONClearAliasesAndReset(t *testing.T) {
 	if builder.BodySet() || builder.BodySize() != 0 || builder.Method() != "POST" || builder.Headers()[0].Value != "yes" {
 		t.Fatalf("clear modified unrelated request state: method=%q headers=%#v bodySet=%v", builder.Method(), builder.Headers(), builder.BodySet())
 	}
+	if builder.ContentType() != "application/json" {
+		t.Fatalf("Content-Type JSON supprimé par clear : %q", builder.ContentType())
+	}
 	sh.Execute("crl.show")
 	if !strings.Contains(out.String(), "Corps (vide / non défini)") {
 		t.Fatalf("empty body not reported:\n%s", out.String())
@@ -345,6 +397,27 @@ func TestJSONClearAliasesAndReset(t *testing.T) {
 	sh.Execute("crl.body.clear")
 	if builder.BodySet() {
 		t.Fatal("crl.body.clear did not clear body")
+	}
+	if builder.ContentType() != "application/json" {
+		t.Fatalf("crl.body.clear a supprimé Content-Type : %q", builder.ContentType())
+	}
+}
+
+func TestMintWatchOffNotificationDoesNotTouchActivePrompt(t *testing.T) {
+	sh, _, _, _, _ := newTestShell(t, "")
+	var out bytes.Buffer
+	sh.editor = newEditor(&out, "crl > ")
+	sh.editor.DrawPrompt()
+	sh.editor.Feed([]byte("hel"))
+	out.Reset()
+	sh.mintWatch = false
+
+	sh.handleNotification(mint.Notification{Kind: "request", ID: 9, Method: "GET", URL: "http://example.test/"})
+	if out.Len() != 0 {
+		t.Fatalf("mint.watch off a écrit dans le prompt :\n%q", out.String())
+	}
+	if len(sh.pendingEvents) != 1 || sh.editor.Text() != "hel" {
+		t.Fatalf("événement non mis en attente ou saisie perdue : events=%d texte=%q", len(sh.pendingEvents), sh.editor.Text())
 	}
 }
 
@@ -364,7 +437,7 @@ func TestMintWatchOffQueuesEventsAndMintRequestsRemainAvailable(t *testing.T) {
 	t.Cleanup(sh.Close)
 	sh.Execute("mint.watch off")
 	notifications <- mint.Notification{Kind: "request", ID: 7, Method: "GET", URL: "http://example.test/path"}
-	sh.drainNotifications(false)
+	sh.drainNotifications()
 	if len(sh.pendingEvents) != 1 {
 		t.Fatalf("queued events = %d", len(sh.pendingEvents))
 	}
@@ -380,6 +453,31 @@ func TestMintWatchOffQueuesEventsAndMintRequestsRemainAvailable(t *testing.T) {
 	}
 }
 
+func TestPendingMintEventsAreBounded(t *testing.T) {
+	sh, out, _, _, _ := newTestShell(t, "")
+	sh.mintWatch = false
+	for i := 0; i < maxPendingEvents+3; i++ {
+		sh.queuePendingEvent(mint.Notification{Kind: "request", ID: i + 1, Method: "GET", URL: "http://example.test/" + strconv.Itoa(i)})
+	}
+	if len(sh.pendingEvents) != maxPendingEvents {
+		t.Fatalf("file = %d, attendu %d", len(sh.pendingEvents), maxPendingEvents)
+	}
+	if sh.pendingDropped != 3 {
+		t.Fatalf("événements abandonnés = %d, attendu 3", sh.pendingDropped)
+	}
+	// On ne réaffiche pas les 1024 événements : seul le compte d'abandons est
+	// vérifié après vidage interne de la file.
+	sh.pendingEvents = nil
+	out.Reset()
+	sh.cmdMintEvents()
+	if !strings.Contains(out.String(), "3 événement(s) ancien(s) ont été abandonnés") {
+		t.Fatalf("abandons non signalés :\n%s", out.String())
+	}
+	if sh.pendingDropped != 0 {
+		t.Fatalf("compteur d'abandons non remis à zéro : %d", sh.pendingDropped)
+	}
+}
+
 func TestReportMintCaptureShowsObservedHeaderDifferences(t *testing.T) {
 	sh, out, _, hist, builder := newTestShell(t, "")
 	started := time.Now()
@@ -392,10 +490,28 @@ func TestReportMintCaptureShowsObservedHeaderDifferences(t *testing.T) {
 		Headers: []mint.Header{{Name: "Authorization", Value: "Bearer captured"}, {Name: "X-Extra", Value: "seen"}},
 	})
 	sh.reportMintCapture(started)
-	for _, want := range []string{"Capture réellement observée", "Authorization", "X-Extra", "valeur préparée absente ou différente"} {
+	for _, want := range []string{"Capture récente de même méthode et URL", "trafic concurrent", "Authorization", "X-Extra", "valeur préparée absente ou différente"} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("missing %q:\n%s", want, out.String())
 		}
+	}
+}
+
+func TestReportMintCaptureWaitsForAsyncBridge(t *testing.T) {
+	sh, out, _, hist, builder := newTestShell(t, "")
+	_ = builder.SetURL("http://example.test/late")
+	started := time.Now()
+	go func() {
+		time.Sleep(40 * time.Millisecond)
+		hist.AddRequest(mint.BridgeEvent{
+			Type: "request", FlowID: "late-flow", Timestamp: started,
+			Method: "GET", URL: "http://example.test/late",
+			Headers: []mint.Header{{Name: "X-Late", Value: "yes"}},
+		})
+	}()
+	sh.reportMintCapture(started)
+	if !strings.Contains(out.String(), "Capture récente de même méthode et URL") || !strings.Contains(out.String(), "X-Late") {
+		t.Fatalf("capture asynchrone non corrélée :\n%s", out.String())
 	}
 }
 
@@ -415,7 +531,7 @@ func TestLaunchUsesCurl(t *testing.T) {
 	if _, err := exec.LookPath("curl"); err != nil {
 		t.Skip("curl absent")
 	}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer replay-token" || r.Header.Get("Cookie") != "session=replay-cookie" {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
@@ -447,11 +563,99 @@ func TestLaunchUsesCurl(t *testing.T) {
 	}
 }
 
+func TestMintAuthHeadersSurviveSelectionImportAndReplay(t *testing.T) {
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skip("curl absent")
+	}
+	srv := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/secure" || r.URL.Query().Get("token") != "abc" {
+			t.Errorf("requête inattendue : %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer auth-secret" ||
+			r.Header.Get("Cookie") != "session=abc" ||
+			r.Header.Get("X-Api-Key") != "api-secret" {
+			t.Errorf("en-têtes d'authentification altérés : %#v", r.Header)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("X-Replay", "ok")
+		_, _ = w.Write([]byte("auth-ok"))
+	}))
+	defer srv.Close()
+
+	sh, out, _, hist, builder := newTestShell(t, "")
+	hist.AddRequest(mint.BridgeEvent{
+		Type: "request", FlowID: "auth-flow", Timestamp: time.Now(),
+		Method: "POST", URL: srv.URL + "/secure?token=abc",
+		Headers: []mint.Header{
+			{Name: "Authorization", Value: "Bearer auth-secret"},
+			{Name: "Cookie", Value: "session=abc"},
+			{Name: "X-Api-Key", Value: "api-secret"},
+			{Name: "Proxy-Authorization", Value: "Basic proxy-secret"},
+			{Name: "Content-Type", Value: "application/json"},
+		},
+		Body: []byte(`{"ok":true}`), BodySize: 11,
+	})
+	hist.AddResponse(mint.BridgeEvent{
+		Type: "response", FlowID: "auth-flow", Timestamp: time.Now(),
+		StatusCode: 200, Reason: "OK", Duration: 5 * time.Millisecond,
+	})
+
+	sh.Execute("mint.select 1")
+	if !strings.Contains(out.String(), "sélectionnée") {
+		t.Fatalf("sélection absente :\n%s", out.String())
+	}
+	out.Reset()
+	sh.Execute("mint.request.show 1")
+	detail := out.String()
+	for _, want := range []string{"Bearer auth-secret", "session=abc", "api-secret", "proxy-secret"} {
+		if !strings.Contains(detail, want) {
+			t.Fatalf("valeur %q absente de la capture :\n%s", want, detail)
+		}
+	}
+
+	out.Reset()
+	sh.Execute("mint.use --force")
+	if !strings.Contains(out.String(), "importée") {
+		t.Fatalf("importation absente :\n%s", out.String())
+	}
+	headerValue := func(name string) string {
+		for _, h := range builder.Headers() {
+			if strings.EqualFold(h.Name, name) {
+				return h.Value
+			}
+		}
+		return ""
+	}
+	if headerValue("Authorization") != "Bearer auth-secret" ||
+		headerValue("Cookie") != "session=abc" ||
+		headerValue("X-Api-Key") != "api-secret" {
+		t.Fatalf("en-têtes perdus à l'import : %#v", builder.Headers())
+	}
+
+	out.Reset()
+	sh.Execute("crl.show")
+	if !strings.Contains(out.String(), "Bearer auth-secret") {
+		t.Fatalf("crl.show ne restitue pas l'authentification :\n%s", out.String())
+	}
+
+	out.Reset()
+	sh.Execute("crl.launch")
+	text := out.String()
+	for _, want := range []string{"200 OK", "X-Replay: ok", "auth-ok"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("rejeu sans %q :\n%s", want, text)
+		}
+	}
+}
+
 func TestLaunchTempResponseIsPrivateAndCleaned(t *testing.T) {
 	if _, err := exec.LookPath("curl"); err != nil {
 		t.Skip("curl absent")
 	}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("temp-check"))
 	}))
 	defer srv.Close()
@@ -485,7 +689,7 @@ func TestLaunchHTTPResponseLayoutAndPrettyJSON(t *testing.T) {
 	if _, err := exec.LookPath("curl"); err != nil {
 		t.Skip("curl absent")
 	}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Set-Cookie", "session=secret")
 		_, _ = w.Write([]byte(`{"b":2,"a":[1,2]}`))
@@ -519,7 +723,7 @@ func TestLaunchOutputModes(t *testing.T) {
 	if _, err := exec.LookPath("curl"); err != nil {
 		t.Skip("curl absent")
 	}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"mode":"test"}`))
 	}))
@@ -552,7 +756,7 @@ func TestLaunchHTTPErrorHTML(t *testing.T) {
 	if _, err := exec.LookPath("curl"); err != nil {
 		t.Skip("curl absent")
 	}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = w.Write([]byte(`<!doctype html><html><body><h1>400 Bad Request</h1><p>Invalid input</p></body></html>`))
@@ -579,7 +783,7 @@ func TestLaunchHTTPStatusDiagnostics(t *testing.T) {
 	}
 	for _, code := range []int{200, 400, 401, 403, 404} {
 		t.Run(strconv.Itoa(code), func(t *testing.T) {
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			srv := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("X-Diagnostic", "visible")
 				w.Header().Set("Content-Type", "text/plain")
 				w.WriteHeader(code)
@@ -598,6 +802,9 @@ func TestLaunchHTTPStatusDiagnostics(t *testing.T) {
 			}
 			if code == 403 && !strings.Contains(text, "ne prouve pas que l'authentification est absente") {
 				t.Fatalf("403 diagnostic overclaims:\n%s", text)
+			}
+			if (code == 401 || code == 403) && (!strings.Contains(text, "crl.show") || !strings.Contains(text, "mint.request.show")) {
+				t.Fatalf("%d diagnostic ne guide pas vers les en-têtes préparés et capturés:\n%s", code, text)
 			}
 			if code == 404 && !strings.Contains(text, "vérifiez le chemin, les paramètres") {
 				t.Fatalf("404 diagnostic missing:\n%s", text)
@@ -643,6 +850,9 @@ func freeLoopbackPort(t *testing.T) int {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
+		if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) {
+			t.Skipf("environnement sans accès aux sockets loopback : %v", err)
+		}
 		t.Fatal(err)
 	}
 	defer ln.Close()
@@ -740,7 +950,7 @@ func TestRealMintAutoProxyInShell(t *testing.T) {
 	}
 	defer sh.Close()
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = w.Write([]byte("hello-from-mint"))
 	}))
@@ -773,8 +983,8 @@ func TestRealMintAutoProxyInShell(t *testing.T) {
 	if !strings.Contains(launchText, cfg.ListenHost+":"+strconv.Itoa(cfg.Port)) {
 		t.Fatalf("proxy Mint automatique non annoncé :\n%s", launchText)
 	}
-	if strings.Contains(launchText, "token=secret") {
-		t.Fatalf("secret affiché par crl.launch :\n%s", launchText)
+	if !strings.Contains(launchText, "token=secret") {
+		t.Fatalf("URL complète absente de crl.launch :\n%s", launchText)
 	}
 
 	var capture mint.Capture

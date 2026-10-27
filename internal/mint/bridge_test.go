@@ -4,21 +4,41 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
 
 func testBridge(t *testing.T, maxBody int64) *Bridge {
 	t.Helper()
+	requireLoopbackTCP(t)
 	b, err := NewBridge(maxBody)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = b.Close() })
 	return b
+}
+
+// requireLoopbackTCP skips network integration tests only when the execution
+// environment explicitly forbids opening loopback sockets (for example, a
+// restricted build sandbox). Other listener errors still fail the test.
+func requireLoopbackTCP(t *testing.T) {
+	t.Helper()
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err == nil {
+		_ = ln.Close()
+		return
+	}
+	if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) {
+		t.Skipf("environnement sans accès aux sockets loopback : %v", err)
+	}
+	t.Fatalf("impossible d'ouvrir un socket loopback pour le test : %v", err)
 }
 
 func bridgeClient() *http.Client {
@@ -229,6 +249,7 @@ func TestBridgeSequentialEvents(t *testing.T) {
 }
 
 func TestBridgeCloseClosesEvents(t *testing.T) {
+	requireLoopbackTCP(t)
 	b, err := NewBridge(1024)
 	if err != nil {
 		t.Fatal(err)

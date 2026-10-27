@@ -19,6 +19,7 @@ import (
 
 func freePort(t *testing.T) int {
 	t.Helper()
+	requireLoopbackTCP(t)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -222,6 +223,7 @@ func TestManagerMitmdumpMissing(t *testing.T) {
 }
 
 func TestManagerPortBusy(t *testing.T) {
+	requireLoopbackTCP(t)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)

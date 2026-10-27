@@ -23,6 +23,13 @@ type editor struct {
 	buf    []rune
 	pos    int
 
+	// originSaved mémorise le début du prompt avec une séquence ANSI de
+	// sauvegarde de curseur. Les redessins et les notifications repartent de
+	// cette origine, ce qui nettoie aussi les lignes physiques produites par
+	// un prompt ou un collage plus long que la largeur du terminal.
+	originSaved  bool
+	promptActive bool
+
 	history []string
 	histIdx int
 	saved   string
@@ -46,15 +53,43 @@ func (e *editor) Reset() {
 
 func (e *editor) Text() string { return string(e.buf) }
 
+// Active indique qu'un prompt est actuellement affiché et que la saisie est
+// en cours. Les notifications peuvent alors utiliser Notify plutôt que
+// PrintLines.
+func (e *editor) Active() bool { return e.promptActive }
+
+// DrawPrompt affiche un nouveau prompt à la position courante et mémorise son
+// origine. À utiliser après une commande ou au démarrage.
 func (e *editor) DrawPrompt() {
-	fmt.Fprint(e.out, "\r\033[K", e.prompt)
-	fmt.Fprint(e.out, string(e.buf))
-	e.reposition()
+	e.drawFresh()
 }
 
+// drawFresh efface la ligne courante, mémorise l'origine du prompt puis
+// redessine prompt et saisie. L'origine est ensuite utilisée par redraw et
+// Notify pour effacer tout le bloc, y compris les lignes de continuation.
+func (e *editor) drawFresh() {
+	fmt.Fprint(e.out, "\r\033[K\033[s")
+	e.drawContent()
+	e.originSaved = true
+	e.promptActive = true
+}
+
+// redraw repart de l'origine mémorisée, efface le prompt et toutes ses lignes
+// de continuation, puis redessine la saisie. Cela évite les fragments de
+// prompt laissés par un effacement limité à la dernière ligne physique.
 func (e *editor) redraw() {
-	fmt.Fprint(e.out, "\r\033[K", e.prompt)
-	fmt.Fprint(e.out, string(e.buf))
+	if e.originSaved {
+		fmt.Fprint(e.out, "\033[u\033[J")
+	} else {
+		fmt.Fprint(e.out, "\r\033[K\033[s")
+		e.originSaved = true
+	}
+	e.drawContent()
+	e.promptActive = true
+}
+
+func (e *editor) drawContent() {
+	fmt.Fprint(e.out, e.prompt, string(e.buf))
 	e.reposition()
 }
 
@@ -64,26 +99,41 @@ func (e *editor) reposition() {
 	}
 }
 
-// PrintLines affiche des lignes au-dessus du prompt sans redessiner celui-ci.
+// PrintLines affiche des lignes sans toucher au prompt. Utilisé après
+// l'exécution d'une commande, quand aucun prompt n'est affiché.
 func (e *editor) PrintLines(lines []string) {
 	if len(lines) == 0 {
 		return
 	}
 	fmt.Fprint(e.out, "\r\033[K")
+	e.writeLines(lines)
+}
+
+func (e *editor) writeLines(lines []string) {
 	for _, line := range lines {
 		fmt.Fprint(e.out, sanitizeTerminalKeepANSI(line), "\r\n")
 	}
 }
 
 // Notify affiche une ou plusieurs lignes au-dessus du prompt, puis restaure
-// la saisie en cours. À appeler uniquement lorsque l'utilisateur est en train
-// de taper une commande.
+// la saisie en cours. L'appel est centralisé par le shell, dans la goroutine
+// qui lit les commandes : aucune goroutine Mint n'écrit directement ici.
 func (e *editor) Notify(lines []string) {
 	if len(lines) == 0 {
 		return
 	}
-	e.PrintLines(lines)
-	e.redraw()
+	if !e.promptActive {
+		e.PrintLines(lines)
+		return
+	}
+	if e.originSaved {
+		fmt.Fprint(e.out, "\033[u\033[J")
+	} else {
+		fmt.Fprint(e.out, "\r\033[K")
+	}
+	e.writeLines(lines)
+	// Après les notifications, l'origine du prompt est déplacée sous celles-ci.
+	e.drawFresh()
 }
 
 func (e *editor) Feed(data []byte) editorResult {
@@ -122,6 +172,7 @@ func (e *editor) handleRune(r rune, result *editorResult) {
 	case '\r', '\n':
 		line := string(e.buf)
 		fmt.Fprint(e.out, "\r\n")
+		e.promptActive = false
 		if strings.TrimSpace(line) != "" {
 			e.history = append(e.history, line)
 			if len(e.history) > 200 {
@@ -138,10 +189,12 @@ func (e *editor) handleRune(r rune, result *editorResult) {
 		e.buf = nil
 		e.pos = 0
 		e.histIdx = len(e.history)
+		e.promptActive = false
 		result.Interrupted = true
 	case 0x04: // Ctrl-D
 		if len(e.buf) == 0 {
 			fmt.Fprint(e.out, "\r\n")
+			e.promptActive = false
 			result.EOF = true
 			return
 		}
@@ -185,7 +238,7 @@ func (e *editor) handleRune(r rune, result *editorResult) {
 		e.redraw()
 	case 0x0c: // Ctrl-L
 		fmt.Fprint(e.out, "\033[2J\033[H")
-		e.redraw()
+		e.drawFresh()
 	case 0x7f, 0x08: // Retour arrière
 		if e.pos > 0 {
 			e.buf = append(e.buf[:e.pos-1], e.buf[e.pos:]...)

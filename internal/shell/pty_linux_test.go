@@ -78,13 +78,31 @@ func waitPTYText(t *testing.T, got *ptyCollector, want string, timeout time.Dura
 }
 
 // ptyCurrentLine approxime la ligne visible : le dernier \r revient en début
-// de ligne, puis la séquence ANSI d'effacement est retirée.
+// de ligne, puis les séquences ANSI de contrôle sont retirées.
 func ptyCurrentLine(output string) string {
 	if i := strings.LastIndexByte(output, '\r'); i >= 0 {
 		output = output[i+1:]
 	}
-	output = strings.ReplaceAll(output, "\x1b[K", "")
-	return output
+	return stripCSI(output)
+}
+
+func stripCSI(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		if s[i] == 0x1b && i+1 < len(s) && s[i+1] == '[' {
+			j := i + 2
+			for j < len(s) && (s[j] < 0x40 || s[j] > 0x7e) {
+				j++
+			}
+			if j < len(s) {
+				i = j + 1
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
 }
 
 func waitPTYLine(t *testing.T, got *ptyCollector, want string, timeout time.Duration) {
@@ -155,6 +173,79 @@ func TestInteractiveTypingOneKeyAtATime(t *testing.T) {
 	}
 	if _, err := master.Write([]byte("\r")); err != nil {
 		t.Fatal(err)
+	}
+	waitPTYText(t, got, "Commandes CRL-CLI", 3*time.Second)
+
+	if _, err := master.Write([]byte("exit\r")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("shell : %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("le shell ne s'est pas arrêté après exit")
+	}
+}
+
+// TestInteractiveMintNotificationPreservesTypedInput vérifie qu'une capture
+// Mint reçue pendant la saisie est affichée au-dessus du prompt, puis que la
+// commande partielle est restaurée et peut être terminée normalement.
+func TestInteractiveMintNotificationPreservesTypedInput(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	master, slave := openPTY(t)
+	defer master.Close()
+	defer slave.Close()
+
+	hist := mint.NewHistory(mint.DefaultHistoryConfig())
+	mgr, err := mint.NewManager(mint.DefaultConfig(), hist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	notifs := make(chan mint.Notification, 4)
+	sh, err := New(Options{
+		In:            slave,
+		Out:           slave,
+		Builder:       request.New(),
+		Manager:       mgr,
+		Notifications: notifs,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := &ptyCollector{}
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := master.Read(buf)
+			if n > 0 {
+				got.write(buf[:n])
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- sh.Run(ctx) }()
+
+	waitPTYLine(t, got, "crl > ", 3*time.Second)
+	if _, err := master.Write([]byte("hel")); err != nil {
+		t.Fatalf("écriture PTY : %v", err)
+	}
+	waitPTYLine(t, got, "crl > hel", 3*time.Second)
+
+	notifs <- mint.Notification{Kind: "request", ID: 7, Method: "GET", URL: "http://example.test/api"}
+	waitPTYText(t, got, "[Mint] #7 GET http://example.test/api", 3*time.Second)
+	waitPTYLine(t, got, "crl > hel", 3*time.Second)
+
+	if _, err := master.Write([]byte("p\r")); err != nil {
+		t.Fatalf("écriture PTY : %v", err)
 	}
 	waitPTYText(t, got, "Commandes CRL-CLI", 3*time.Second)
 

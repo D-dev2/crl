@@ -25,8 +25,9 @@ import (
 )
 
 const (
-	prompt          = "crl > "
-	launchBodyLimit = 32 << 10
+	prompt           = "crl > "
+	launchBodyLimit  = 32 << 10
+	maxPendingEvents = 1024
 )
 
 // Options configure le shell.
@@ -61,6 +62,7 @@ type Shell struct {
 	lastResponseDir string
 	mintWatch       bool
 	pendingEvents   []mint.Notification
+	pendingDropped  int
 }
 
 type trackingWriter struct {
@@ -134,7 +136,7 @@ func (s *Shell) Close() {
 
 func (s *Shell) runBatch(ctx context.Context) error {
 	for s.scanner.Scan() {
-		s.drainNotifications(false)
+		s.drainNotifications()
 		s.out.reset()
 		if exit := s.Execute(s.scanner.Text()); exit {
 			return nil
@@ -143,7 +145,7 @@ func (s *Shell) runBatch(ctx context.Context) error {
 			fmt.Fprint(s.out, "\n")
 			s.out.reset()
 		}
-		s.drainNotifications(false)
+		s.drainNotifications()
 	}
 	return s.scanner.Err()
 }
@@ -173,11 +175,7 @@ func (s *Shell) runInteractive(ctx context.Context) error {
 				s.notifs = nil
 				continue
 			}
-			if s.mintWatch {
-				s.editor.Notify(s.formatNotification(n))
-			} else {
-				s.pendingEvents = append(s.pendingEvents, n)
-			}
+			s.handleNotification(n)
 		case data, ok := <-s.inputCh:
 			if !ok {
 				fmt.Fprint(s.out, "\r\n")
@@ -206,7 +204,7 @@ func (s *Shell) runInteractive(ctx context.Context) error {
 				if s.out.needsNewline() {
 					fmt.Fprint(s.out, "\r\n")
 				}
-				s.drainNotifications(true)
+				s.drainNotifications()
 			}
 			if exit {
 				return nil
@@ -239,7 +237,7 @@ func readInput(in io.Reader) <-chan []byte {
 	return ch
 }
 
-func (s *Shell) drainNotifications(interactive bool) {
+func (s *Shell) drainNotifications() {
 	if s.notifs == nil {
 		return
 	}
@@ -250,23 +248,39 @@ func (s *Shell) drainNotifications(interactive bool) {
 				s.notifs = nil
 				return
 			}
-			if !s.mintWatch {
-				s.pendingEvents = append(s.pendingEvents, n)
-				continue
-			}
-			lines := s.formatNotification(n)
-			if interactive && s.editor != nil {
-				// Les notifications sont affichées après la commande : on ne
-				// redessine pas le prompt ici, il l'est une seule fois ensuite.
-				s.editor.PrintLines(lines)
-			} else {
-				for _, line := range lines {
-					s.printf("%s\n", line)
-				}
-			}
+			s.handleNotification(n)
 		default:
 			return
 		}
+	}
+}
+
+// handleNotification est le point unique de traitement des événements Mint.
+// Il est appelé depuis la goroutine du shell, jamais depuis le pont Mint :
+// le terminal n'est donc écrit que pendant les phases où le shell contrôle
+// l'affichage. Les captures restent enregistrées même si l'affichage est
+// suspendu avec mint.watch off.
+func (s *Shell) handleNotification(n mint.Notification) {
+	if !s.mintWatch {
+		s.queuePendingEvent(n)
+		return
+	}
+	lines := s.formatNotification(n)
+	if len(lines) == 0 {
+		return
+	}
+	if s.editor != nil {
+		if s.editor.Active() {
+			s.editor.Notify(lines)
+		} else {
+			// Une commande vient de s'exécuter : le prompt sera redessiné une
+			// seule fois par runInteractive après le drainage.
+			s.editor.PrintLines(lines)
+		}
+		return
+	}
+	for _, line := range lines {
+		s.printf("%s\n", line)
 	}
 }
 
@@ -289,8 +303,25 @@ func (s *Shell) cmdMintWatch(rest string) {
 	}
 }
 
+func (s *Shell) queuePendingEvent(n mint.Notification) {
+	if len(s.pendingEvents) >= maxPendingEvents {
+		// Conserve les événements les plus récents sans laisser la file croître
+		// indéfiniment pendant une longue session avec mint.watch off.
+		copy(s.pendingEvents, s.pendingEvents[1:])
+		s.pendingEvents[len(s.pendingEvents)-1] = n
+		s.pendingDropped++
+		return
+	}
+	s.pendingEvents = append(s.pendingEvents, n)
+}
+
 func (s *Shell) cmdMintEvents() {
 	if len(s.pendingEvents) == 0 {
+		if s.pendingDropped > 0 {
+			s.printf("[Mint] Aucun événement en attente ; %d événement(s) ancien(s) ont été abandonnés (limite %d).\n", s.pendingDropped, maxPendingEvents)
+			s.pendingDropped = 0
+			return
+		}
 		s.printf("[Mint] Aucun événement en attente.\n")
 		return
 	}
@@ -298,6 +329,10 @@ func (s *Shell) cmdMintEvents() {
 		for _, line := range s.formatNotification(event) {
 			s.printf("%s\n", line)
 		}
+	}
+	if s.pendingDropped > 0 {
+		s.printf("[Mint] %d événement(s) ancien(s) ont été abandonnés (limite %d).\n", s.pendingDropped, maxPendingEvents)
+		s.pendingDropped = 0
 	}
 	s.printf("[Mint] %d événement(s) affiché(s).\n", len(s.pendingEvents))
 	s.pendingEvents = nil
@@ -663,14 +698,13 @@ func (s *Shell) cmdTable() {
 	}
 	headers := s.builder.Headers()
 	if len(headers) > 0 {
-		s.printf("\n  %s\n", p.BoldCyan(fmt.Sprintf("En-têtes (%d)", len(headers))))
-		header := padCell("EN-TÊTE", 28) + "  " + "VALEUR (masquée si sensible)"
-		s.printf("  %s\n", p.Bold(header))
-		s.rule(78)
+		names := make([]string, 0, len(headers))
 		for _, h := range headers {
-			name := padCell(truncate(h.Name, 28), 28)
-			s.printf("  %s  %s\n", p.BoldCyan(name), s.headerValue(h.Name, h.Value))
+			names = append(names, sanitizeTerminal(h.Name))
 		}
+		s.printf("\n  %s\n", p.BoldCyan(fmt.Sprintf("En-têtes (%d)", len(headers))))
+		s.printf("  %s\n", p.Dim(strings.Join(names, ", ")))
+		s.printf("  %s\n", p.Dim("crl.show affiche le détail complet des valeurs."))
 	}
 }
 
@@ -756,7 +790,7 @@ func (s *Shell) cmdLaunch(rest string) {
 	started := time.Now()
 	runErr := cmd.Run()
 	elapsed := time.Since(started)
-	if res.Source == "Mint (automatique)" {
+	if s.launchUsesMintProxy(res) {
 		s.reportMintCapture(started)
 	}
 	s.lastResponseDir = dir
@@ -802,10 +836,38 @@ func (s *Shell) cmdLaunch(rest string) {
 	s.printHTTPResponse(status, headers, meta, bodyPreview, total, bodyPath)
 }
 
+// launchUsesMintProxy reconnaît le proxy Mint qu'il soit choisi
+// automatiquement ou fourni explicitement avec la même URL.
+func (s *Shell) launchUsesMintProxy(res request.ProxyResolution) bool {
+	if res.None || res.URL == "" {
+		return false
+	}
+	mintURL, active := s.manager.ProxyURL()
+	return active && res.URL == mintURL
+}
+
 // reportMintCapture compare uniquement une capture récente de même méthode et
 // URL. En présence de trafic concurrent, l'absence de correspondance est
 // signalée au lieu d'attribuer arbitrairement une capture à crl.launch.
 func (s *Shell) reportMintCapture(started time.Time) {
+	// Le pont Mint est asynchrone : la capture de requête peut arriver juste
+	// après la fin de curl. On lui laisse une courte fenêtre, sans bloquer
+	// longtemps si le proxy n'a effectivement rien capturé.
+	deadline := time.Now().Add(250 * time.Millisecond)
+	for {
+		if c, ok := s.findRecentMintCapture(started); ok {
+			s.reportMintCaptureDiff(c)
+			return
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	s.printf("\n[Mint] Aucune capture Mint récente de même méthode et URL n'a été corrélée à cette requête. Consultez mint.requests ; en cas de trafic concurrent, vérifiez mint.request.show manuellement.\n")
+}
+
+func (s *Shell) findRecentMintCapture(started time.Time) (mint.Capture, bool) {
 	captures := s.history.List()
 	for i := len(captures) - 1; i >= 0; i-- {
 		c := captures[i]
@@ -815,30 +877,33 @@ func (s *Shell) reportMintCapture(started time.Time) {
 		if c.Request.Method != s.builder.Method() || c.Request.URL != s.builder.URL() {
 			continue
 		}
-		s.printf("\n[Mint] Capture réellement observée : #%d (%s %s). Comparez les en-têtes avec crl.show ; détail : mint.request.show %d.\n", c.ID, c.Request.Method, sanitizeTerminal(c.Request.URL), c.ID)
-		matched := make([]bool, len(c.Request.Headers))
-		for _, expected := range s.builder.Headers() {
-			found := false
-			for i, actual := range c.Request.Headers {
-				if !matched[i] && strings.EqualFold(expected.Name, actual.Name) && expected.Value == actual.Value {
-					found = true
-					matched[i] = true
-					break
-				}
-			}
-			if !found {
-				s.printf("[Mint] Différence observée pour l'en-tête %s : valeur préparée absente ou différente dans la capture.\n", sanitizeTerminal(expected.Name))
-			}
-		}
-		for i, actual := range c.Request.Headers {
-			if matched[i] {
-				continue
-			}
-			s.printf("[Mint] En-tête observé en plus ou avec une valeur différente : %s.\n", sanitizeTerminal(actual.Name))
-		}
-		return
+		return c, true
 	}
-	s.printf("\n[Mint] Aucune capture Mint récente de même méthode et URL n'a été corrélée à cette requête. Consultez mint.requests ; en cas de trafic concurrent, vérifiez mint.request.show manuellement.\n")
+	return mint.Capture{}, false
+}
+
+func (s *Shell) reportMintCaptureDiff(c mint.Capture) {
+	s.printf("\n[Mint] Capture récente de même méthode et URL : #%d (%s %s). La corrélation n'est pas garantie en cas de trafic concurrent ; comparez les en-têtes avec crl.show, détail : mint.request.show %d.\n", c.ID, sanitizeTerminal(c.Request.Method), sanitizeTerminal(c.Request.URL), c.ID)
+	matched := make([]bool, len(c.Request.Headers))
+	for _, expected := range s.builder.Headers() {
+		found := false
+		for i, actual := range c.Request.Headers {
+			if !matched[i] && strings.EqualFold(expected.Name, actual.Name) && expected.Value == actual.Value {
+				found = true
+				matched[i] = true
+				break
+			}
+		}
+		if !found {
+			s.printf("[Mint] Différence observée pour l'en-tête %s : valeur préparée absente ou différente dans la capture.\n", sanitizeTerminal(expected.Name))
+		}
+	}
+	for i, actual := range c.Request.Headers {
+		if matched[i] {
+			continue
+		}
+		s.printf("[Mint] En-tête observé en plus ou avec une valeur différente : %s.\n", sanitizeTerminal(actual.Name))
+	}
 }
 
 func curlExitCode(err error) int {
@@ -915,9 +980,9 @@ func (s *Shell) printHTTPResponse(status response.Status, headers response.Heade
 		case 400:
 			s.printf("  %s\n", p.Dim("400 : inspectez le corps et les en-têtes de réponse pour le détail fourni par le serveur."))
 		case 401:
-			s.printf("  %s\n", p.Dim("401 : comparez la requête préparée avec mint.requests puis mint.request.show <id> si Mint a capturé l'échange."))
+			s.printf("  %s\n", p.Dim("401 : comparez crl.show avec mint.requests puis mint.request.show <id> si Mint a capturé l'échange."))
 		case 403:
-			s.printf("  %s\n", p.Dim("403 : accès refusé par le serveur ; cela ne prouve pas que l'authentification est absente. Inspectez la requête et les règles d'accès."))
+			s.printf("  %s\n", p.Dim("403 : accès refusé par le serveur ; cela ne prouve pas que l'authentification est absente. Comparez crl.show et mint.request.show <id>, puis vérifiez les règles d'accès."))
 		case 404:
 			s.printf("  %s\n", p.Dim(fmt.Sprintf("404 : vérifiez le chemin, les paramètres et la méthode %s ; ce statut ne prouve pas à lui seul que la ressource n'existe pas.", s.builder.Method())))
 		}
@@ -1204,7 +1269,7 @@ func (s *Shell) cmdMintShow(rest string) {
 	s.field("Date", c.StartedAt.Local().Format("2006-01-02 15:04:05.000"))
 	s.field("URL", p.Cyan(sanitizeTerminal(c.Request.URL)))
 	s.field("Hôte", c.Request.Host)
-	s.field("Chemin", p.Cyan(display.MaskURL(c.PathAndQuery())))
+	s.field("Chemin", p.Cyan(sanitizeTerminal(c.PathAndQuery())))
 	if reasons := c.IncompleteReasons(); len(reasons) > 0 {
 		s.field("Complétude", p.BoldYellow("incomplète — "+strings.Join(reasons, " ; ")))
 	} else {
@@ -1518,9 +1583,11 @@ func (s *Shell) confirm(question string) bool {
 			case <-s.ctx.Done():
 				break loop
 			case n, ok := <-s.notifs:
-				if ok {
-					s.editor.Notify(s.formatNotification(n))
+				if !ok {
+					s.notifs = nil
+					continue
 				}
+				s.handleNotification(n)
 			case data, ok := <-s.inputCh:
 				if !ok {
 					break loop
@@ -1562,11 +1629,11 @@ func (s *Shell) printHelp() {
   crl.json <json>|clear       Définir ou effacer le corps JSON
   crl.body <texte>            Définir/afficher le corps brut
   crl.body.clear              Effacer le corps
-  crl.proxy <url|none|auto>   Proxy explicite (aucun, ou retour au proxy Mint auto)
+  crl.proxy <url|none|auto>   Définir le proxy (none/off : aucun ; auto/clear/unset : Mint auto)
   crl.proxy                   Afficher le proxy explicite et effectif
-  crl.ca <fichier|off>        CA de confiance pour curl (TLS toujours vérifié)
-  crl.show                    Afficher la requête préparée et ses en-têtes
-  crl.table                   Afficher un tableau récapitulatif
+  crl.ca <fichier|off>        CA PEM pour curl (off/none/clear : bundle système)
+  crl.show                    Afficher l'URL et les en-têtes complets, sans envoyer
+  crl.table                   Résumé avec URL masquée et noms d'en-têtes
   crl.output [mode]           auto|raw|pretty (sans argument : mode courant)
   crl.launch                  Envoyer la requête et présenter la réponse
   help | ?                    Afficher cette aide
@@ -1595,28 +1662,35 @@ Commandes Mint
 func (s *Shell) printMintHelp() {
 	s.printf(`Mint — capture HTTP via mitmproxy
 
-  mint.proxy on               Démarrer mitmdump et l'addon Mint
-  mint.proxy off              Arrêter uniquement le proxy lancé par CRL-CLI
-  mint.proxy status           État, port, captures, réponses, pont
-  mint.proxy config           Configuration effective et prérequis
-  mint.proxy.port <port>      Changer le port d'écoute (proxy arrêté)
+  PROXY
+  mint.proxy [status]          État du proxy, port, captures, réponses et pont
+  mint.proxy on|start          Démarrer mitmdump et attendre que Mint soit prêt
+  mint.proxy off|stop          Arrêter le proxy lancé par CRL-CLI ; garder l'historique
+  mint.proxy config            Afficher la configuration et les prérequis
+  mint.proxy.port <port>       Changer le port (proxy à l'arrêt)
 
-  mint.requests               Tableau des captures (filtre appliqué)
-  mint.watch on|off           Notifications automatiques (captures conservées)
-  mint.events                 Afficher les notifications mises en attente
-  mint.history                Tableau de tout l'historique
-  mint.request.show <id>      Requête, réponse, en-têtes et corps
-  mint.select <id>            Sélectionner une capture
-  mint.selected               Afficher la capture sélectionnée
-  mint.filter <texte>         Filtrer par hôte, URL ou chemin
-  mint.filter clear           Supprimer le filtre (historique conservé)
-  mint.clear                  Effacer les captures (confirmation)
-  mint.use <id>               Importer dans le constructeur, sans envoyer
+  CAPTURES ET NOTIFICATIONS
+  mint.requests                Lister les captures correspondant au filtre
+  mint.history                 Lister tout l'historique, sans appliquer le filtre
+  mint.watch [on|off]           Activer, suspendre ou afficher l'état des notifications
+  mint.events                  Afficher les notifications accumulées pendant watch off
+  mint.request.show <id>       Afficher le détail complet d'une capture (alias mint.show)
+  mint.select <id>             Sélectionner une capture pour mint.use
+  mint.selected                Afficher l'identifiant sélectionné
+  mint.filter <texte>          Filtrer par hôte, URL, chemin ou query string
+  mint.filter clear            Retirer le filtre ; l'historique reste intact
+  mint.clear [--yes|-y]        Vider l'historique ; demander confirmation par défaut
+  mint.use [id] [--force]      Importer une capture dans CRL, sans envoyer la requête
 
-Les notifications affichées rafraîchissent le prompt sans perdre la saisie.
-mint.watch off suspend l'affichage ; mint.requests conserve l'accès aux captures.
-Les commandes d'inspection affichent les valeurs complètes des en-têtes.
-mint.proxy config affiche l'état du processus, de l'addon et du pont local.
+DÉTAILS
+  mint.watch off met en attente les notifications ; les captures continuent
+  d'être enregistrées et restent consultables avec mint.requests/history.
+  mint.events vide cette file après affichage. Elle conserve au plus 1024
+  événements ; si elle déborde, les plus anciens sont abandonnés.
+  mint.use sans ID utilise mint.select ; --force remplace le constructeur
+  sans demander confirmation. Un corps de requête tronqué ne peut pas être importé.
+  Les commandes de détail affichent URL et valeurs d'en-têtes complètes.
+  Tapez help pour les commandes de construction et de rejeu CRL.
 `)
 }
 

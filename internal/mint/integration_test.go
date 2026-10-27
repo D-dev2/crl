@@ -2,17 +2,35 @@ package mint
 
 import (
 	"context"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"crl-cli/internal/request"
 )
+
+func newMintTestHTTPServer(t *testing.T, handler http.Handler) *httptest.Server {
+	t.Helper()
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) {
+			t.Skipf("environnement sans accès aux sockets loopback : %v", err)
+		}
+		t.Fatalf("impossible d'ouvrir un socket loopback pour le test : %v", err)
+	}
+	server := httptest.NewUnstartedServer(handler)
+	server.Listener = listener
+	server.Start()
+	return server
+}
 
 func TestAddonPythonSyntax(t *testing.T) {
 	if _, err := exec.LookPath("python3"); err != nil {
@@ -56,7 +74,7 @@ func TestRealMitmdumpCapture(t *testing.T) {
 	}
 	defer m.Close()
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newMintTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	}))

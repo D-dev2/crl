@@ -177,6 +177,9 @@ func TestEditorNotifyRedrawsWithoutLosingInput(t *testing.T) {
 	if strings.Contains(text, "\x00") {
 		t.Fatalf("caractère de contrôle non filtré :\n%q", text)
 	}
+	if !strings.Contains(text, "\033[u\033[J") {
+		t.Fatalf("notification sans retour à l'origine du prompt :\n%q", text)
+	}
 	if !strings.Contains(text, "crl > crl.sho") {
 		t.Fatalf("prompt non redessiné :\n%q", text)
 	}
@@ -188,6 +191,28 @@ func TestEditorNotifyRedrawsWithoutLosingInput(t *testing.T) {
 	e.Notify(nil)
 	if out.Len() != 0 {
 		t.Fatalf("Notify vide a écrit :\n%q", out.String())
+	}
+}
+
+func TestEditorNotifyRedrawsLongInputOnce(t *testing.T) {
+	e, out := newTestEditor(t)
+	e.DrawPrompt()
+	long := strings.Repeat("eyJhbGciOiJIUzI1NiJ9.", 80)
+	e.Feed([]byte(long))
+	if e.Text() != long {
+		t.Fatalf("saisie longue perdue : %d caractères", len(e.Text()))
+	}
+	out.Reset()
+	e.Notify([]string{"[Mint] #8 GET http://example.test/"})
+	text := out.String()
+	if strings.Count(text, "\033[u\033[J") != 1 {
+		t.Fatalf("retour à l'origine du prompt absent ou multiple :\n%q", text)
+	}
+	if strings.Count(text, "crl > ") != 1 {
+		t.Fatalf("prompt dupliqué après notification :\n%q", text)
+	}
+	if !strings.Contains(text, long) || e.Text() != long {
+		t.Fatal("saisie longue non restaurée après notification")
 	}
 }
 

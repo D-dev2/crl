@@ -12,7 +12,7 @@ constructeur `crl.*` sans l'envoyer.
 - Modes d'affichage `auto`, `raw` et `pretty`, sans modifier les octets reçus.
 - Proxy Mint démarré et arrêté par CRL-CLI, avec confirmation de disponibilité.
 - Capture en temps réel, historique, filtre, sélection et import.
-- Masquage des secrets à l'affichage, sans altérer les données de rejeu.
+- Affichage complet dans les commandes d'inspection, URL masquée dans les tableaux et notifications Mint.
 - Aucune dépendance Go externe : bibliothèque standard uniquement.
 - Installation portable dans `~/.local/bin`, sans chemin personnel en dur.
 
@@ -206,10 +206,13 @@ crl.launch
 
 `crl.output auto` rétablit la détection automatique.
 
-`crl.show` et `mint.request.show` affichent les valeurs complètes des en-têtes
-de requête et de réponse, y compris les valeurs d'authentification et les
-cookies. Attention à ne pas partager ces sorties. Les tableaux et notifications
-Mint restent limités aux informations d'identification d'une requête.
+`crl.show` et `mint.request.show` affichent l'URL complète (paramètres compris)
+et les valeurs complètes des en-têtes de requête ; `mint.request.show` affiche
+aussi les en-têtes de réponse. `crl.launch` affiche l'URL complète et les
+en-têtes de réponse complets. Ces sorties peuvent contenir des identifiants,
+des jetons ou des cookies : attention avant de les partager. `crl.table`, les
+tableaux Mint et les notifications Mint masquent les valeurs sensibles de
+l'URL et n'affichent pas les valeurs d'en-têtes.
 
 ### Capturer une requête avec Mint et l'importer
 
@@ -252,8 +255,8 @@ utilise automatiquement le proxy Mint. L'historique reste disponible après
 | `crl.proxy <url\|none\|auto>` | proxy explicite ; `none` désactive tout proxy ; `auto`, `clear` ou `unset` réactive le proxy Mint automatique |
 | `crl.proxy` | affiche le proxy explicite et le proxy effectif |
 | `crl.ca <fichier\|off>` | utilise un fichier CA PEM pour curl, sans désactiver la vérification TLS ; `off`/`none`/`clear` revient au bundle système |
-| `crl.show` | affiche la requête préparée et ses en-têtes complets, sans l'envoyer |
-| `crl.table` | affiche un tableau récapitulatif |
+| `crl.show` | affiche la requête préparée avec l'URL et les en-têtes complets, sans l'envoyer |
+| `crl.table` | affiche un tableau récapitulatif (URL masquée, noms d'en-têtes ; valeurs via `crl.show`) |
 | `crl.output [auto\|raw\|pretty]` | choisit le format d'affichage du corps des réponses ; sans argument, affiche le mode courant |
 | `crl.launch` | envoie la requête avec `curl` et présente la réponse |
 | `reset` | réinitialise le constructeur |
@@ -276,10 +279,13 @@ Notes :
 - Un statut HTTP 4xx ou 5xx est une réponse réelle du serveur, pas une erreur de
   connexion. Les délais dépassés et les erreurs réseau sont présentés séparément.
 - Les réponses 400, 401, 403 et 404 affichent une indication de diagnostic.
-  Quand `crl.launch` utilise le proxy Mint, CRL cherche une capture récente de
-  même méthode et URL et signale les différences d'en-têtes observées. En cas de
-  trafic concurrent ou de capture absente, la corrélation n'est pas certaine ;
-  vérifiez `mint.requests` et `mint.request.show <id>` manuellement.
+  Quand `crl.launch` utilise le proxy Mint, CRL attend brièvement une capture
+  récente de même méthode et URL, puis signale les différences d'en-têtes
+  observées. En cas de trafic concurrent, de capture tardive ou absente, la
+  corrélation n'est pas certaine ; comparez `crl.show` avec `mint.requests` et
+  `mint.request.show <id>` manuellement.
+- Un statut 403 ne signifie pas nécessairement qu'un en-tête d'authentification
+  manque : le serveur peut refuser la requête pour une autre règle d'accès.
 - L'affichage du corps est limité à 32 Kio ; toute troncature est signalée et le
   chemin du corps complet est affiché. Le fichier temporaire est supprimé au
   prochain `crl.launch` ou à la fermeture du shell.
@@ -305,6 +311,18 @@ Notes :
 | `mint.clear [--yes]` | efface l'historique après confirmation ; `--yes` ou `-y` évite la question |
 | `mint.use [id] [--force]` | importe une capture dans le constructeur CRL-CLI, sans envoyer de requête |
 | `mint.help` | affiche l'aide Mint |
+
+Avec `mint.watch off`, les notifications sont mises en attente sans interrompre
+la saisie. La file est plafonnée à 1024 événements ; au-delà, les plus anciens
+sont abandonnés et `mint.events` en indique le nombre.
+
+Les événements Mint sont lus et affichés par la goroutine du shell : le
+gestionnaire du proxy et le pont ne touchent jamais directement au terminal.
+Pendant la saisie, l'éditeur repart de l'origine mémorisée du prompt, efface
+tout le bloc affiché (y compris les lignes de continuation d'un collage long),
+affiche les notifications au-dessus, puis restaure le prompt et le texte déjà
+tapé. L'éditeur reste celui de la bibliothèque standard, sans dépendance
+externe de type readline.
 
 Comportement de `mint.use` :
 
@@ -350,7 +368,7 @@ curl --proxy http://127.0.0.1:8080 --noproxy "" http://127.0.0.1:5002/
 
 `crl.launch` sépare l'affichage en sections :
 
-1. résumé de la requête envoyée (méthode, URL masquée, proxy, mode) ;
+1. résumé de la requête envoyée (méthode, URL complète, proxy, mode) ;
 2. statut HTTP, durée, taille, type et version ;
 3. en-têtes de réponse ;
 4. corps de la réponse.
@@ -456,8 +474,7 @@ tests, afin de ne jamais polluer une sortie machine.
   erreur ;
 - les méthodes HTTP, les statuts et les identifiants de capture utilisent des
   couleurs distinctes dans `mint.requests` et `mint.request.show` ;
-- les titres de section, les libellés et les valeurs sensibles masquées sont
-  également différenciés ;
+- les titres de section et les libellés sont également différenciés ;
 - `crl.launch` colore les statuts 2xx, 3xx, 4xx et 5xx et sépare la requête, les
   en-têtes et le corps ;
 - `mint.proxy.config` affiche les états `ACTIF`, `ARRÊTÉ`, `ERREUR` et
@@ -516,11 +533,13 @@ démarrage du proxy, puis supprimé à l'arrêt.
   crash, le shell reste utilisable et signale l'erreur.
 - **Captures conservées** : arrêter le proxy ne supprime pas l'historique de la
   session. Quitter CRL-CLI le supprime, car tout est en mémoire.
-- **Masquage à l'affichage** : les noms d'en-tête contenant notamment
-  `authorization`, `cookie`, `token`, `secret`, `password`, `session` ou
-  `api-key` sont masqués, de même que les paramètres d'URL sensibles
-  (`token`, `key`, `code`, `signature`, etc.). Les notifications Mint utilisent
-  les mêmes règles. Les données internes d'import et de rejeu ne sont jamais
+- **Affichage des secrets** : `crl.show` et `mint.request.show` affichent l'URL
+  complète et les valeurs d'en-têtes complètes ; `crl.head` affiche les valeurs
+  complètes des en-têtes. `mint.request.show` inclut les en-têtes de réponse et
+  `crl.launch` affiche l'URL complète et les en-têtes de réponse complets.
+  `crl.table`, les tableaux Mint (`mint.requests`, `mint.history`) et les
+  notifications masquent les paramètres d'URL sensibles et n'affichent pas les
+  valeurs d'en-têtes. Les données internes d'import et de rejeu ne sont jamais
   modifiées.
 
 ### Association et troncature
@@ -554,9 +573,9 @@ capture est alors marquée incomplète ou en attente.
 - **Pas d'interception transparente** : Mint ne modifie pas les règles réseau du
   système.
 - **Données sensibles affichées** : les commandes d'inspection affichent les
-  valeurs d'en-têtes et les corps tels quels. Protégez leurs sorties si elles
-  contiennent des secrets. Les URL dans les tableaux restent formatées pour
-  limiter le bruit.
+  URL complètes ainsi que les valeurs d'en-têtes et les corps tels quels.
+  Protégez leurs sorties si elles contiennent des secrets. Les URL dans les
+  tableaux récapitulatifs restent formatées pour limiter le bruit.
 - **Troncature** : les corps dépassant `MINT_MAX_BODY_BYTES` sont tronqués et
   signalés. Un corps de requête tronqué bloque l'import.
 - **Filtre local** : `mint.filter` ne fait qu'un filtrage de texte insensible à
@@ -590,7 +609,8 @@ Résultats constatés lors de la dernière validation :
 
 Les tests couvrent notamment :
 
-- masquage des en-têtes, query strings et URL ;
+- affichage complet des en-têtes et URL dans les commandes d'inspection,
+  masquage dans les tableaux et notifications Mint ;
 - construction d'arguments curl, priorité des proxies, import et refus de
   capture incomplète ;
 - historique : association par `flow_id`, réponses en attente, erreurs,
@@ -599,15 +619,20 @@ Les tests couvrent notamment :
   séquentiels ;
 - gestionnaire Mint : démarrage/arrêt, crash, délai de démarrage, port occupé,
   redémarrage, arrêt propre et non-agression d'un processus sans rapport ;
-- shell : commandes, masquage, import, confirmation, lancement curl et
-  utilisabilité après un échec de démarrage de Mint ;
+- shell : commandes, affichage complet, import, confirmation, lancement curl,
+  rejeu des en-têtes `Authorization`/`Cookie` après sélection et import,
+  diagnostics 400/401/403/404 et utilisabilité après un échec de démarrage de
+  Mint ;
+- notifications Mint : file bornée avec `mint.watch off`, corrélation
+  asynchrone avec une capture récente et test PTY d'une notification reçue
+  pendant qu'une commande est en cours de saisie ;
 - réponses : analyse des en-têtes finaux, métadonnées curl, JSON/HTML, modes
   `auto`, `raw`, `pretty`, troncature, corps binaires et distinction des erreurs
   de transport ;
 - réponses temporaires : droits `0700`/`0600` et nettoyage à la fermeture ;
 - éditeur de ligne : saisie, retour arrière, UTF-8 fragmenté, historique,
   Ctrl-C, Ctrl-D, collage long sans duplication du prompt, notification avec
-  redessin et raccourcis d'édition ;
+  redessin complet depuis l'origine du prompt et raccourcis d'édition ;
 - addon Python : compilation syntaxique et test d'intégration avec un vrai
   `mitmdump`.
 
