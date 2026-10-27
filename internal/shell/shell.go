@@ -1619,43 +1619,43 @@ func (s *Shell) confirm(question string) bool {
 
 func (s *Shell) printHelp() {
 	s.printf(`Commandes CRL-CLI
-  crl.host <url>              Définir l'URL (chemin et requête conservés)
-  crl.host                    Afficher l'URL courante (masquée)
-  crl.method <méthode>        Définir la méthode HTTP
-  crl.head <Nom: valeur>      Ajouter/remplacer un en-tête (alias : crl.header)
-  crl.head                    Lister les en-têtes
-  crl.head clear [Nom]        Supprimer un ou tous les en-têtes
-  crl.head.clear [Nom]        Alias explicite de suppression
-  crl.json <json>|clear       Définir ou effacer le corps JSON
-  crl.body <texte>            Définir/afficher le corps brut
-  crl.body.clear              Effacer le corps
-  crl.proxy <url|none|auto>   Définir le proxy (none/off : aucun ; auto/clear/unset : Mint auto)
+  crl.host <url>              Définir l'URL ; sans argument, l'afficher
+  crl.method <méthode>        Définir la méthode ; sans argument, l'afficher
+  crl.head/header <Nom: val>  Ajouter/remplacer un en-tête
+  crl.head                    Lister les en-têtes et leurs valeurs
+  crl.head clear [Nom]        Supprimer un en-tête ou tous les en-têtes
+  crl.head.clear [Nom]        Alias de suppression (aussi crl.header.clear)
+  crl.json <json>|clear       Définir du JSON valide ou effacer le corps
+  crl.body [texte|clear]      Définir, afficher ou effacer le corps brut
+  crl.body.clear              Alias pour effacer le corps
+  crl.proxy <url|none|auto>   Définir le proxy (off=none ; clear/unset=auto)
   crl.proxy                   Afficher le proxy explicite et effectif
-  crl.ca <fichier|off>        CA PEM pour curl (off/none/clear : bundle système)
-  crl.show                    Afficher l'URL et les en-têtes complets, sans envoyer
-  crl.table                   Résumé avec URL masquée et noms d'en-têtes
-  crl.output [mode]           auto|raw|pretty (sans argument : mode courant)
-  crl.launch                  Envoyer la requête et présenter la réponse
-  help | ?                    Afficher cette aide
+  crl.ca [fichier|off]        Définir/afficher le CA PEM (off/none/clear : système)
+  crl.show                    Afficher URL et en-têtes complets, sans envoyer
+  crl.table                   Résumé avec valeurs d'URL sensibles masquées
+  crl.output [auto|raw|pretty] Choisir le rendu du corps des réponses
+  crl.launch                  Envoyer la requête avec curl et afficher la réponse
   reset                       Réinitialiser le constructeur
-  clear                       Effacer l'écran
-  exit | quit                 Quitter (le proxy Mint est arrêté proprement)
+  clear                       Effacer l'écran en mode interactif
+  help | ?                    Afficher cette aide
+  exit | quit                 Quitter et arrêter proprement Mint
 
-Commandes Mint
-  mint.proxy on|off|status    Contrôler le proxy géré
-  mint.proxy.config           Afficher la configuration effective
-  mint.proxy.port <port>      Changer le port (proxy arrêté)
-  mint.requests               Lister les captures (filtre appliqué)
-  mint.watch on|off           Activer ou suspendre les notifications automatiques
-  mint.events                 Afficher les notifications mises en attente
-  mint.history                Lister tout l'historique
-  mint.request.show <id>      Détail complet d'une capture
-  mint.select <id>            Sélectionner une capture
-  mint.selected               Afficher la sélection
-  mint.filter <texte|clear>   Filtrer hôte/URL/chemin sans effacer l'historique
-  mint.clear [--yes]          Effacer l'historique (confirmation demandée)
-  mint.use [id] [--force]     Importer une capture dans CRL-CLI, sans l'envoyer
-  mint.help                   Afficher cette aide
+Commandes Mint (aide détaillée : mint.help)
+  mint.proxy [status]         Afficher l'état du proxy
+  mint.proxy on|start          Démarrer le proxy ; off|stop l'arrêter
+  mint.proxy config            Configuration effective et prérequis
+  mint.proxy.port <port>       Changer le port lorsque le proxy est arrêté
+  mint.requests                Lister les captures selon le filtre courant
+  mint.history                 Lister toutes les captures, sans filtre
+  mint.watch [on|off]           Activer/suspendre les notifications, ou afficher l'état
+  mint.events                  Afficher et vider les notifications mises en attente
+  mint.request.show <id>       Détail complet (alias : mint.show)
+  mint.select <id>             Sélectionner une capture pour l'import
+  mint.selected                Afficher la capture sélectionnée
+  mint.filter <texte|clear>    Filtrer par hôte, URL, chemin ou query string
+  mint.clear [--yes|-y]        Vider l'historique (confirmation sauf avec --yes)
+  mint.use [id] [--force]      Importer dans CRL sans envoyer la requête
+  mint | mint.help             Afficher l'aide détaillée de Mint
 `)
 }
 

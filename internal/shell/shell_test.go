@@ -846,6 +846,26 @@ func TestUnknownCommand(t *testing.T) {
 	}
 }
 
+func TestHelpListsRecentCRLAndMintCommands(t *testing.T) {
+	sh, out, _, _, _ := newTestShell(t, "")
+	sh.Execute("help")
+	for _, command := range []string{
+		"crl.ca", "crl.table", "crl.output", "mint.watch", "mint.events",
+		"mint.history", "mint.filter", "mint.use", "mint.help",
+	} {
+		if !strings.Contains(out.String(), command) {
+			t.Errorf("help does not list %s:\n%s", command, out.String())
+		}
+	}
+	out.Reset()
+	sh.Execute("mint.help")
+	for _, command := range []string{"mint.watch", "mint.events", "mint.filter", "mint.use"} {
+		if !strings.Contains(out.String(), command) {
+			t.Errorf("mint.help does not list %s:\n%s", command, out.String())
+		}
+	}
+}
+
 func freeLoopbackPort(t *testing.T) int {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
