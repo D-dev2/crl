@@ -1553,18 +1553,23 @@ func (s *Shell) confirm(question string) bool {
 func (s *Shell) printHelp() {
 	s.printf(`Commandes CRL-CLI
   crl.host <url>              Définir l'URL (chemin et requête conservés)
+  crl.host                    Afficher l'URL courante (masquée)
   crl.method <méthode>        Définir la méthode HTTP
-  crl.head <Nom: valeur>      Ajouter/remplacer un en-tête
+  crl.head <Nom: valeur>      Ajouter/remplacer un en-tête (alias : crl.header)
+  crl.head                    Lister les en-têtes
   crl.head clear [Nom]        Supprimer un ou tous les en-têtes
+  crl.head.clear [Nom]        Alias explicite de suppression
   crl.json <json>|clear       Définir ou effacer le corps JSON
-  crl.body.clear              Alias pour effacer le corps
-  crl.body <texte>            Définir un corps brut (crl.body.clear pour l'effacer)
+  crl.body <texte>            Définir/afficher le corps brut
+  crl.body.clear              Effacer le corps
   crl.proxy <url|none|auto>   Proxy explicite (aucun, ou retour au proxy Mint auto)
+  crl.proxy                   Afficher le proxy explicite et effectif
   crl.ca <fichier|off>        CA de confiance pour curl (TLS toujours vérifié)
   crl.show                    Afficher la requête préparée et ses en-têtes
   crl.table                   Afficher un tableau récapitulatif
   crl.output [mode]           auto|raw|pretty (sans argument : mode courant)
   crl.launch                  Envoyer la requête et présenter la réponse
+  help | ?                    Afficher cette aide
   reset                       Réinitialiser le constructeur
   clear                       Effacer l'écran
   exit | quit                 Quitter (le proxy Mint est arrêté proprement)
