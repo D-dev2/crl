@@ -44,7 +44,7 @@ constructeur `crl.*` sans l'envoyer.
 
 | Outil | Rôle | Remarque |
 |---|---|---|
-| Go 1.23 ou plus récent | compilation | aucune dépendance Go externe |
+| Go 1.22 ou plus récent | compilation | aucune dépendance Go externe |
 | `curl` | envoi des requêtes | vérifié au moment de `crl.launch` |
 | `mitmdump` (mitmproxy) | capture Mint | uniquement nécessaire pour Mint |
 | Linux ou macOS | édition interactive | ailleurs, le shell fonctionne en mode non interactif |
@@ -701,6 +701,18 @@ Fichiers importants :
 | `scripts/install-fish-path.sh` | configuration du PATH universel de Fish |
 
 ## Dépannage
+
+**`go: downloading go1.23 ... toolchain not available`**
+
+CRL-CLI demande Go 1.22 ou plus récent. Vérifiez la version active avec
+`go version`. Si elle est antérieure à 1.22, installez Go 1.22+ ; si elle est
+déjà suffisante, vérifiez qu'un fichier `go.work` ou une variable
+`GOTOOLCHAIN` ne force pas une autre version :
+
+```sh
+go version
+go env GOTOOLCHAIN GOWORK
+```
 
 **`compile: version "go1.22.2" does not match go tool version "go1.23.6"`**
 
