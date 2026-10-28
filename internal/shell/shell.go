@@ -211,13 +211,14 @@ func (s *Shell) runInteractive(ctx context.Context) error {
 						s.multilineBuf.Reset()
 						s.multilineInitial = nil
 						s.drainNotifications()
+						s.out.reset()
+						s.editor.Reset()
+						s.editor.SetPrompt(s.promptText())
+						s.editor.DrawPrompt()
 						continue
 					}
 					if strings.TrimSpace(trimmed) == ":end" {
 						content := s.multilineBuf.String()
-						if content != "" && !strings.HasSuffix(content, "\n") {
-							// keep as is? usually fine
-						}
 						if s.multilineMode == "json" {
 							if !json.Valid([]byte(content)) {
 								s.errorf("JSON invalide ; corps précédent conservé")
@@ -236,6 +237,10 @@ func (s *Shell) runInteractive(ctx context.Context) error {
 						s.multilineBuf.Reset()
 						s.multilineInitial = nil
 						s.drainNotifications()
+						s.out.reset()
+						s.editor.Reset()
+						s.editor.SetPrompt(s.promptText())
+						s.editor.DrawPrompt()
 						continue
 					}
 					s.multilineBuf.WriteString(line)
@@ -671,7 +676,7 @@ func (s *Shell) startMultilineJSON() {
 			s.printf("\n")
 		}
 	}
-	s.printf("[CRL] Saisie JSON multiligne en cours. Terminez avec une ligne isolée ':end'. Annulez avec ':cancel'.\n")
+	s.printf("[CRL] Saisie JSON multiligne en cours. Tapez votre JSON ligne par ligne. Terminez par une ligne isolée ':end'. Annulez avec ':cancel'.\n")
 	s.printf("[CRL] La saisie fournira un nouveau document JSON complet.\n")
 	s.multilineMode = "json"
 	s.multilineBuf.Reset()
@@ -703,7 +708,7 @@ func (s *Shell) startMultilineBody() {
 			s.printf("\n")
 		}
 	}
-	s.printf("[CRL] Saisie corps multiligne en cours. Terminez avec une ligne isolée ':end'. Annulez avec ':cancel'.\n")
+	s.printf("[CRL] Saisie corps multiligne en cours. Tapez votre corps ligne par ligne. Terminez par une ligne isolée ':end'. Annulez avec ':cancel'.\n")
 	s.multilineMode = "body"
 	s.multilineBuf.Reset()
 	s.out.reset()
@@ -1002,6 +1007,45 @@ func (s *Shell) cmdLaunch(rest string) {
 		s.errorf("crl.launch n'accepte aucun argument")
 		return
 	}
+	// Check for selected captures
+	if s.history != nil {
+		selected := s.history.SelectedMany()
+		if len(selected) > 1 {
+			// Execute in parallel
+			s.cmdMintReplay("")
+			return
+		}
+		if len(selected) == 1 {
+			// Execute this single capture like before
+			c := selected[0]
+			if importable, reason := c.Importable(); !importable {
+				s.errorf("capture #%d non exploitable : %s", c.ID, reason)
+				return
+			}
+			b := request.New()
+			headers := make([]request.Header, 0, len(c.Request.Headers))
+			for _, h := range c.Request.Headers {
+				headers = append(headers, request.Header{Name: h.Name, Value: h.Value})
+			}
+			if err := b.Import(request.CapturedRequest{URL: c.Request.URL, Method: c.Request.Method, Headers: headers, Body: c.Request.Body, BodyPresent: len(c.Request.Body) > 0}); err != nil {
+				s.errorf("%v", err)
+				return
+			}
+			if err := b.SetProxy("none"); err != nil {
+				s.errorf("%v", err)
+				return
+			}
+			res := b.ResolveProxy("", false)
+			args, err := b.CurlArgs(res)
+			if err != nil {
+				s.errorf("%v", err)
+				return
+			}
+			// reuse launch logic with builder b
+			s.launchWithBuilder(b, args, res)
+			return
+		}
+	}
 	if s.builder.URL() == "" {
 		s.errorf("aucune URL configurée : utilisez crl.host <url>")
 		return
@@ -1016,6 +1060,10 @@ func (s *Shell) cmdLaunch(rest string) {
 		s.errorf("%v", err)
 		return
 	}
+	s.launchWithBuilder(s.builder, args, res)
+}
+
+func (s *Shell) launchWithBuilder(b *request.Builder, args []string, res request.ProxyResolution) {
 
 	s.clearLastResponse()
 	dir, err := os.MkdirTemp("", "crl-response-*")
@@ -1038,19 +1086,19 @@ func (s *Shell) cmdLaunch(rest string) {
 	p := s.pal
 	s.printf("%s\n", p.BoldGreen("[CRL] Requête envoyée"))
 	s.rule(78)
-	s.field("Méthode", p.Method(s.builder.Method()))
-	s.field("URL", p.Cyan(sanitizeTerminal(s.builder.URL())))
+	s.field("Méthode", p.Method(b.Method()))
+	s.field("URL", p.Cyan(sanitizeTerminal(b.URL())))
 	s.field("Proxy", s.proxyValue(res))
 	s.field("Sortie", p.Cyan(s.outputMode.ShortLabel()))
-	s.field("Requête", fmt.Sprintf("%d en-tête(s), corps %s", len(s.builder.Headers()), display.FormatBytes(int64(s.builder.BodySize()))))
+	s.field("Requête", fmt.Sprintf("%d en-tête(s), corps %s", len(b.Headers()), display.FormatBytes(int64(b.BodySize()))))
 
 	ctx := s.ctx
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	cmd := exec.CommandContext(ctx, "curl", args...)
-	if s.builder.BodySet() {
-		cmd.Stdin = s.builder.BodyReader()
+	if b.BodySet() {
+		cmd.Stdin = b.BodyReader()
 	}
 	var metaOut, stderr bytes.Buffer
 	cmd.Stdout = &metaOut
@@ -1085,7 +1133,7 @@ func (s *Shell) cmdLaunch(rest string) {
 		}
 		if status.Code > 0 {
 			s.printf("\n%s\n", p.BoldYellow(fmt.Sprintf("[CRL] Transport : %s (curl %d) — un statut HTTP a tout de même été reçu.", failure.Label, failure.Code)))
-			s.printHTTPResponse(status, headers, meta, bodyPreview, total, bodyPath)
+			s.printHTTPResponseWithBuilder(b, status, headers, meta, bodyPreview, total, bodyPath)
 			return
 		}
 		s.printTransportFailure(failure)
@@ -1101,7 +1149,7 @@ func (s *Shell) cmdLaunch(rest string) {
 		s.clearLastResponse()
 		return
 	}
-	s.printHTTPResponse(status, headers, meta, bodyPreview, total, bodyPath)
+	s.printHTTPResponseWithBuilder(b, status, headers, meta, bodyPreview, total, bodyPath)
 }
 
 // launchUsesMintProxy reconnaît le proxy Mint qu'il soit choisi
@@ -1213,12 +1261,16 @@ func (s *Shell) printTransportFailure(failure response.CurlFailure) {
 }
 
 func (s *Shell) printHTTPResponse(status response.Status, headers response.Headers, meta response.CurlMeta, body []byte, total int64, bodyPath string) {
+	s.printHTTPResponseWithBuilder(s.builder, status, headers, meta, body, total, bodyPath)
+}
+
+func (s *Shell) printHTTPResponseWithBuilder(b *request.Builder, status response.Status, headers response.Headers, meta response.CurlMeta, body []byte, total int64, bodyPath string) {
 	p := s.pal
 	s.printf("\n%s\n", p.BoldGreen("[CRL] Réponse HTTP"))
 	s.rule(78)
 	s.field("Statut", p.StatusCode(status.Code, sanitizeTerminal(status.Label())))
-	s.field("Méthode", p.Method(s.builder.Method()))
-	s.field("URL demandée", p.Cyan(sanitizeTerminal(s.builder.URL())))
+	s.field("Méthode", p.Method(b.Method()))
+	s.field("URL demandée", p.Cyan(sanitizeTerminal(b.URL())))
 	s.field("Durée", p.Cyan(durationLabel(meta.Duration)))
 	s.field("Taille", p.Bold(display.FormatBytes(total)))
 	if contentType := headers.ContentType(); contentType != "" {
@@ -1252,7 +1304,7 @@ func (s *Shell) printHTTPResponse(status response.Status, headers response.Heade
 		case 403:
 			s.printf("  %s\n", p.Dim("403 : accès refusé par le serveur ; cela ne prouve pas que l'authentification est absente. Comparez crl.show et mint.request.show <id>, puis vérifiez les règles d'accès."))
 		case 404:
-			s.printf("  %s\n", p.Dim(fmt.Sprintf("404 : vérifiez le chemin, les paramètres et la méthode %s ; ce statut ne prouve pas à lui seul que la ressource n'existe pas.", s.builder.Method())))
+			s.printf("  %s\n", p.Dim(fmt.Sprintf("404 : vérifiez le chemin, les paramètres et la méthode %s ; ce statut ne prouve pas à lui seul que la ressource n'existe pas.", b.Method())))
 		}
 	} else if status.Code >= 300 && status.Code < 400 {
 		s.printf("  %s\n", p.Cyan("Redirection reçue ; curl ne la suit pas automatiquement."))
