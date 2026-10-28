@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -49,7 +50,13 @@ type Shell struct {
 	builder *request.Builder
 	manager *mint.Manager
 	history *mint.History
-	notifs  <-chan mint.Notification
+	// requestEdits holds independent working copies of captured requests.
+	requestEdits        map[int]*request.Builder
+	requestBodyReplaced map[int]bool
+	activeMintID        int
+	replayBodies        map[int]string
+	replayDirs          []string
+	notifs              <-chan mint.Notification
 
 	interactive bool
 	editor      *editor
@@ -71,9 +78,10 @@ type Shell struct {
 	lastBatchFail    int
 	lastBatchSet     bool
 
-	multilineMode    string // "json" or "body" or ""
-	multilineBuf     strings.Builder
-	multilineInitial []byte
+	multilineMode      string // "json" or "body" or ""
+	multilineBuf       strings.Builder
+	multilineInitial   []byte
+	multilineTargetIDs []int
 }
 
 type trackingWriter struct {
@@ -111,16 +119,19 @@ func New(opts Options) (*Shell, error) {
 
 	tw := &trackingWriter{w: opts.Out}
 	s := &Shell{
-		in:         opts.In,
-		out:        tw,
-		builder:    opts.Builder,
-		manager:    opts.Manager,
-		history:    opts.Manager.History(),
-		notifs:     opts.Notifications,
-		mintWatch:  true,
-		scanner:    bufio.NewScanner(opts.In),
-		pal:        termstyle.New(opts.Out),
-		outputMode: response.ModeAuto,
+		in:                  opts.In,
+		out:                 tw,
+		builder:             opts.Builder,
+		manager:             opts.Manager,
+		history:             opts.Manager.History(),
+		requestEdits:        make(map[int]*request.Builder),
+		requestBodyReplaced: make(map[int]bool),
+		replayBodies:        make(map[int]string),
+		notifs:              opts.Notifications,
+		mintWatch:           true,
+		scanner:             bufio.NewScanner(opts.In),
+		pal:                 termstyle.New(opts.Out),
+		outputMode:          response.ModeAuto,
 	}
 	s.scanner.Buffer(make([]byte, 64<<10), 2<<20)
 	if f, ok := opts.In.(*os.File); ok && termstyle.IsTerminal(f.Fd()) {
@@ -143,6 +154,7 @@ func (s *Shell) Run(ctx context.Context) error {
 // l'appeler plusieurs fois.
 func (s *Shell) Close() {
 	s.clearLastResponse()
+	s.clearReplayArtifacts()
 }
 
 func (s *Shell) runBatch(ctx context.Context) error {
@@ -210,6 +222,7 @@ func (s *Shell) runInteractive(ctx context.Context) error {
 						s.multilineMode = ""
 						s.multilineBuf.Reset()
 						s.multilineInitial = nil
+						s.multilineTargetIDs = nil
 						s.drainNotifications()
 						s.out.reset()
 						s.editor.Reset()
@@ -222,6 +235,28 @@ func (s *Shell) runInteractive(ctx context.Context) error {
 						if s.multilineMode == "json" {
 							if !json.Valid([]byte(content)) {
 								s.errorf("JSON invalide ; corps précédent conservé")
+							} else if len(s.multilineTargetIDs) > 0 {
+								ok, failed := 0, 0
+								for _, id := range s.multilineTargetIDs {
+									c, found := s.history.Get(id)
+									if !found {
+										failed++
+										s.errorf("requête #%d introuvable", id)
+										continue
+									}
+									b, e := s.requestBuilderFor(c)
+									if e == nil {
+										e = b.SetJSON(content)
+									}
+									if e != nil {
+										failed++
+										s.errorf("requête #%d : %v", id, e)
+									} else {
+										s.requestBodyReplaced[id] = true
+										ok++
+									}
+								}
+								s.printf("[CRL] JSON appliqué : %d réussite(s), %d échec(s).\n", ok, failed)
 							} else {
 								if err := s.builder.SetJSON(content); err != nil {
 									s.errorf("%v", err)
@@ -230,12 +265,33 @@ func (s *Shell) runInteractive(ctx context.Context) error {
 								}
 							}
 						} else if s.multilineMode == "body" {
-							s.builder.SetBody([]byte(content))
-							s.printf("[CRL] Corps brut configuré (%d octets).\n", len(content))
+							if len(s.multilineTargetIDs) > 0 {
+								ok, failed := 0, 0
+								for _, id := range s.multilineTargetIDs {
+									if c, found := s.history.Get(id); found {
+										if b, e := s.requestBuilderFor(c); e == nil {
+											b.SetBody([]byte(content))
+											s.requestBodyReplaced[id] = true
+											ok++
+											continue
+										} else {
+											s.errorf("requête #%d : %v", id, e)
+										}
+									} else {
+										s.errorf("requête #%d introuvable", id)
+									}
+									failed++
+								}
+								s.printf("[CRL] Corps appliqué : %d réussite(s), %d échec(s).\n", ok, failed)
+							} else {
+								s.builder.SetBody([]byte(content))
+								s.printf("[CRL] Corps brut configuré (%d octets).\n", len(content))
+							}
 						}
 						s.multilineMode = ""
 						s.multilineBuf.Reset()
 						s.multilineInitial = nil
+						s.multilineTargetIDs = nil
 						s.drainNotifications()
 						s.out.reset()
 						s.editor.Reset()
@@ -453,6 +509,7 @@ func (s *Shell) Execute(line string) bool {
 		return false
 	case "reset":
 		s.builder.Reset()
+		s.activeMintID = 0
 		s.printf("[CRL] Constructeur réinitialisé.\n")
 		return false
 	case "crl.host":
@@ -469,6 +526,8 @@ func (s *Shell) Execute(line string) bool {
 			s.printf("[CRL] Corps supprimé.\n")
 		} else if strings.TrimSpace(rest) == "" {
 			s.startMultilineJSON()
+		} else if words := shellWords(rest); len(words) > 1 && (strings.EqualFold(words[1], "set") || strings.EqualFold(words[1], "delete") || strings.EqualFold(words[1], "edit") || strings.EqualFold(words[1], "clear")) {
+			s.cmdTargetJSON(rest)
 		} else if strings.HasPrefix(strings.TrimSpace(rest), "set ") {
 			s.cmdJSONSet(rest)
 		} else if strings.HasPrefix(strings.TrimSpace(rest), "delete ") {
@@ -482,6 +541,8 @@ func (s *Shell) Execute(line string) bool {
 			s.printf("[CRL] Corps supprimé.\n")
 		} else if strings.TrimSpace(rest) == "" {
 			s.startMultilineBody()
+		} else if words := shellWords(rest); len(words) > 1 && (strings.EqualFold(words[1], "edit") || strings.EqualFold(words[1], "clear") || strings.EqualFold(words[1], "set")) {
+			s.cmdTargetBody(rest)
 		} else {
 			s.cmdBody(rest)
 		}
@@ -493,7 +554,7 @@ func (s *Shell) Execute(line string) bool {
 	case "crl.ca":
 		s.cmdCA(rest)
 	case "crl.show":
-		s.cmdShow()
+		s.cmdShow(rest)
 	case "crl.table":
 		s.cmdTable()
 	case "crl.launch":
@@ -556,6 +617,8 @@ func (s *Shell) executeMint(cmd, rest string) {
 		s.cmdMintSelected()
 	case "mint.replay":
 		s.cmdMintReplay(rest)
+	case "mint.replay.body":
+		s.cmdMintReplayBody(rest)
 	case "mint.filter":
 		s.cmdMintFilter(rest)
 	case "mint.clear":
@@ -588,6 +651,15 @@ func (s *Shell) cmdSetMethod(rest string) {
 		s.printf("[CRL] Méthode : %s\n", s.builder.Method())
 		return
 	}
+	if words := shellWords(rest); len(words) >= 3 && strings.EqualFold(words[1], "set") {
+		captures, err := s.resolveTargets(strings.Join(words[2:], " "))
+		if err != nil {
+			s.errorf("%v", err)
+			return
+		}
+		s.applyCaptureChanges(captures, func(b *request.Builder) error { return b.SetMethod(words[0]) })
+		return
+	}
 	if err := s.builder.SetMethod(rest); err != nil {
 		s.errorf("%v", err)
 		return
@@ -596,6 +668,11 @@ func (s *Shell) cmdSetMethod(rest string) {
 }
 
 func (s *Shell) cmdHeader(rest string) {
+	words := shellWords(rest)
+	if len(words) > 0 && (strings.EqualFold(words[0], "set") || strings.EqualFold(words[0], "delete") || strings.EqualFold(words[0], "show")) {
+		s.cmdTargetHeader(words)
+		return
+	}
 	switch {
 	case rest == "":
 		headers := s.builder.Headers()
@@ -671,7 +748,8 @@ func (s *Shell) startMultilineJSON() {
 	}
 	body := s.builder.Body()
 	if s.builder.BodySet() && len(body) > 0 {
-		s.printf("[CRL] Corps JSON actuel (référence) :\n%s\n", string(body))
+		preview, _ := display.RenderBody(display.MaskBody(body), 0)
+		s.printf("[CRL] Corps JSON actuel (référence masquée) :\n%s\n", preview)
 		if !strings.HasSuffix(string(body), "\n") {
 			s.printf("\n")
 		}
@@ -703,7 +781,8 @@ func (s *Shell) startMultilineBody() {
 	}
 	body := s.builder.Body()
 	if s.builder.BodySet() && len(body) > 0 {
-		s.printf("[CRL] Corps actuel (référence) :\n%s\n", string(body))
+		preview, _ := display.RenderBody(display.MaskBody(body), 0)
+		s.printf("[CRL] Corps actuel (référence masquée) :\n%s\n", preview)
 		if !strings.HasSuffix(string(body), "\n") {
 			s.printf("\n")
 		}
@@ -718,80 +797,222 @@ func (s *Shell) startMultilineBody() {
 }
 
 func (s *Shell) cmdJSONSet(rest string) {
-	// rest is like: set role = "admin" or set user.role = "admin"
 	trim := strings.TrimSpace(rest)
 	if !strings.HasPrefix(trim, "set ") {
 		s.errorf("usage : crl.json set <chemin> = <valeur JSON>")
 		return
 	}
-	expr := strings.TrimSpace(trim[4:])
-	eq := strings.Index(expr, "=")
-	if eq < 0 {
-		s.errorf("usage : crl.json set <chemin> = <valeur JSON>")
+	if err := updateJSONBuilder(s.builder, "set", strings.TrimSpace(trim[4:])); err != nil {
+		s.errorf("%v", err)
 		return
 	}
-	path := strings.TrimSpace(expr[:eq])
-	valStr := strings.TrimSpace(expr[eq+1:])
-	if path == "" {
-		s.errorf("chemin invalide")
-		return
-	}
+	s.printf("[CRL] Champ JSON mis à jour (%d octets).\n", s.builder.BodySize())
+}
 
-	body := s.builder.Body()
-	if !s.builder.BodySet() || len(body) == 0 {
-		body = []byte("{}")
-	}
-	var root interface{}
-	if err := json.Unmarshal(body, &root); err != nil {
-		s.errorf("JSON existant invalide")
+func (s *Shell) cmdTargetJSON(rest string) {
+	words := shellWords(rest)
+	if len(words) < 2 {
+		s.errorf("usage : crl.json <cible> set|delete|clear|edit …")
 		return
 	}
-	m, ok := root.(map[string]interface{})
-	if !ok {
-		s.errorf("le JSON existant n'est pas un objet compatible")
-		return
-	}
-
-	var val interface{}
-	if err := json.Unmarshal([]byte(valStr), &val); err != nil {
-		// Try as string if not valid JSON
-		s.errorf("valeur JSON invalide")
-		return
-	}
-
-	// handle nested path
-	parts := strings.Split(path, ".")
-	cur := m
-	for i := 0; i < len(parts)-1; i++ {
-		key := parts[i]
-		if cur[key] == nil {
-			nm := map[string]interface{}{}
-			cur[key] = nm
-			cur = nm
-			continue
-		}
-		if nm, ok := cur[key].(map[string]interface{}); ok {
-			cur = nm
-			continue
-		}
-		s.errorf("chemin invalide")
-		return
-	}
-	cur[parts[len(parts)-1]] = val
-
-	out, err := json.Marshal(root)
+	captures, err := s.resolveTargets(words[0])
 	if err != nil {
 		s.errorf("%v", err)
 		return
 	}
-	old := s.builder.Body()
-	if err := s.builder.SetJSON(string(out)); err != nil {
+	operation := strings.TrimSpace(rest[len(words[0]):])
+	switch strings.ToLower(words[1]) {
+	case "edit":
+		if len(words) != 2 {
+			s.errorf("usage : crl.json <cible> edit")
+			return
+		}
+		if len(captures) > 1 {
+			s.errorf("l'édition JSON ciblée est individuelle ; choisissez un ID précis")
+			return
+		}
+		b, e := s.requestBuilderFor(captures[0])
+		if e != nil {
+			s.errorf("%v", e)
+			return
+		}
+		previous := s.builder
+		s.builder = b
+		s.multilineTargetIDs = []int{captures[0].ID}
+		s.startMultilineJSON()
+		s.builder = previous
+		if s.multilineMode == "" {
+			s.multilineTargetIDs = nil
+		}
+	case "clear":
+		s.applyCaptureChanges(captures, func(b *request.Builder) error { b.ClearBody(); return nil })
+		for _, c := range captures {
+			s.requestBodyReplaced[c.ID] = true
+		}
+	case "set", "delete":
+		pathExpr := strings.TrimSpace(operation[len(words[1]):])
+		s.applyCaptureChanges(captures, func(b *request.Builder) error { return updateJSONBuilder(b, strings.ToLower(words[1]), pathExpr) })
+	default:
+		s.errorf("opération JSON inconnue : %s", words[1])
+	}
+}
+
+func (s *Shell) cmdTargetBody(rest string) {
+	words := shellWords(rest)
+	if len(words) < 2 {
+		s.errorf("usage : crl.body <cible> edit|clear|set [texte]")
+		return
+	}
+	captures, err := s.resolveTargets(words[0])
+	if err != nil {
 		s.errorf("%v", err)
 		return
 	}
-	// SetJSON adds/sets Content-Type; ensure we preserve other headers? SetJSON calls SetHeader for Content-Type
-	s.printf("[CRL] Champ JSON mis à jour (%d octets).\n", s.builder.BodySize())
-	_ = old
+	switch strings.ToLower(words[1]) {
+	case "clear":
+		s.applyCaptureChanges(captures, func(b *request.Builder) error { b.ClearBody(); return nil })
+		for _, c := range captures {
+			s.requestBodyReplaced[c.ID] = true
+		}
+	case "set":
+		if len(words) < 3 {
+			s.errorf("texte du corps manquant")
+			return
+		}
+		text := strings.Join(words[2:], " ")
+		s.applyCaptureChanges(captures, func(b *request.Builder) error { b.SetBodyText(text); return nil })
+		for _, c := range captures {
+			s.requestBodyReplaced[c.ID] = true
+		}
+	case "edit":
+		if len(captures) != 1 {
+			s.errorf("l'édition interactive du corps est individuelle ; choisissez un ID précis")
+			return
+		}
+		b, e := s.requestBuilderFor(captures[0])
+		if e != nil {
+			s.errorf("%v", e)
+			return
+		}
+		previous := s.builder
+		s.builder = b
+		s.multilineTargetIDs = []int{captures[0].ID}
+		s.startMultilineBody()
+		s.builder = previous
+		if s.multilineMode == "" {
+			s.multilineTargetIDs = nil
+		}
+	default:
+		s.errorf("opération de corps inconnue : %s", words[1])
+	}
+}
+
+func updateJSONBuilder(b *request.Builder, operation, expression string) error {
+	body := b.Body()
+	if !b.BodySet() || len(body) == 0 {
+		body = []byte("{}")
+	}
+	var root any
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if err := decoder.Decode(&root); err != nil {
+		return fmt.Errorf("JSON existant invalide: %w", err)
+	}
+	path := ""
+	var value any
+	if operation == "set" {
+		eq := strings.Index(expression, "=")
+		if eq < 0 {
+			return fmt.Errorf("usage : set <chemin> = <valeur JSON")
+		}
+		path = strings.TrimSpace(expression[:eq])
+		raw := strings.TrimSpace(expression[eq+1:])
+		if err := json.Unmarshal([]byte(raw), &value); err != nil {
+			return fmt.Errorf("valeur JSON invalide: %w", err)
+		}
+	} else {
+		path = strings.TrimSpace(expression)
+	}
+	if path == "" {
+		return fmt.Errorf("chemin JSON vide")
+	}
+	mutated, err := mutateJSONPath(root, strings.Split(path, "."), operation, value)
+	if err != nil {
+		return err
+	}
+	root = mutated
+	encoded, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return err
+	}
+	return b.SetJSON(string(encoded))
+}
+
+func mutateJSONPath(current any, parts []string, operation string, value any) (any, error) {
+	if len(parts) == 0 || parts[0] == "" {
+		return current, fmt.Errorf("chemin JSON invalide")
+	}
+	if len(parts) > 1 {
+		switch node := current.(type) {
+		case map[string]any:
+			child, ok := node[parts[0]]
+			if !ok && operation == "set" {
+				child = map[string]any{}
+			}
+			if !ok && operation == "delete" {
+				return current, fmt.Errorf("chemin %q introuvable", parts[0])
+			}
+			updated, err := mutateJSONPath(child, parts[1:], operation, value)
+			if err != nil {
+				return current, err
+			}
+			node[parts[0]] = updated
+			return node, nil
+		case []any:
+			index, err := strconv.Atoi(parts[0])
+			if err != nil || index < 0 || index >= len(node) {
+				return current, fmt.Errorf("index de tableau %q invalide", parts[0])
+			}
+			updated, err := mutateJSONPath(node[index], parts[1:], operation, value)
+			if err != nil {
+				return current, err
+			}
+			node[index] = updated
+			return node, nil
+		default:
+			return current, fmt.Errorf("chemin %q introuvable ou scalaire", parts[0])
+		}
+	}
+	switch node := current.(type) {
+	case map[string]any:
+		if operation == "delete" {
+			if _, ok := node[parts[0]]; !ok {
+				return current, fmt.Errorf("propriété %q absente", parts[0])
+			}
+			delete(node, parts[0])
+		} else {
+			node[parts[0]] = value
+		}
+		return node, nil
+	case []any:
+		index, err := strconv.Atoi(parts[0])
+		if err != nil || index < 0 || index > len(node) {
+			return current, fmt.Errorf("index de tableau %q invalide", parts[0])
+		}
+		if operation == "delete" {
+			if index >= len(node) {
+				return current, fmt.Errorf("index de tableau %q absent", parts[0])
+			}
+			return append(node[:index], node[index+1:]...), nil
+		}
+		if index == len(node) {
+			return append(node, value), nil
+		}
+		node[index] = value
+		return node, nil
+	default:
+		return current, fmt.Errorf("la racine JSON doit être un objet ou un tableau")
+	}
 }
 
 func (s *Shell) cmdJSONDelete(rest string) {
@@ -800,47 +1021,7 @@ func (s *Shell) cmdJSONDelete(rest string) {
 		s.errorf("usage : crl.json delete <chemin>")
 		return
 	}
-	path := strings.TrimSpace(trim[7:])
-	if path == "" {
-		s.errorf("chemin invalide")
-		return
-	}
-	body := s.builder.Body()
-	if !s.builder.BodySet() || len(body) == 0 {
-		body = []byte("{}")
-	}
-	var root interface{}
-	if err := json.Unmarshal(body, &root); err != nil {
-		s.errorf("JSON existant invalide")
-		return
-	}
-	m, ok := root.(map[string]interface{})
-	if !ok {
-		s.errorf("le JSON existant n'est pas un objet compatible")
-		return
-	}
-	parts := strings.Split(path, ".")
-	cur := m
-	for i := 0; i < len(parts)-1; i++ {
-		key := parts[i]
-		if nm, ok := cur[key].(map[string]interface{}); ok {
-			cur = nm
-			continue
-		}
-		s.errorf("chemin introuvable")
-		return
-	}
-	if _, exists := cur[parts[len(parts)-1]]; !exists {
-		s.errorf("chemin introuvable")
-		return
-	}
-	delete(cur, parts[len(parts)-1])
-	out, err := json.Marshal(root)
-	if err != nil {
-		s.errorf("%v", err)
-		return
-	}
-	if err := s.builder.SetJSON(string(out)); err != nil {
+	if err := updateJSONBuilder(s.builder, "delete", strings.TrimSpace(trim[7:])); err != nil {
 		s.errorf("%v", err)
 		return
 	}
@@ -914,55 +1095,74 @@ func (s *Shell) cmdCA(rest string) {
 	}
 }
 
-func (s *Shell) cmdShow() {
+func (s *Shell) cmdShow(rest string) {
 	if s.history != nil {
 		selected := s.history.SelectedMany()
-		if len(selected) > 0 {
-			if len(selected) == 1 {
-				c := selected[0]
-				p := s.pal
-				s.printf("%s\n", p.BoldGreen(fmt.Sprintf("[CRL] Requête sélectionnée #%d (Mint)", c.ID)))
-				s.printf("%s\n", p.Dim("Aucune requête envoyée — utilisez crl.launch pour l'exécuter."))
-				s.rule(78)
-				s.field("Méthode", p.Method(c.Request.Method))
-				s.field("URL", p.Cyan(sanitizeTerminal(c.Request.URL)))
-				headers := c.Request.Headers
-				s.printf("\n  %s\n", p.BoldCyan(fmt.Sprintf("En-têtes (%d)", len(headers))))
-				if len(headers) == 0 {
-					s.printf("    %s\n", p.Dim("(aucun)"))
-				} else {
-					for _, h := range headers {
-						s.printf("    %s\n", s.headerLine(h.Name, h.Value))
-					}
-				}
-				if len(c.Request.Body) > 0 {
-					s.printf("\n  %s\n", p.BoldCyan(fmt.Sprintf("Corps (%d octets)", len(c.Request.Body))))
-					rendered, _ := display.RenderBody(c.Request.Body, 4096)
-					s.printIndented(rendered, "    ")
-				} else {
-					s.printf("\n  %s\n", p.BoldCyan("Corps (vide / non défini)"))
-				}
-				s.printf("\n")
-				s.rule(78)
-				s.printf("%s\n", p.Dim("crl.launch pour envoyer (ou mint.replay) · crl.table pour un résumé"))
+		if strings.TrimSpace(rest) != "" {
+			words := shellWords(rest)
+			if len(words) == 0 {
+				s.errorf("usage : crl.show [id [body [offset]]]")
 				return
 			}
-			// multiple selections
-			p := s.pal
-			s.printf("%s\n", p.BoldGreen(fmt.Sprintf("[CRL] Requêtes sélectionnées (%d)", len(selected))))
-			s.rule(78)
-			for _, c := range selected {
-				s.printf("  #%d %s %s\n", c.ID, p.Method(c.Request.Method), p.Cyan(sanitizeTerminal(c.Request.URL)))
-				if len(c.Request.Headers) > 0 {
-					s.printf("     %s\n", p.Dim(fmt.Sprintf("%d en-tête(s)", len(c.Request.Headers))))
+			if strings.EqualFold(words[0], "body") {
+				offset := 0
+				var err error
+				if len(words) > 2 {
+					s.errorf("usage : crl.show body [offset]")
+					return
 				}
-				if len(c.Request.Body) > 0 {
-					s.printf("     %s\n", p.Dim(fmt.Sprintf("corps %d octet(s)", len(c.Request.Body))))
+				if len(words) == 2 {
+					offset, err = strconv.Atoi(words[1])
+					if err != nil || offset < 0 {
+						s.errorf("offset invalide")
+						return
+					}
+				}
+				s.showActiveBody(offset)
+				return
+			}
+			if strings.EqualFold(words[0], "active") {
+				if len(words) != 1 {
+					s.errorf("usage : crl.show active")
+					return
+				}
+				s.showActiveRequest()
+				return
+			}
+			id, err := parseID(words[0])
+			if err != nil {
+				s.errorf("%v", err)
+				return
+			}
+			c, ok := s.history.Get(id)
+			if !ok {
+				s.errorf("requête #%d introuvable", id)
+				return
+			}
+			offset := 0
+			if len(words) > 1 {
+				if words[1] != "body" {
+					s.errorf("usage : crl.show <id> [body [offset]]")
+					return
+				}
+				if len(words) > 2 {
+					offset, err = strconv.Atoi(words[2])
+					if err != nil || offset < 0 {
+						s.errorf("offset invalide")
+						return
+					}
 				}
 			}
-			s.printf("\n")
-			s.rule(78)
-			s.printf("%s\n", p.Dim("crl.launch ou mint.replay pour exécuter en parallèle"))
+			s.showCapture(c, offset)
+			return
+		}
+		if len(selected) > 0 {
+			p := s.pal
+			s.printf("[CRL] Requêtes sélectionnées (%d) — détails\n", len(selected))
+			for _, c := range selected {
+				s.showCapture(c, 0)
+			}
+			s.printf("\n%s\n", p.Dim("crl.show <id> pour une requête · crl.launch / mint.replay pour envoyer"))
 			return
 		}
 	}
@@ -976,7 +1176,10 @@ func (s *Shell) cmdShow() {
 	s.printf("%s\n", p.Dim("Aucune requête envoyée — utilisez crl.launch pour l'exécuter."))
 	s.rule(78)
 	s.field("Méthode", p.Method(s.builder.Method()))
-	s.field("URL", p.Cyan(sanitizeTerminal(s.builder.URL())))
+	s.field("URL", p.Cyan(display.MaskURL(sanitizeTerminal(s.builder.URL()))))
+	if s.activeMintID > 0 {
+		s.field("Source", fmt.Sprintf("Mint · capture #%d (copie active)", s.activeMintID))
+	}
 	s.field("Proxy", s.proxyValue(res))
 	s.field("Sortie", p.Cyan(s.outputMode.ShortLabel()))
 	if s.builder.CAFile() != "" {
@@ -993,14 +1196,126 @@ func (s *Shell) cmdShow() {
 	}
 	if s.builder.BodySet() {
 		s.printf("\n  %s\n", p.BoldCyan(fmt.Sprintf("Corps (%d octets)", s.builder.BodySize())))
-		rendered, _ := display.RenderBody(s.builder.Body(), 4096)
+		rendered, truncated := display.RenderBody(display.MaskBody(s.builder.Body()), 4096)
 		s.printIndented(rendered, "    ")
+		if truncated {
+			s.printf("    […] Corps limité à 4 Kio.\n")
+		}
 	} else {
 		s.printf("\n  %s\n", p.BoldCyan("Corps (vide / non défini)"))
 	}
 	s.printf("\n")
 	s.rule(78)
 	s.printf("%s\n", p.Dim("crl.launch pour envoyer · crl.table pour un résumé"))
+}
+
+func (s *Shell) showActiveRequest() {
+	if s.builder.IsEmpty() {
+		s.printf("[CRL] Aucune requête active préparée.\n")
+		return
+	}
+	history := s.history
+	s.history = nil
+	s.cmdShow("")
+	s.history = history
+}
+
+func (s *Shell) showActiveBody(offset int) {
+	body := display.MaskBody(s.builder.Body())
+	if !s.builder.BodySet() {
+		s.printf("[CRL] Aucun corps configuré.\n")
+		return
+	}
+	if offset < 0 || offset >= len(body) {
+		s.errorf("offset hors limites (%d octets affichés)", len(body))
+		return
+	}
+	end := offset + launchBodyLimit
+	if end > len(body) {
+		end = len(body)
+	}
+	for offset > 0 && offset < len(body) && !utf8.RuneStart(body[offset]) {
+		offset++
+	}
+	for end > offset && end < len(body) && !utf8.RuneStart(body[end]) {
+		end--
+	}
+	rendered, _ := display.RenderBody(body[offset:end], 0)
+	s.printf("[CRL] Corps actif — octets %d-%d/%d\n", offset, end, len(body))
+	s.printIndented(rendered, "  ")
+	if end < len(body) {
+		s.printf("Suite : crl.show body %d\n", end)
+	}
+}
+
+func (s *Shell) showCapture(c mint.Capture, offset int) {
+	p := s.pal
+	b, err := s.requestBuilderFor(c)
+	if err != nil {
+		s.errorf("requête #%d : %v", c.ID, err)
+		return
+	}
+	s.printf("\n╭─ REQUEST #%d ───────────────────────────────────────────\n", c.ID)
+	s.printf("│ Méthode : %s\n│ URL     : %s\n│ Source  : Mint · capture #%d\n│ Capturée: %s\n", p.Method(b.Method()), display.MaskURL(sanitizeTerminal(b.URL())), c.ID, c.StartedAt.Local().Format("2006-01-02 15:04:05.000"))
+	u, _ := url.Parse(b.URL())
+	if u != nil {
+		s.printf("│ Chemin  : %s\n", display.MaskURL(sanitizeTerminal(u.EscapedPath()+func() string {
+			if u.RawQuery != "" {
+				return "?" + u.RawQuery
+			}
+			return ""
+		}())))
+	}
+	headers := b.Headers()
+	ctype := ""
+	s.printf("│\n│ EN-TÊTES (%d)\n", len(headers))
+	if len(headers) == 0 {
+		s.printf("│   (aucun)\n")
+	}
+	for _, h := range headers {
+		s.printf("│   %s\n", s.headerLine(h.Name, h.Value))
+		if strings.EqualFold(h.Name, "Content-Type") {
+			ctype = h.Value
+		}
+	}
+	if ctype != "" {
+		s.printf("│ Type de contenu : %s\n", sanitizeTerminal(ctype))
+	}
+	body := b.Body()
+	displayBody := display.MaskBody(body)
+	s.printf("│\n│ CORPS (%s)\n", display.FormatBytes(int64(len(body))))
+	if c.Request.BodyTruncated {
+		s.printf("│   [capture tronquée : %d octets conservés sur %d]\n", len(body), c.Request.BodySize)
+	}
+	if len(body) == 0 {
+		s.printf("│   Aucun corps\n")
+	} else if offset > 0 || len(body) > launchBodyLimit {
+		if offset >= len(displayBody) {
+			s.printf("│   Offset hors limites (%d octets affichables)\n", len(displayBody))
+		} else {
+			end := offset + launchBodyLimit
+			if end > len(displayBody) {
+				end = len(displayBody)
+			}
+			page := displayBody[offset:end]
+			rendered, _ := display.RenderBody(page, 0)
+			for _, line := range strings.Split(rendered, "\n") {
+				s.printf("│   %s\n", line)
+			}
+			if end < len(displayBody) {
+				s.printf("│   […] octets affichés %d-%d sur %d · suite : crl.show %d body %d\n", offset, end, len(displayBody), c.ID, end)
+			}
+			if offset > 0 {
+				s.printf("│   [page brute depuis l'octet %d]\n", offset)
+			}
+		}
+	} else {
+		rendered, _ := display.RenderBody(displayBody, 0)
+		for _, line := range strings.Split(rendered, "\n") {
+			s.printf("│   %s\n", line)
+		}
+	}
+	s.printf("╰──────────────────────────────────────────────────────────\n")
 }
 
 func (s *Shell) cmdTable() {
@@ -1087,48 +1402,13 @@ func (s *Shell) cmdOutput(rest string) {
 }
 
 func (s *Shell) cmdLaunch(rest string) {
-	if rest != "" {
-		s.errorf("crl.launch n'accepte aucun argument")
+	if rest != "" && !strings.EqualFold(strings.TrimSpace(rest), "active") {
+		s.cmdMintReplay(rest)
 		return
 	}
-	// Check for selected captures
-	if s.history != nil {
-		selected := s.history.SelectedMany()
-		if len(selected) > 1 {
-			// Execute in parallel
-			s.cmdMintReplay("")
-			return
-		}
-		if len(selected) == 1 {
-			// Execute this single capture like before
-			c := selected[0]
-			if importable, reason := c.Importable(); !importable {
-				s.errorf("capture #%d non exploitable : %s", c.ID, reason)
-				return
-			}
-			b := request.New()
-			headers := make([]request.Header, 0, len(c.Request.Headers))
-			for _, h := range c.Request.Headers {
-				headers = append(headers, request.Header{Name: h.Name, Value: h.Value})
-			}
-			if err := b.Import(request.CapturedRequest{URL: c.Request.URL, Method: c.Request.Method, Headers: headers, Body: c.Request.Body, BodyPresent: len(c.Request.Body) > 0}); err != nil {
-				s.errorf("%v", err)
-				return
-			}
-			if err := b.SetProxy("none"); err != nil {
-				s.errorf("%v", err)
-				return
-			}
-			res := b.ResolveProxy("", false)
-			args, err := b.CurlArgs(res)
-			if err != nil {
-				s.errorf("%v", err)
-				return
-			}
-			// reuse launch logic with builder b
-			s.launchWithBuilder(b, args, res)
-			return
-		}
+	if strings.TrimSpace(rest) == "" && s.history != nil && len(s.history.SelectedMany()) > 0 {
+		s.cmdMintReplay("")
+		return
 	}
 	if s.builder.URL() == "" {
 		s.errorf("aucune URL configurée : utilisez crl.host <url>")
@@ -1171,7 +1451,7 @@ func (s *Shell) launchWithBuilder(b *request.Builder, args []string, res request
 	s.printf("%s\n", p.BoldGreen("[CRL] Requête envoyée"))
 	s.rule(78)
 	s.field("Méthode", p.Method(b.Method()))
-	s.field("URL", p.Cyan(sanitizeTerminal(b.URL())))
+	s.field("URL", p.Cyan(display.MaskURL(sanitizeTerminal(b.URL()))))
 	s.field("Proxy", s.proxyValue(res))
 	s.field("Sortie", p.Cyan(s.outputMode.ShortLabel()))
 	s.field("Requête", fmt.Sprintf("%d en-tête(s), corps %s", len(b.Headers()), display.FormatBytes(int64(b.BodySize()))))
@@ -1283,7 +1563,7 @@ func (s *Shell) findRecentMintCapture(started time.Time) (mint.Capture, bool) {
 }
 
 func (s *Shell) reportMintCaptureDiff(c mint.Capture) {
-	s.printf("\n[Mint] Capture récente de même méthode et URL : #%d (%s %s). La corrélation n'est pas garantie en cas de trafic concurrent ; comparez les en-têtes avec crl.show, détail : mint.request.show %d.\n", c.ID, sanitizeTerminal(c.Request.Method), sanitizeTerminal(c.Request.URL), c.ID)
+	s.printf("\n[Mint] Capture récente de même méthode et URL : #%d (%s %s). La corrélation n'est pas garantie en cas de trafic concurrent ; comparez les en-têtes avec crl.show, détail : mint.request.show %d.\n", c.ID, sanitizeTerminal(c.Request.Method), display.MaskURL(sanitizeTerminal(c.Request.URL)), c.ID)
 	matched := make([]bool, len(c.Request.Headers))
 	for _, expected := range s.builder.Headers() {
 		found := false
@@ -1354,7 +1634,7 @@ func (s *Shell) printHTTPResponseWithBuilder(b *request.Builder, status response
 	s.rule(78)
 	s.field("Statut", p.StatusCode(status.Code, sanitizeTerminal(status.Label())))
 	s.field("Méthode", p.Method(b.Method()))
-	s.field("URL demandée", p.Cyan(sanitizeTerminal(b.URL())))
+	s.field("URL demandée", p.Cyan(display.MaskURL(sanitizeTerminal(b.URL()))))
 	s.field("Durée", p.Cyan(durationLabel(meta.Duration)))
 	s.field("Taille", p.Bold(display.FormatBytes(total)))
 	if contentType := headers.ContentType(); contentType != "" {
@@ -1364,7 +1644,7 @@ func (s *Shell) printHTTPResponseWithBuilder(b *request.Builder, status response
 		s.field("HTTP", p.Dim(sanitizeTerminal(status.Proto)))
 	}
 	if meta.EffectiveURL != "" {
-		s.field("URL finale", p.Cyan(sanitizeTerminal(meta.EffectiveURL)))
+		s.field("URL finale", p.Cyan(display.MaskURL(sanitizeTerminal(meta.EffectiveURL))))
 	}
 
 	s.printf("\n  %s\n", p.BoldBlue(fmt.Sprintf("En-têtes de réponse (%d)", len(headers))))
@@ -1671,9 +1951,9 @@ func (s *Shell) cmdMintShow(rest string) {
 		s.field("Flux", p.Dim(c.FlowID))
 	}
 	s.field("Date", c.StartedAt.Local().Format("2006-01-02 15:04:05.000"))
-	s.field("URL", p.Cyan(sanitizeTerminal(c.Request.URL)))
+	s.field("URL", p.Cyan(display.MaskURL(sanitizeTerminal(c.Request.URL))))
 	s.field("Hôte", c.Request.Host)
-	s.field("Chemin", p.Cyan(sanitizeTerminal(c.PathAndQuery())))
+	s.field("Chemin", p.Cyan(display.MaskURL(sanitizeTerminal(c.PathAndQuery()))))
 	if reasons := c.IncompleteReasons(); len(reasons) > 0 {
 		s.field("Complétude", p.BoldYellow("incomplète — "+strings.Join(reasons, " ; ")))
 	} else {
@@ -1693,7 +1973,7 @@ func (s *Shell) cmdMintShow(rest string) {
 			}
 		}
 		s.printf("    %s\n", p.BoldCyan(fmt.Sprintf("Corps (%d octets%s)", len(c.Request.Body), truncatedSuffix(c.Request.BodyTruncated, c.Request.BodySize))))
-		rendered, _ := display.RenderBody(c.Request.Body, 8192)
+		rendered, _ := display.RenderBody(display.MaskBody(c.Request.Body), 8192)
 		s.printIndented(rendered, "      ")
 	}
 
@@ -1709,7 +1989,7 @@ func (s *Shell) cmdMintShow(rest string) {
 			}
 		}
 		s.printf("    %s\n", p.BoldCyan(fmt.Sprintf("Corps (%d octets%s)", len(c.Response.Body), truncatedSuffix(c.Response.BodyTruncated, c.Response.BodySize))))
-		rendered, _ := display.RenderBody(c.Response.Body, 8192)
+		rendered, _ := display.RenderBody(display.MaskBody(c.Response.Body), 8192)
 		s.printIndented(rendered, "      ")
 	} else if c.Err == "" {
 		s.printf("\n  %s %s\n", p.BoldYellow("RÉPONSE"), p.Yellow("en attente"))
@@ -1724,9 +2004,40 @@ func (s *Shell) cmdMintSelect(rest string) {
 		s.errorf("usage : mint.select <id...>|clear")
 		return
 	}
-	if strings.EqualFold(strings.TrimSpace(rest), "clear") {
+	words := shellWords(rest)
+	if len(words) == 1 && strings.EqualFold(words[0], "clear") {
 		s.history.ClearSelection()
 		s.printf("[Mint] Sélection effacée.\n")
+		return
+	}
+	mode := "replace"
+	if len(words) > 1 && (strings.EqualFold(words[0], "add") || strings.EqualFold(words[0], "remove")) {
+		mode = strings.ToLower(words[0])
+		rest = strings.TrimSpace(rest[len(words[0]):])
+	}
+	if strings.EqualFold(strings.TrimSpace(rest), "all") {
+		ids := make([]int, 0)
+		for _, c := range s.history.List() {
+			ids = append(ids, c.ID)
+		}
+		if len(ids) == 0 {
+			s.errorf("aucune requête Mint à sélectionner")
+			return
+		}
+		var captures []mint.Capture
+		var err error
+		if mode == "add" {
+			captures, err = s.history.AddSelection(ids)
+		} else if mode == "remove" {
+			captures = s.history.RemoveSelection(ids)
+		} else {
+			captures, err = s.history.SelectMany(ids)
+		}
+		if err != nil {
+			s.errorf("%v", err)
+			return
+		}
+		s.printSelected(captures)
 		return
 	}
 	var ids []int
@@ -1738,7 +2049,16 @@ func (s *Shell) cmdMintSelect(rest string) {
 		}
 		ids = append(ids, id)
 	}
-	captures, err := s.history.SelectMany(ids)
+	var captures []mint.Capture
+	var err error
+	switch mode {
+	case "add":
+		captures, err = s.history.AddSelection(ids)
+	case "remove":
+		captures = s.history.RemoveSelection(ids)
+	default:
+		captures, err = s.history.SelectMany(ids)
+	}
 	if err != nil {
 		s.errorf("%v", err)
 		return
@@ -1754,21 +2074,249 @@ func (s *Shell) printSelected(captures []mint.Capture) {
 	}
 }
 
+func (s *Shell) requestBuilderFor(c mint.Capture) (*request.Builder, error) {
+	if b := s.requestEdits[c.ID]; b != nil {
+		return b, nil
+	}
+	b := request.New()
+	headers := make([]request.Header, 0, len(c.Request.Headers))
+	for _, h := range c.Request.Headers {
+		headers = append(headers, request.Header{Name: h.Name, Value: h.Value})
+	}
+	if err := b.Import(request.CapturedRequest{URL: c.Request.URL, Method: c.Request.Method, Headers: headers, Body: c.Request.Body, BodyPresent: len(c.Request.Body) > 0}); err != nil {
+		return nil, err
+	}
+	s.requestEdits[c.ID] = b
+	return b, nil
+}
+
+func (s *Shell) captureWithEdits(c mint.Capture) (mint.Capture, error) {
+	b, err := s.requestBuilderFor(c)
+	if err != nil {
+		return c, err
+	}
+	c.Request.Method = b.Method()
+	c.Request.URL = b.URL()
+	c.Request.Headers = nil
+	for _, h := range b.Headers() {
+		c.Request.Headers = append(c.Request.Headers, mint.Header{Name: h.Name, Value: h.Value})
+	}
+	c.Request.Body = b.Body()
+	if s.requestBodyReplaced[c.ID] {
+		c.Request.BodyTruncated = false
+	}
+	if !c.Request.BodyTruncated {
+		c.Request.BodySize = int64(len(c.Request.Body))
+	}
+	u, err := url.Parse(c.Request.URL)
+	if err == nil {
+		c.Request.Scheme = u.Scheme
+		c.Request.Host = u.Host
+		c.Request.Path = u.EscapedPath()
+		if c.Request.Path == "" {
+			c.Request.Path = "/"
+		}
+		c.Request.RawQuery = u.RawQuery
+	}
+	return c, nil
+}
+
+func (s *Shell) resolveTargets(spec string) ([]mint.Capture, error) {
+	spec = strings.TrimSpace(spec)
+	if strings.EqualFold(spec, "all") {
+		return s.history.List(), nil
+	}
+	if strings.EqualFold(spec, "selected") {
+		out := s.history.SelectedMany()
+		if len(out) == 0 {
+			return nil, fmt.Errorf("aucune requête sélectionnée")
+		}
+		return out, nil
+	}
+	var ids []int
+	for _, part := range strings.Fields(strings.ReplaceAll(spec, ",", " ")) {
+		id, err := parseID(part)
+		if err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("cible requise : ID, liste d'ID, selected ou all")
+	}
+	out := make([]mint.Capture, 0, len(ids))
+	seen := map[int]bool{}
+	for _, id := range ids {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		c, ok := s.history.Get(id)
+		if !ok {
+			return nil, fmt.Errorf("requête #%d introuvable", id)
+		}
+		out = append(out, c)
+	}
+	return out, nil
+}
+
+func (s *Shell) applyCaptureChanges(captures []mint.Capture, change func(*request.Builder) error) {
+	ok, failed := 0, 0
+	for _, c := range captures {
+		b, err := s.requestBuilderFor(c)
+		if err == nil {
+			err = change(b)
+		}
+		if err != nil {
+			failed++
+			s.printf("[ERREUR] Requête #%d : %s\n", c.ID, sanitizeTerminal(err.Error()))
+		} else {
+			ok++
+		}
+	}
+	s.printf("[CRL] Modifications : %d requête(s) réussie(s), %d échec(s).\n", ok, failed)
+}
+
+func (s *Shell) cmdTargetHeader(words []string) {
+	if len(words) < 2 {
+		s.errorf("usage : crl.head set <cible> <nom> <valeur> | delete <cible> <nom> | show <cible>")
+		return
+	}
+	action := strings.ToLower(words[0])
+	targets := words[1]
+	if action == "show" {
+		if len(words) != 2 {
+			s.errorf("usage : crl.head show <cible>")
+			return
+		}
+		captures, err := s.resolveTargets(targets)
+		if err != nil {
+			s.errorf("%v", err)
+			return
+		}
+		for _, c := range captures {
+			b, e := s.requestBuilderFor(c)
+			if e != nil {
+				s.errorf("requête #%d : %v", c.ID, e)
+				continue
+			}
+			s.printf("[CRL] En-têtes de #%d (%d) :\n", c.ID, len(b.Headers()))
+			for _, h := range b.Headers() {
+				s.printf("  %s\n", s.headerLine(h.Name, h.Value))
+			}
+		}
+		return
+	}
+	if len(words) < 3 {
+		s.errorf("usage : crl.head set <cible> <nom> <valeur> | delete <cible> <nom>")
+		return
+	}
+	name := words[2]
+	captures, err := s.resolveTargets(targets)
+	if err != nil {
+		s.errorf("%v", err)
+		return
+	}
+	if action == "set" {
+		if len(words) < 4 {
+			s.errorf("valeur d'en-tête manquante")
+			return
+		}
+		value := strings.Join(words[3:], " ")
+		s.applyCaptureChanges(captures, func(b *request.Builder) error { return b.SetHeader(name, value) })
+		return
+	}
+	if action == "delete" {
+		s.applyCaptureChanges(captures, func(b *request.Builder) error {
+			if b.RemoveHeader(name) == 0 {
+				return fmt.Errorf("en-tête %q absent", name)
+			}
+			return nil
+		})
+		return
+	}
+	s.errorf("commande d'en-tête inconnue : %s", action)
+}
+
+// shellWords handles quoted command arguments without invoking a shell.
+func shellWords(input string) []string {
+	var out []string
+	var b strings.Builder
+	quote := rune(0)
+	escaped := false
+	active := false
+	for _, r := range input {
+		if escaped {
+			b.WriteRune(r)
+			escaped = false
+			active = true
+			continue
+		}
+		if r == '\\' && quote != '\'' {
+			escaped = true
+			active = true
+			continue
+		}
+		if quote != 0 {
+			if r == quote {
+				quote = 0
+			} else {
+				b.WriteRune(r)
+			}
+			active = true
+			continue
+		}
+		if r == '\'' || r == '"' {
+			quote = r
+			active = true
+			continue
+		}
+		if r == ' ' || r == '\t' {
+			if active {
+				out = append(out, b.String())
+				b.Reset()
+				active = false
+			}
+			continue
+		}
+		b.WriteRune(r)
+		active = true
+	}
+	if escaped {
+		b.WriteRune('\\')
+	}
+	if active {
+		out = append(out, b.String())
+	}
+	return out
+}
+
 // cmdMintReplay starts each selected captured request concurrently, preserving
 // its own builder state and source ID. Results are printed after the whole batch.
 func (s *Shell) cmdMintReplay(rest string) {
+	var captures []mint.Capture
+	var err error
 	if strings.TrimSpace(rest) != "" {
-		s.errorf("usage : mint.replay")
-		return
+		captures, err = s.resolveTargets(rest)
+		if err != nil {
+			s.errorf("%v", err)
+			return
+		}
+	} else {
+		captures = s.history.SelectedMany()
 	}
-	captures := s.history.SelectedMany()
 	if len(captures) == 0 {
 		s.errorf("aucune capture sélectionnée : utilisez mint.select <id> [id...]")
 		return
 	}
+	s.clearReplayArtifacts()
 	type result struct {
 		id                            int
 		method, url, status, duration string
+		statusCode                    int
+		responseSize                  int64
+		bodyPath                      string
+		network                       bool
 		details                       string
 		err                           error
 	}
@@ -1780,43 +2328,72 @@ func (s *Shell) cmdMintReplay(rest string) {
 	sem := make(chan struct{}, 4)
 	var wg sync.WaitGroup
 	for i, capture := range captures {
+		prepared, prepErr := s.captureWithEdits(capture)
+		if prepErr == nil {
+			if ok, why := prepared.Importable(); !ok {
+				prepErr = fmt.Errorf("%s", why)
+			}
+		}
 		wg.Add(1)
-		go func(i int, c mint.Capture) {
+		go func(i int, c mint.Capture, prepErr error) {
 			defer wg.Done()
 			r := result{id: c.ID, method: c.Request.Method, url: c.Request.URL}
-			sem <- struct{}{}
+			if prepErr != nil {
+				r.err = prepErr
+				results[i] = r
+				return
+			}
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				r.err = ctx.Err()
+				results[i] = r
+				return
+			}
 			defer func() { <-sem }()
-			err, status, dur, details := s.replayCapture(ctx, c)
+			err, status, dur, details, code, size, bodyPath := s.replayCapture(ctx, c)
 			if err != nil {
 				r.err = err
+				r.network = true
 			} else {
 				r.status = status
 			}
 			r.duration = dur
 			r.details = details
+			r.statusCode = code
+			r.responseSize = size
+			r.bodyPath = bodyPath
 			results[i] = r
-		}(i, capture)
+		}(i, prepared, prepErr)
 	}
 	wg.Wait()
-	success := 0
-	failed := 0
+	completed, successHTTP, httpErrors, networkErrors, executionErrors := 0, 0, 0, 0, 0
 	for _, r := range results {
 		if r.err != nil {
-			failed++
+			if r.network {
+				networkErrors++
+			} else {
+				executionErrors++
+			}
 		} else {
-			success++
+			completed++
+			if r.statusCode >= 400 {
+				httpErrors++
+			} else if r.statusCode >= 200 && r.statusCode < 400 {
+				successHTTP++
+			}
 		}
 	}
 	s.lastBatchSent = len(results)
-	s.lastBatchSuccess = success
-	s.lastBatchFail = failed
+	s.lastBatchSuccess = completed
+	s.lastBatchFail = networkErrors
 	s.lastBatchSet = true
 	s.printf("[Mint] Résultats du rejeu parallèle (%d requêtes)\n", len(results))
-	s.printf("[Envoyées: %d/%d]\n", success, len(results))
+	s.printf("[Résumé] Total : %d · Terminées : %d · Succès HTTP : %d · Erreurs HTTP : %d · Erreurs réseau : %d · Erreurs de requête : %d\n", len(results), completed, successHTTP, httpErrors, networkErrors, executionErrors)
 	s.printf("  ID  MÉTHODE  STATUT  DURÉE  URL / ERREUR\n")
 	for _, r := range results {
 		status := r.status
-		detail := r.url
+		detail := display.MaskURL(sanitizeTerminal(r.url))
 		if r.err != nil {
 			status = "ERREUR"
 			detail = r.err.Error()
@@ -1824,19 +2401,30 @@ func (s *Shell) cmdMintReplay(rest string) {
 		s.printf("  #%d  %-7s  %-7s  %-8s %s\n", r.id, r.method, status, r.duration, sanitizeTerminal(detail))
 	}
 	for _, r := range results {
-		s.printf("\n[Mint] Réponse du rejeu #%d — %s %s\n", r.id, r.method, sanitizeTerminal(r.url))
+		if r.bodyPath != "" {
+			s.replayBodies[r.id] = r.bodyPath
+			s.replayDirs = append(s.replayDirs, filepath.Dir(r.bodyPath))
+		}
+		s.printf("\n[Mint] Réponse du rejeu #%d — %s %s\n", r.id, r.method, display.MaskURL(sanitizeTerminal(r.url)))
 		if r.err != nil {
 			s.printf("  Erreur : %s\n", sanitizeTerminal(r.err.Error()))
 			continue
 		}
-		s.printf("  Statut : %s · durée : %s\n%s", r.status, r.duration, r.details)
+		s.printf("  Statut : %s · durée : %s · taille : %s\n%s", r.status, r.duration, display.FormatBytes(r.responseSize), r.details)
+		if r.responseSize > launchBodyLimit {
+			if r.responseSize <= 16<<20 {
+				s.printf("  Suite du corps : mint.replay.body %d %d\n", r.id, launchBodyLimit)
+			} else {
+				s.printf("  Corps complet privé : %s (accessible avec un outil local de lecture de fichier)\n", r.bodyPath)
+			}
+		}
 	}
 	// Record in history associations? mission says "Enregistre les résultats des rejeux dans l'historique et conserve une association fiable avec chaque capture source." - existing code already has history; maybe ensure we don't break things
 }
 
-func (s *Shell) replayCapture(ctx context.Context, c mint.Capture) (error, string, string, string) {
+func (s *Shell) replayCapture(ctx context.Context, c mint.Capture) (error, string, string, string, int, int64, string) {
 	if ok, why := c.Importable(); !ok {
-		return fmt.Errorf("%s", why), "", "-", ""
+		return fmt.Errorf("%s", why), "", "-", "", 0, 0, ""
 	}
 	b := request.New()
 	headers := make([]request.Header, 0, len(c.Request.Headers))
@@ -1844,48 +2432,66 @@ func (s *Shell) replayCapture(ctx context.Context, c mint.Capture) (error, strin
 		headers = append(headers, request.Header{Name: h.Name, Value: h.Value})
 	}
 	if err := b.Import(request.CapturedRequest{URL: c.Request.URL, Method: c.Request.Method, Headers: headers, Body: c.Request.Body, BodyPresent: len(c.Request.Body) > 0}); err != nil {
-		return err, "", "-", ""
+		return err, "", "-", "", 0, 0, ""
 	}
 	// Replayed captures must not be recorded a second time by this tool's Mint
 	// proxy. Captured requests have no portable proxy setting, so replay direct.
 	if err := b.SetProxy("none"); err != nil {
-		return err, "", "-", ""
+		return err, "", "-", "", 0, 0, ""
 	}
 	res := b.ResolveProxy("", false)
 	args, err := b.CurlArgs(res)
 	if err != nil {
-		return err, "", "-", ""
+		return err, "", "-", "", 0, 0, ""
 	}
 	dir, err := os.MkdirTemp("", "crl-replay-*")
 	if err != nil {
-		return err, "", "-", ""
+		return err, "", "-", "", 0, 0, ""
 	}
-	defer os.RemoveAll(dir)
+	keepDir := false
+	defer func() {
+		if !keepDir {
+			_ = os.RemoveAll(dir)
+		}
+	}()
 	headersPath, bodyPath := filepath.Join(dir, "headers"), filepath.Join(dir, "body")
 	cmd := exec.CommandContext(ctx, "curl", append(args, "--dump-header", headersPath, "--output", bodyPath, "-w", "%{http_code} %{time_total}")...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	if b.BodySet() {
 		cmd.Stdin = b.BodyReader()
 	}
 	out, err := cmd.Output()
 	if err != nil {
 		if ctx.Err() != nil {
-			return ctx.Err(), "", "-", ""
+			return ctx.Err(), "", "-", "", 0, 0, ""
 		}
-		return err, "", "-", ""
+		message := strings.TrimSpace(stderr.String())
+		if message != "" {
+			return fmt.Errorf("curl: %s", truncate(sanitizeTerminal(message), 600)), "", "-", "", 0, 0, ""
+		}
+		return err, "", "-", "", 0, 0, ""
 	}
 	parts := strings.Fields(string(out))
 	if len(parts) < 2 {
-		return fmt.Errorf("réponse curl illisible"), "", "-", ""
+		return fmt.Errorf("réponse curl illisible"), "", "-", "", 0, 0, ""
 	}
 	d, _ := strconv.ParseFloat(parts[1], 64)
 	duration := (time.Duration(d * float64(time.Second))).String()
 	headerData, _ := os.ReadFile(headersPath)
-	_, parsedHeaders := response.ParseHeaderDump(headerData)
+	httpStatus, parsedHeaders := response.ParseHeaderDump(headerData)
 	var bodySize int64
 	if info, statErr := os.Stat(bodyPath); statErr == nil {
 		bodySize = info.Size()
 	}
 	body := readFilePrefix(bodyPath, 32<<10)
+	if bodySize <= 16<<20 {
+		if complete, readErr := os.ReadFile(bodyPath); readErr == nil {
+			body = display.MaskBody(complete)
+		}
+	} else {
+		body = []byte("[corps volumineux : aperçu masqué ; utilisez mint.replay.body pour consulter une page]")
+	}
 	view := response.RenderBody(body, bodySize, 32<<10, response.ModeAuto, parsedHeaders.ContentType())
 	var details strings.Builder
 	details.WriteString("  En-têtes de réponse:\n")
@@ -1898,8 +2504,89 @@ func (s *Shell) replayCapture(ctx context.Context, c mint.Capture) (error, strin
 	}
 	if view.Truncated {
 		details.WriteString("    […] corps tronqué à l'affichage\n")
+		details.WriteString("    Consultez la capture source ou utilisez une sortie fichier dédiée.\n")
 	}
-	return nil, parts[0], duration, details.String()
+	code, _ := strconv.Atoi(parts[0])
+	statusLabel := httpStatus.Label()
+	if statusLabel == "" {
+		statusLabel = parts[0]
+	}
+	details.WriteString("  Taille de réponse : " + display.FormatBytes(bodySize) + "\n")
+	keepDir = true
+	return nil, statusLabel, duration, details.String(), code, bodySize, bodyPath
+}
+
+func (s *Shell) clearReplayArtifacts() {
+	seen := make(map[string]bool)
+	for _, dir := range s.replayDirs {
+		if dir != "" && !seen[dir] {
+			seen[dir] = true
+			_ = os.RemoveAll(dir)
+		}
+	}
+	s.replayDirs = nil
+	s.replayBodies = make(map[int]string)
+}
+
+func (s *Shell) cmdMintReplayBody(rest string) {
+	words := strings.Fields(rest)
+	if len(words) < 1 || len(words) > 2 {
+		s.errorf("usage : mint.replay.body <id> [offset]")
+		return
+	}
+	id, err := parseID(words[0])
+	if err != nil {
+		s.errorf("%v", err)
+		return
+	}
+	offset := 0
+	if len(words) == 2 {
+		offset, err = strconv.Atoi(words[1])
+		if err != nil || offset < 0 {
+			s.errorf("offset invalide")
+			return
+		}
+	}
+	path := s.replayBodies[id]
+	if path == "" {
+		s.errorf("corps de réponse #%d indisponible ; exécutez mint.replay", id)
+		return
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		s.errorf("corps de réponse #%d expiré", id)
+		return
+	}
+	if info.Size() > 16<<20 {
+		s.errorf("réponse supérieure à 16 Mio ; aperçu intégré indisponible")
+		return
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		s.errorf("lecture du corps : %v", err)
+		return
+	}
+	body = display.MaskBody(body)
+	if offset >= len(body) {
+		s.errorf("offset hors limites (%d octets affichés)", len(body))
+		return
+	}
+	end := offset + launchBodyLimit
+	if end > len(body) {
+		end = len(body)
+	}
+	for offset < len(body) && offset > 0 && !utf8.RuneStart(body[offset]) {
+		offset++
+	}
+	for end > offset && end < len(body) && !utf8.RuneStart(body[end]) {
+		end--
+	}
+	view, _ := display.RenderBody(body[offset:end], 0)
+	s.printf("[Mint] Corps de réponse #%d — octets %d-%d/%d\n", id, offset, end, len(body))
+	s.printIndented(view, "  ")
+	if end < len(body) {
+		s.printf("Suite : mint.replay.body %d %d\n", id, end)
+	}
 }
 
 func (s *Shell) cmdMintSelected() {
@@ -1962,6 +2649,8 @@ func (s *Shell) cmdMintClear(rest string) {
 		}
 	}
 	s.history.Clear()
+	s.requestEdits = make(map[int]*request.Builder)
+	s.requestBodyReplaced = make(map[int]bool)
 	s.printf("[Mint] Historique effacé (%d requête(s), %d réponse(s)). Le proxy reste dans son état actuel.\n", requests, responses)
 }
 
@@ -2038,8 +2727,7 @@ func (s *Shell) cmdMintUse(rest string) {
 		s.errorf("importation impossible : %v", err)
 		return
 	}
-	s.history.Select(c.ID)
-
+	s.activeMintID = c.ID
 	s.printf("[Mint] Capture #%d importée dans CRL-CLI.\n", c.ID)
 	s.printf("  %s %s\n", s.pal.Method(c.Request.Method), s.pal.Cyan(display.MaskURL(c.Request.URL)))
 	s.printf("  %d en-tête(s), corps %d octet(s).\n", len(c.Request.Headers), len(c.Request.Body))
@@ -2127,10 +2815,14 @@ func (s *Shell) promptText() string {
 			selected = 1
 		}
 	}
+	methodBadge := "[" + method + "]"
+	if selected > 0 {
+		methodBadge = "[Actif: " + method + "]"
+	}
 
 	p := s.pal
 	if !p.Enabled {
-		prompt := fmt.Sprintf("crl [%s] [Mint: %s]", method, mintStateStr)
+		prompt := fmt.Sprintf("crl %s [Mint: %s]", methodBadge, mintStateStr)
 		if selected > 0 {
 			prompt += fmt.Sprintf(" [Sel: %d]", selected)
 		}
@@ -2144,7 +2836,7 @@ func (s *Shell) promptText() string {
 	// Couleurs sobres : cyan, bleu, violet et vert
 	parts := []string{}
 	parts = append(parts, p.Cyan("crl"))
-	parts = append(parts, p.BoldCyan("["+method+"]"))
+	parts = append(parts, p.BoldCyan(methodBadge))
 	if mintStateStr == "ON" {
 		parts = append(parts, p.BoldGreen("[Mint: ON]"))
 	} else {
@@ -2189,7 +2881,7 @@ func (s *Shell) rule(width int) {
 }
 
 func (s *Shell) headerValue(name, value string) string {
-	return sanitizeTerminal(value)
+	return sanitizeTerminal(display.MaskHeaderValue(name, value))
 }
 
 func (s *Shell) headerLine(name, value string) string {
@@ -2296,8 +2988,13 @@ func (s *Shell) confirm(question string) bool {
 func (s *Shell) printHelp() {
 	s.printf(`Commandes CRL-CLI
   crl.host <url>              Définir l'URL ; sans argument, l'afficher
-  crl.method <méthode>        Définir la méthode ; sans argument, l'afficher
-  crl.head/header <Nom: val>  Ajouter/remplacer un en-tête
+	  crl.method <méthode>        Définir la méthode active
+	  crl.method <méthode> set <cible> Modifier la méthode des captures Mint
+	  crl.head/header <Nom: val>  Ajouter/remplacer un en-tête actif
+	  crl.head set <cible> <Nom> <valeur> Modifier l'en-tête des captures
+	  crl.head delete <cible> <Nom> Supprimer l'en-tête des captures
+	  crl.json <cible> set|delete ... Modifier un champ JSON de capture
+	  crl.body <cible> edit|set|clear Éditer le corps d'une capture
   crl.head                    Lister les en-têtes et leurs valeurs
   crl.head clear [Nom]        Supprimer un en-tête ou tous les en-têtes
   crl.head.clear [Nom]        Alias de suppression (aussi crl.header.clear)
@@ -2307,10 +3004,10 @@ func (s *Shell) printHelp() {
   crl.proxy <url|none|auto>   Définir le proxy (off=none ; clear/unset=auto)
   crl.proxy                   Afficher le proxy explicite et effectif
   crl.ca [fichier|off]        Définir/afficher le CA PEM (off/none/clear : système)
-  crl.show                    Afficher URL et en-têtes complets, sans envoyer
+	  crl.show [id|active [body offset]] Afficher les requêtes détaillées
   crl.table                   Résumé avec valeurs d'URL sensibles masquées
   crl.output [auto|raw|pretty] Choisir le rendu du corps des réponses
-  crl.launch                  Envoyer la requête avec curl et afficher la réponse
+	  crl.launch [cibles|active]  Envoyer la sélection, les cibles ou l'actif
   reset                       Réinitialiser le constructeur
   clear                       Effacer l'écran en mode interactif
   help | ?                    Afficher cette aide
@@ -2326,8 +3023,9 @@ Commandes Mint (aide détaillée : mint.help)
   mint.watch [on|off]           Activer/suspendre les notifications, ou afficher l'état
   mint.events                  Afficher et vider les notifications mises en attente
   mint.request.show <id>       Détail complet (alias : mint.show)
-	  mint.select <id...>|clear    Sélectionner une ou plusieurs captures
-	  mint.replay                  Rejouer en parallèle la sélection
+	  mint.select <ids>|all         Sélectionner ; add/remove/clear modifient la sélection
+	  mint.replay [cibles]         Rejouer en parallèle (IDs, selected ou all)
+	  mint.replay.body <id> [offset] Lire une page du corps d'une réponse
   mint.selected                Afficher la capture sélectionnée
   mint.filter <texte|clear>    Filtrer par hôte, URL, chemin ou query string
   mint.clear [--yes|-y]        Vider l'historique (confirmation sauf avec --yes)
@@ -2352,9 +3050,10 @@ func (s *Shell) printMintHelp() {
   mint.watch [on|off]           Activer, suspendre ou afficher l'état des notifications
   mint.events                  Afficher les notifications accumulées pendant watch off
   mint.request.show <id>       Afficher le détail complet d'une capture (alias mint.show)
-	  mint.select <id...>|clear    Sélectionner une ou plusieurs captures
-	  mint.replay                  Rejouer en parallèle (lot limité à 4)
-  mint.selected                Afficher l'identifiant sélectionné
+	  mint.select <ids>|all         Sélectionner ; add/remove/clear modifient la sélection
+	  mint.replay [cibles]         Rejouer en parallèle (lot limité à 4)
+	  mint.replay.body <id> [offset] Lire une page du corps d'une réponse
+	  mint.selected                Afficher les requêtes sélectionnées
   mint.filter <texte>          Filtrer par hôte, URL, chemin ou query string
   mint.filter clear            Retirer le filtre ; l'historique reste intact
   mint.clear [--yes|-y]        Vider l'historique ; demander confirmation par défaut

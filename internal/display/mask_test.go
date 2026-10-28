@@ -46,6 +46,17 @@ func TestMaskURLWithoutQuery(t *testing.T) {
 	}
 }
 
+func TestMaskBodyMasksNestedCredentialsWithoutMutatingInput(t *testing.T) {
+	body := []byte(`{"profile":{"role":"admin","password":"secret"},"items":[{"access_token":"abc"}]}`)
+	masked := string(MaskBody(body))
+	if strings.Contains(masked, "secret") || strings.Contains(masked, "abc") || !strings.Contains(masked, "admin") {
+		t.Fatalf("masked JSON = %s", masked)
+	}
+	if string(body) != `{"profile":{"role":"admin","password":"secret"},"items":[{"access_token":"abc"}]}` {
+		t.Fatalf("input body mutated: %s", body)
+	}
+}
+
 func TestRenderBody(t *testing.T) {
 	text, cut := RenderBody([]byte("hello"), 10)
 	if text != "hello" || cut {

@@ -267,26 +267,39 @@ utilise automatiquement le proxy Mint. L'historique reste disponible après
 |---|---|
 | `crl.host <url>` | définit l'URL ; sans schéma, `http://` est ajouté ; l'encodage, les paramètres répétés et les valeurs vides sont conservés |
 | `crl.host` | affiche l'URL courante (masquée) |
-| `crl.method <méthode>` | définit la méthode HTTP (normalisée en majuscules) |
+| `crl.method <méthode>` | définit la méthode du constructeur actif (normalisée en majuscules) |
+| `crl.method <méthode> set <cible>` | modifie la méthode des captures Mint ciblées (`1`, `1,2`, `selected`, `all`) |
 | `crl.head <Nom: valeur>` | ajoute ou remplace un en-tête (alias : `crl.header`) |
 | `crl.head` | liste les en-têtes avec leurs valeurs complètes |
 | `crl.head clear [Nom]` | supprime un en-tête nommé, ou tous sans argument |
+| `crl.head set <cible> <Nom> <valeur>` | ajoute/remplace l'en-tête des captures ciblées ; les valeurs entre guillemets gardent leurs espaces |
+| `crl.head delete <cible> <Nom>` | supprime l'en-tête des captures ciblées |
+| `crl.head show <cible>` | affiche les en-têtes masquant les valeurs sensibles |
 | `crl.head.clear [Nom]` | variante explicite de la commande précédente |
 | `crl.json <json>` | définit un corps JSON valide et `Content-Type: application/json` |
 | `crl.json` | saisie multiligne intégrée (`:end` pour valider, `:cancel` pour annuler) |
 | `crl.json set <chemin> = <valeur JSON>` | modifie un champ précis (objets imbriqués pris en charge) |
 | `crl.json delete <chemin>` | supprime une propriété précise |
+| `crl.json <cible> set <chemin> = <valeur JSON>` | applique le changement JSON aux captures ciblées sans toucher les originales |
+| `crl.json <id> edit` | édite le JSON de cette capture seulement ; `:end` applique après validation, `:cancel` annule |
 | `crl.json clear` | efface le corps sans modifier méthode ni en-têtes |
 | `crl.body <texte>` | définit un corps brut, sans modifier le `Content-Type` |
 | `crl.body` | saisie multiligne intégrée sans validation JSON (`:end`/`:cancel`) |
+| `crl.body <id> edit` | édite le corps brut d'une capture seulement |
+| `crl.body <cible> set <texte>` / `clear` | définit ou efface les corps des captures ciblées |
 | `crl.body.clear` | supprime le corps |
 | `crl.proxy <url\|none\|auto>` | proxy explicite ; `none` désactive tout proxy ; `auto`, `clear` ou `unset` réactive le proxy Mint automatique |
 | `crl.proxy` | affiche le proxy explicite et le proxy effectif |
 | `crl.ca <fichier\|off>` | utilise un fichier CA PEM pour curl, sans désactiver la vérification TLS ; `off`/`none`/`clear` revient au bundle système |
-| `crl.show` | affiche la requête préparée avec l'URL et les en-têtes complets, sans l'envoyer |
+| `crl.show` | détaille la requête active ou toutes les captures sélectionnées ; secrets masqués, corps volumineux paginés |
+| `crl.show <id> [body <offset>]` | détaille une capture et lit une page de son corps |
+| `crl.show active` | détaille le constructeur actif même lorsqu'une sélection Mint existe |
+| `crl.show body [offset]` | lit une page du corps actif |
 | `crl.table` | affiche un tableau récapitulatif (URL masquée, noms d'en-têtes ; valeurs via `crl.show`) |
 | `crl.output [auto\|raw\|pretty]` | choisit le format d'affichage du corps des réponses ; sans argument, affiche le mode courant |
-| `crl.launch` | envoie la requête avec `curl` et présente la réponse |
+| `crl.launch` | envoie la sélection si elle existe, sinon le constructeur actif |
+| `crl.launch active` | envoie explicitement le constructeur actif |
+| `crl.launch <cible>` | envoie en parallèle des captures Mint ciblées (`1`, `1,2`, `selected`, `all`) |
 | `reset` | réinitialise le constructeur |
 | `clear` | efface l'écran en mode interactif |
 | `help` ou `?` | affiche l'aide |
@@ -332,9 +345,10 @@ Notes :
 | `mint.events` | affiche les notifications mises en attente pendant `mint.watch off` |
 | `mint.history` | liste tout l'historique, sans filtre |
 | `mint.request.show <id>` | détail complet d'une capture (alias : `mint.show`) |
-| `mint.select <id...>` | sélectionne une ou plusieurs captures (`12 15` ou `12,15`) ; `clear` efface la sélection |
+| `mint.select <id...>` | remplace la sélection ; `add <cible>`, `remove <cible>`, `clear`, `all` la modifient |
 | `mint.selected` | affiche la sélection persistante |
-| `mint.replay` | rejoue en parallèle les captures sélectionnées (maximum 4 simultanées) |
+| `mint.replay [cible]` | rejoue en parallèle les captures sélectionnées ou ciblées (maximum 4 simultanées) |
+| `mint.replay.body <id> [offset]` | consulte les pages du corps de réponse (jusqu'à 16 Mio, durant la session) |
 | `mint.filter <texte>` | filtre localement par hôte, URL, chemin ou chaîne de requête |
 | `mint.filter clear` | supprime le filtre sans effacer l'historique |
 | `mint.clear [--yes]` | efface l'historique après confirmation ; `--yes` ou `-y` évite la question |
@@ -362,7 +376,7 @@ Comportement de `mint.use` :
   corps n'est pas utilisé pour le rejeu ;
 - demande confirmation avant de remplacer une configuration non vide, sauf avec
   `--force` ;
-- sélectionne la capture importée ;
+- marque cette capture comme requête active du constructeur sans modifier la sélection Mint ;
 - n'envoie jamais la requête.
 
 ## Proxy automatique et priorité
@@ -562,13 +576,9 @@ démarrage du proxy, puis supprimé à l'arrêt.
   crash, le shell reste utilisable et signale l'erreur.
 - **Captures conservées** : arrêter le proxy ne supprime pas l'historique de la
   session. Quitter CRL-CLI le supprime, car tout est en mémoire.
-- **Affichage des secrets** : `crl.show` et `mint.request.show` affichent l'URL
-  complète et les valeurs d'en-têtes complètes ; `crl.head` affiche les valeurs
-  complètes des en-têtes. `mint.request.show` inclut les en-têtes de réponse et
-  `crl.launch` affiche l'URL complète et les en-têtes de réponse complets.
-  `crl.table`, les tableaux Mint (`mint.requests`, `mint.history`) et les
-  notifications masquent les paramètres d'URL sensibles et n'affichent pas les
-  valeurs d'en-têtes. Les données internes d'import et de rejeu ne sont jamais
+- **Affichage des secrets** : les inspections détaillées masquent les valeurs
+  sensibles des en-têtes, les champs JSON usuels (jetons, mots de passe) et les
+  paramètres d'URL connus. Les données d'import et de rejeu ne sont jamais
   modifiées.
 
 ### Association et troncature
@@ -648,7 +658,8 @@ Les tests couvrent notamment :
   séquentiels ;
 - gestionnaire Mint : démarrage/arrêt, crash, délai de démarrage, port occupé,
   redémarrage, arrêt propre et non-agression d'un processus sans rapport ;
-- shell : commandes, affichage complet, import, confirmation, lancement curl,
+- shell : commandes, détails multisélectionnés, modifications individuelles et
+  collectives, import, confirmation, lancement curl,
   rejeu des en-têtes `Authorization`/`Cookie` après sélection et import,
   diagnostics 400/401/403/404 et utilisabilité après un échec de démarrage de
   Mint ;
@@ -813,12 +824,12 @@ MIT. Voir [LICENSE](LICENSE).
 
 ## Mise à jour (session de stabilisation)
 
-- Prompt mono-ligne `crl [GET] [Mint: ON] [Sel: N] >` avec couleurs sobres, mise à jour dynamique et respect de `NO_COLOR`/terminal non-TTY.
+- Prompt mono-ligne `crl [GET] [Mint: ON] [Sel: N] >` ; la méthode devient `[Actif: GET]` avec une sélection pour éviter toute ambiguïté.
 - Notifications Mint : pas d'écriture concurrente depuis le pont/goroutines pendant la saisie ; un seul lecteur `stdin`.
-- Sélection Mint distincte du constructeur préparé ; `crl.show`/`crl.table` cohérents ; `crl.launch` exécute selon la sélection (préparée, unique ou lot parallèle).
+- Sélection Mint et constructeur actif indépendants ; `crl.show` détaille toutes les captures sélectionnées ; modifications ciblées stockées en copies de travail, captures originales inchangées.
 - Édition JSON multiligne intégrée sans `$EDITOR`/`$VISUAL` (`:end`, `:cancel`), préservation du corps en cas d'erreur/annulation. Ajout de `crl.json set`/`delete` pour modifier/supprimer un champ précis en préservant le reste.
 - `crl.body` multiligne intégrée. Corps envoyé fidèlement (gestion Content-Length/`--data-binary` via stdin), pas de réutilisation aveugle après modification.
-- Rejeu parallèle conservant la source, bilan `[Envoyées: ...]`, historique associé.
+- Rejeu parallèle avec sections et résumé par identifiant ; erreurs HTTP distinctes des erreurs réseau ; `mint.replay.body <id> [offset]` consulte le corps jusqu'à 16 Mio.
 
 ### Tests réellement exécutés
 - `gofmt -w .`

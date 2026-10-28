@@ -350,10 +350,54 @@ func (h *History) SelectMany(ids []int) ([]Capture, error) {
 	return out, nil
 }
 
-// SelectedMany returns snapshots of all still available selected captures.
-func (h *History) SelectedMany() []Capture {
+// AddSelection ajoute les IDs disponibles à la sélection existante.
+func (h *History) AddSelection(ids []int) ([]Capture, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	seen := make(map[int]bool, len(h.selectedIDs)+len(ids))
+	for _, id := range h.selectedIDs {
+		seen[id] = true
+	}
+	for _, id := range ids {
+		if h.byID[id] == nil {
+			return nil, fmt.Errorf("capture #%d introuvable", id)
+		}
+	}
+	for _, id := range ids {
+		if !seen[id] {
+			seen[id] = true
+			h.selectedIDs = append(h.selectedIDs, id)
+		}
+	}
+	if len(h.selectedIDs) > 0 {
+		h.selected = h.selectedIDs[0]
+	}
+	return h.selectedLocked(), nil
+}
+
+// RemoveSelection retire les IDs indiqués de la sélection.
+func (h *History) RemoveSelection(ids []int) []Capture {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	remove := make(map[int]bool, len(ids))
+	for _, id := range ids {
+		remove[id] = true
+	}
+	out := h.selectedIDs[:0]
+	for _, id := range h.selectedIDs {
+		if !remove[id] && h.byID[id] != nil {
+			out = append(out, id)
+		}
+	}
+	h.selectedIDs = out
+	h.selected = 0
+	if len(out) > 0 {
+		h.selected = out[0]
+	}
+	return h.selectedLocked()
+}
+
+func (h *History) selectedLocked() []Capture {
 	out := make([]Capture, 0, len(h.selectedIDs))
 	for _, id := range h.selectedIDs {
 		if c := h.byID[id]; c != nil {
@@ -361,6 +405,13 @@ func (h *History) SelectedMany() []Capture {
 		}
 	}
 	return out
+}
+
+// SelectedMany returns snapshots of all still available selected captures.
+func (h *History) SelectedMany() []Capture {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.selectedLocked()
 }
 
 // ClearSelection removes the persistent selection.

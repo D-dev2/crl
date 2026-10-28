@@ -181,6 +181,43 @@ func RenderBody(body []byte, limit int) (string, bool) {
 	return string(body), false
 }
 
+// MaskBody returns a display-only copy of a JSON body with common credential
+// fields obscured. The bytes held by a request are never modified.
+func MaskBody(body []byte) []byte {
+	var value any
+	if !json.Valid(body) {
+		return append([]byte(nil), body...)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if decoder.Decode(&value) != nil {
+		return append([]byte(nil), body...)
+	}
+	var mask func(any)
+	mask = func(v any) {
+		switch x := v.(type) {
+		case map[string]any:
+			for k, child := range x {
+				if HeaderSensitive(k) || QuerySensitive(k) {
+					x[k] = "***"
+				} else {
+					mask(child)
+				}
+			}
+		case []any:
+			for _, child := range x {
+				mask(child)
+			}
+		}
+	}
+	mask(value)
+	out, err := json.Marshal(value)
+	if err != nil {
+		return append([]byte(nil), body...)
+	}
+	return out
+}
+
 func hasBinaryControl(body []byte) bool {
 	for _, b := range body {
 		if b == 0 {

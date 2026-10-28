@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -136,19 +137,19 @@ func TestMintRequestsFilterAndHistory(t *testing.T) {
 	}
 }
 
-func TestMintShowIncludesFullHeaders(t *testing.T) {
+func TestMintShowMasksSecrets(t *testing.T) {
 	sh, out, _, hist, _ := newTestShell(t, "")
 	addCapture(t, hist)
 	sh.Execute("mint.request.show 1")
 	text := out.String()
-	for _, want := range []string{"Capture #1", "Bearer supersecret", "Cookie: session=abc", "Set-Cookie: session=abc", "token=supersecret", "200 OK", "24ms", "/users/v1/login"} {
+	for _, want := range []string{"Capture #1", "Bearer ***", "Cookie: ***", "Set-Cookie: ***", "token=***", "200 OK", "24ms", "/users/v1/login"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("show missing %q:\n%s", want, text)
 		}
 	}
 }
 
-func TestMintShowDisplaysProxyAndCustomHeaderValues(t *testing.T) {
+func TestMintShowMasksProxyAndCustomHeaderValues(t *testing.T) {
 	sh, out, _, hist, _ := newTestShell(t, "")
 	hist.AddRequest(mint.BridgeEvent{
 		Type: "request", FlowID: "custom-headers", Timestamp: time.Now(),
@@ -160,7 +161,7 @@ func TestMintShowDisplaysProxyAndCustomHeaderValues(t *testing.T) {
 	})
 	sh.Execute("mint.request.show 1")
 	text := out.String()
-	for _, want := range []string{"Proxy-Authorization: Basic proxy-value", "X-Custom-Token: custom-value"} {
+	for _, want := range []string{"Proxy-Authorization: Basic ***", "X-Custom-Token: ***"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("valeur complète %q absente :\n%s", want, text)
 		}
@@ -201,8 +202,130 @@ func TestMintSelectAndUse(t *testing.T) {
 	}
 	out.Reset()
 	sh.Execute("crl.show")
-	if !strings.Contains(out.String(), "Bearer supersecret") || !strings.Contains(out.String(), "session=abc") {
-		t.Fatalf("crl.show did not show full headers:\n%s", out.String())
+	if !strings.Contains(out.String(), "Bearer ***") || !strings.Contains(out.String(), "Cookie: ***") {
+		t.Fatalf("crl.show did not mask secret headers:\n%s", out.String())
+	}
+}
+
+func TestSelectedRequestsShowAndEditIndependently(t *testing.T) {
+	sh, out, _, hist, _ := newTestShell(t, "")
+	for i := 1; i <= 3; i++ {
+		hist.AddRequest(mint.BridgeEvent{Type: "request", FlowID: fmt.Sprintf("multi-%d", i), Method: "POST", URL: fmt.Sprintf("http://example.test/%d?token=private", i), Timestamp: time.Now(), Headers: []mint.Header{{Name: "Authorization", Value: "Bearer private"}, {Name: "X-Index", Value: strconv.Itoa(i)}, {Name: "Content-Type", Value: "application/json"}}, Body: []byte(fmt.Sprintf(`{"role":"user","n":%d}`, i)), BodySize: int64(len(fmt.Sprintf(`{"role":"user","n":%d}`, i)))})
+	}
+	sh.Execute("mint.select 1 2 3")
+	out.Reset()
+	sh.Execute("crl.show")
+	text := out.String()
+	for _, want := range []string{"REQUEST #1", "REQUEST #2", "REQUEST #3", "Authorization: Bearer ***", "\"role\": \"user\"", "token=***"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("crl.show missing %q:\n%s", want, text)
+		}
+	}
+	sh.Execute("crl.method PATCH set 1")
+	sh.Execute(`crl.head set 2 X-Note "two words"`)
+	sh.Execute(`crl.json 2 set role = "admin"`)
+	if sh.requestEdits[1].Method() != "PATCH" {
+		t.Fatalf("method #1 = %q", sh.requestEdits[1].Method())
+	}
+	if sh.requestEdits[2].Method() != "POST" {
+		t.Fatalf("method #2 changed unexpectedly: %q", sh.requestEdits[2].Method())
+	}
+	if sh.requestEdits[3].Method() != "POST" || !strings.Contains(string(sh.requestEdits[3].Body()), `"n":3`) {
+		t.Fatalf("requête #3 modifiée involontairement: method=%s body=%s", sh.requestEdits[3].Method(), sh.requestEdits[3].Body())
+	}
+	for _, h := range sh.requestEdits[2].Headers() {
+		if h.Name == "X-Note" && h.Value != "two words" {
+			t.Fatalf("quoted header value = %q", h.Value)
+		}
+	}
+	sh.Execute("crl.head show 2")
+	if !strings.Contains(out.String(), "X-Note: two words") {
+		t.Fatalf("target header inspection failed:\n%s", out.String())
+	}
+	sh.Execute("crl.head delete 2 X-Note")
+	for _, h := range sh.requestEdits[2].Headers() {
+		if h.Name == "X-Note" {
+			t.Fatal("target header delete failed")
+		}
+	}
+	if !strings.Contains(string(sh.requestEdits[2].Body()), `"role": "admin"`) {
+		t.Fatalf("targeted JSON edit missing: %s", sh.requestEdits[2].Body())
+	}
+	beforeInvalid := string(sh.requestEdits[2].Body())
+	sh.Execute(`crl.json 2 set role = not-json`)
+	if string(sh.requestEdits[2].Body()) != beforeInvalid {
+		t.Fatal("invalid JSON edit changed the working request")
+	}
+	if err := sh.requestEdits[3].SetJSON(`[ {"role":"user"} ]`); err != nil {
+		t.Fatal(err)
+	}
+	sh.Execute(`crl.json 3 set 0.role = "admin"`)
+	if !strings.Contains(string(sh.requestEdits[3].Body()), `"role": "admin"`) {
+		t.Fatalf("array path update failed: %s", sh.requestEdits[3].Body())
+	}
+	sh.Execute("crl.head set selected Accept application/json")
+	for id := 1; id <= 3; id++ {
+		if sh.requestEdits[id] == nil {
+			t.Fatalf("collective header missing request #%d", id)
+		}
+		found := false
+		for _, h := range sh.requestEdits[id].Headers() {
+			if h.Name == "Accept" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("Accept missing from #%d", id)
+		}
+	}
+	sh.Execute("mint.select remove 2")
+	if got := len(hist.SelectedMany()); got != 2 {
+		t.Fatalf("selection count after remove = %d", got)
+	}
+	sh.Execute("mint.select clear")
+	if got := len(hist.SelectedMany()); got != 0 {
+		t.Fatalf("selection count after clear = %d", got)
+	}
+}
+
+func TestJSONFieldEditPreservesLargeInteger(t *testing.T) {
+	sh, out, _, _, builder := newTestShell(t, "")
+	if err := builder.SetJSON(`{"id":9007199254740993,"role":"user"}`); err != nil {
+		t.Fatal(err)
+	}
+	sh.Execute(`crl.json set role = "admin"`)
+	if !strings.Contains(string(builder.Body()), "9007199254740993") || !strings.Contains(string(builder.Body()), `"role": "admin"`) {
+		t.Fatalf("JSON update corrupted sibling data: %s\n%s", builder.Body(), out.String())
+	}
+}
+
+func TestMintUseKeepsSelectionSeparateFromActiveRequest(t *testing.T) {
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skip("curl absent")
+	}
+	gotPath := make(chan string, 1)
+	srv := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { gotPath <- r.URL.Path; w.WriteHeader(http.StatusOK) }))
+	defer srv.Close()
+	sh, _, _, hist, builder := newTestShell(t, "")
+	for i, path := range []string{"/loaded", "/selected"} {
+		hist.AddRequest(mint.BridgeEvent{Type: "request", FlowID: fmt.Sprintf("separate-%d", i), Method: "GET", URL: srv.URL + path, Timestamp: time.Now()})
+	}
+	sh.Execute("mint.select 2")
+	sh.Execute("mint.use 1 --force")
+	if selected, ok := hist.Selected(); !ok || selected.ID != 2 {
+		t.Fatalf("mint.use changed selection: %#v", selected)
+	}
+	if builder.URL() != srv.URL+"/loaded" {
+		t.Fatalf("active request was not loaded: %s", builder.URL())
+	}
+	sh.Execute("crl.launch active")
+	select {
+	case path := <-gotPath:
+		if path != "/loaded" {
+			t.Fatalf("active launch sent selected request path %q", path)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("active launch did not reach server")
 	}
 }
 
@@ -217,7 +340,11 @@ func TestMintReplayRunsSelectedRequestsInParallel(t *testing.T) {
 			t.Errorf("Authorization lost during replay: %#v", r.Header)
 		}
 		time.Sleep(250 * time.Millisecond)
-		w.WriteHeader(http.StatusOK)
+		if r.URL.Path == "/two" {
+			w.WriteHeader(http.StatusUnauthorized)
+		} else {
+			w.WriteHeader(http.StatusOK)
+		}
 		_, _ = w.Write([]byte(r.URL.Path))
 	})
 	ln, listenErr := net.Listen("tcp4", "127.0.0.1:0")
@@ -241,10 +368,17 @@ func TestMintReplayRunsSelectedRequestsInParallel(t *testing.T) {
 	if elapsed >= 450*time.Millisecond {
 		t.Fatalf("batch took %s, expected parallel responses", elapsed)
 	}
-	for _, want := range []string{"#1", "#2", "200", "/one", "/two"} {
+	for _, want := range []string{"#1", "#2", "200 OK", "401 Unauthorized", "/one", "/two", "Succès HTTP : 1", "Erreurs HTTP : 1"} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("missing %q in replay result:\n%s", want, out.String())
 		}
+	}
+	sh.Execute("mint.replay.body 1")
+	if !strings.Contains(out.String(), "Corps de réponse #1") {
+		t.Fatalf("replayed body not retained for detailed inspection:\n%s", out.String())
+	}
+	if original, ok := hist.Get(1); !ok || original.Request.Method != "GET" {
+		t.Fatalf("replay modified original capture: %#v", original)
 	}
 }
 
@@ -428,7 +562,7 @@ func TestProxyPriorityInShow(t *testing.T) {
 	}
 }
 
-func TestCRLCommandsShowFullHeaders(t *testing.T) {
+func TestCRLCommandsMaskSecrets(t *testing.T) {
 	sh, out, _, _, builder := newTestShell(t, "")
 	sh.Execute("crl.host http://127.0.0.1:5002/a%2Fb?x=1&x=2&empty=&token=abc")
 	sh.Execute("crl.method PUT")
@@ -438,7 +572,7 @@ func TestCRLCommandsShowFullHeaders(t *testing.T) {
 	sh.Execute("crl.json {\"a\":1}")
 	sh.Execute("crl.show")
 	text := out.String()
-	for _, want := range []string{"Bearer verysecret", "Basic proxysecret", "customsecret", "token=abc"} {
+	for _, want := range []string{"Bearer ***", "Basic ***", "***", "token=***"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("full header or URL value %q missing:\n%s", want, text)
 		}
