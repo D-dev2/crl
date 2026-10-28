@@ -24,6 +24,7 @@ func TestColorDisabledByDefaultOnBuffer(t *testing.T) {
 }
 
 func TestPaletteAndPromptColors(t *testing.T) {
+	t.Setenv("TERM", "xterm-256color")
 	p := palette{Enabled: true}
 	for name, got := range map[string]string{
 		"method":  p.Method("DELETE"),
@@ -50,17 +51,17 @@ func TestPaletteAndPromptColors(t *testing.T) {
 	sh, _, _, _, _ := newTestShell(t, "")
 	sh.pal.Enabled = true
 	sh.lastFailed = false
-	if got := sh.promptText(); !strings.Contains(got, prompt) || !strings.Contains(got, "\033[1;36m") {
+	if got := sh.promptText(); !strings.Contains(got, "CRL-CLI") || !strings.Contains(got, "\033[1;34m") {
 		t.Fatalf("invite normale = %q", got)
 	}
 	sh.lastFailed = true
-	if got := sh.promptText(); !strings.Contains(got, prompt) || !strings.Contains(got, "\033[1;31m") {
+	if got := sh.promptText(); !strings.Contains(got, "CRL-CLI") || !strings.Contains(got, "\033[1;31m") {
 		t.Fatalf("invite d'erreur = %q", got)
 	}
 
 	sh.pal.Enabled = false
 	sh.lastFailed = true
-	if got := sh.promptText(); got != prompt {
+	if got := sh.promptText(); !strings.Contains(got, "CRL-CLI") || strings.Contains(got, "\033[") {
 		t.Fatalf("invite sans couleur = %q", got)
 	}
 }

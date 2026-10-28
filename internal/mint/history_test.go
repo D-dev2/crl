@@ -65,6 +65,25 @@ func TestAddRequestAndResponseSameCapture(t *testing.T) {
 	}
 }
 
+func TestSelectManyKeepsOrderedPersistentSelection(t *testing.T) {
+	h := NewHistory(DefaultHistoryConfig())
+	h.AddRequest(reqEvent("a", "http://a.test/", "GET", nil))
+	h.AddRequest(reqEvent("b", "http://b.test/", "POST", []byte("x")))
+	got, err := h.SelectMany([]int{2, 1, 2})
+	if err != nil || len(got) != 2 || got[0].ID != 2 || got[1].ID != 1 {
+		t.Fatalf("selection = %#v, %v", got, err)
+	}
+	if got := h.SelectedMany(); len(got) != 2 || got[0].ID != 2 {
+		t.Fatalf("persistent selection = %#v", got)
+	}
+	if _, err := h.SelectMany([]int{99}); err == nil {
+		t.Fatal("unknown ID accepted")
+	}
+	if got := h.SelectedMany(); len(got) != 2 {
+		t.Fatalf("failed selection changed state: %#v", got)
+	}
+}
+
 func TestDuplicateRequestUpdatesFlow(t *testing.T) {
 	h := NewHistory(DefaultHistoryConfig())
 	h.AddRequest(reqEvent("flow-1", "http://example.test/old", "GET", []byte("old")))

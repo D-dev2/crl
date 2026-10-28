@@ -162,14 +162,14 @@ func TestInteractiveTypingOneKeyAtATime(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- sh.Run(ctx) }()
 
-	waitPTYLine(t, got, "crl > ", 3*time.Second)
+	waitPTYLine(t, got, "\n`-> ", 3*time.Second)
 
 	typed := "help"
 	for i := range typed {
 		if _, err := master.Write([]byte{typed[i]}); err != nil {
 			t.Fatalf("écriture PTY : %v", err)
 		}
-		waitPTYLine(t, got, "crl > "+typed[:i+1], 3*time.Second)
+		waitPTYLine(t, got, "\n`-> "+typed[:i+1], 3*time.Second)
 	}
 	if _, err := master.Write([]byte("\r")); err != nil {
 		t.Fatal(err)
@@ -234,15 +234,15 @@ func TestInteractiveMintNotificationPreservesTypedInput(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- sh.Run(ctx) }()
 
-	waitPTYLine(t, got, "crl > ", 3*time.Second)
+	waitPTYLine(t, got, "\n`-> ", 3*time.Second)
 	if _, err := master.Write([]byte("hel")); err != nil {
 		t.Fatalf("écriture PTY : %v", err)
 	}
-	waitPTYLine(t, got, "crl > hel", 3*time.Second)
+	waitPTYLine(t, got, "\n`-> hel", 3*time.Second)
 
 	notifs <- mint.Notification{Kind: "request", ID: 7, Method: "GET", URL: "http://example.test/api"}
 	waitPTYText(t, got, "[Mint] #7 GET http://example.test/api", 3*time.Second)
-	waitPTYLine(t, got, "crl > hel", 3*time.Second)
+	waitPTYLine(t, got, "\n`-> hel", 3*time.Second)
 
 	if _, err := master.Write([]byte("p\r")); err != nil {
 		t.Fatalf("écriture PTY : %v", err)
@@ -305,13 +305,13 @@ func TestInteractiveLongPasteShowsPromptOnce(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- sh.Run(ctx) }()
 
-	waitPTYLine(t, got, "crl > ", 3*time.Second)
+	waitPTYLine(t, got, "\n`-> ", 3*time.Second)
 	paste := strings.Repeat("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.", 30)
 	if _, err := master.Write([]byte(paste)); err != nil {
 		t.Fatalf("écriture PTY : %v", err)
 	}
 	waitPTYText(t, got, paste, 3*time.Second)
-	if count := strings.Count(got.String(), "crl > "); count != 1 {
+	if count := strings.Count(got.String(), "`-> "); count != 1 {
 		t.Fatalf("le collage a produit %d prompts :\n%q", count, got.String())
 	}
 

@@ -10,6 +10,9 @@ constructeur `crl.*` sans l'envoyer.
 - Rejeu fidèle via `curl`, sans passer les données par un shell.
 - Réponses HTTP présentées avec statut, durée, en-têtes et corps lisible.
 - Modes d'affichage `auto`, `raw` et `pretty`, sans modifier les octets reçus.
+- Prompt compact CRL-CLI avec état Mint et méthode/host de la requête.
+- Édition multilignes de JSON et de corps brut via `$VISUAL` ou `$EDITOR`.
+- Sélection de plusieurs captures Mint et rejeu concurrent avec `mint.replay`.
 - Proxy Mint démarré et arrêté par CRL-CLI, avec confirmation de disponibilité.
 - Capture en temps réel, historique, filtre, sélection et import.
 - Affichage complet dans les commandes d'inspection, URL masquée dans les tableaux et notifications Mint.
@@ -195,6 +198,26 @@ crl.table
 crl.launch
 ```
 
+Sans argument, `crl.json` ouvre le JSON actuel dans `$VISUAL`, puis `$EDITOR`
+(repli sur `vi`) et valide le document avant de remplacer le corps. `crl.body`
+ouvre de la même manière le corps brut sans validation JSON. `crl.json clear`
+et `crl.body.clear` effacent le corps sans toucher aux autres en-têtes.
+
+Pour rejouer simultanément plusieurs captures :
+
+```text
+mint.select 12 15
+mint.selected
+mint.replay
+```
+
+La sélection reste active jusqu'à `mint.select clear` ou une nouvelle
+sélection. Le rejeu démarre jusqu'à quatre requêtes à la fois et affiche un
+bilan par identifiant après la fin du lot. Le rejeu contourne le proxy Mint
+local afin d'éviter de générer une nouvelle capture artificielle. `mint.use` sans ID demande une
+sélection unique ; avec plusieurs captures, utilisez explicitement
+`mint.use <id>`.
+
 À l'affichage, `crl.launch` présente d'abord la requête, puis le statut, la durée,
 les en-têtes de réponse et le corps. Un JSON valide est indenté ; une page HTML
 est aérée sans être présentée comme du JSON. Pour conserver le corps brut :
@@ -304,8 +327,9 @@ Notes :
 | `mint.events` | affiche les notifications mises en attente pendant `mint.watch off` |
 | `mint.history` | liste tout l'historique, sans filtre |
 | `mint.request.show <id>` | détail complet d'une capture (alias : `mint.show`) |
-| `mint.select <id>` | sélectionne une capture |
-| `mint.selected` | affiche la capture sélectionnée |
+| `mint.select <id...>` | sélectionne une ou plusieurs captures (`12 15` ou `12,15`) ; `clear` efface la sélection |
+| `mint.selected` | affiche la sélection persistante |
+| `mint.replay` | rejoue en parallèle les captures sélectionnées (maximum 4 simultanées) |
 | `mint.filter <texte>` | filtre localement par hôte, URL, chemin ou chaîne de requête |
 | `mint.filter clear` | supprime le filtre sans effacer l'historique |
 | `mint.clear [--yes]` | efface l'historique après confirmation ; `--yes` ou `-y` évite la question |

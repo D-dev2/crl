@@ -53,14 +53,15 @@ func (c HistoryConfig) normalized() HistoryConfig {
 type History struct {
 	mu sync.Mutex
 
-	cfg      HistoryConfig
-	byID     map[int]*Capture
-	byFlow   map[string]*Capture
-	order    []int
-	nextID   int
-	total    int64
-	filter   string
-	selected int
+	cfg         HistoryConfig
+	byID        map[int]*Capture
+	byFlow      map[string]*Capture
+	order       []int
+	nextID      int
+	total       int64
+	filter      string
+	selected    int
+	selectedIDs []int
 }
 
 // NewHistory crée un historique vide.
@@ -238,6 +239,12 @@ func (h *History) enforceLimitsLocked() {
 		if h.selected == oldest {
 			h.selected = 0
 		}
+		for i, id := range h.selectedIDs {
+			if id == oldest {
+				h.selectedIDs = append(h.selectedIDs[:i], h.selectedIDs[i+1:]...)
+				break
+			}
+		}
 		if h.total < 0 {
 			h.total = 0
 		}
@@ -312,7 +319,56 @@ func (h *History) Select(id int) (Capture, bool) {
 		return Capture{}, false
 	}
 	h.selected = id
+	h.selectedIDs = []int{id}
 	return c.snapshot(), true
+}
+
+// SelectMany validates and stores a persistent ordered selection.
+func (h *History) SelectMany(ids []int) ([]Capture, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	seen := make(map[int]bool, len(ids))
+	out := make([]Capture, 0, len(ids))
+	for _, id := range ids {
+		c, ok := h.byID[id]
+		if !ok {
+			return nil, fmt.Errorf("capture #%d introuvable", id)
+		}
+		if !seen[id] {
+			seen[id] = true
+			out = append(out, c.snapshot())
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("sélection vide")
+	}
+	h.selectedIDs = h.selectedIDs[:0]
+	for _, c := range out {
+		h.selectedIDs = append(h.selectedIDs, c.ID)
+	}
+	h.selected = out[0].ID
+	return out, nil
+}
+
+// SelectedMany returns snapshots of all still available selected captures.
+func (h *History) SelectedMany() []Capture {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]Capture, 0, len(h.selectedIDs))
+	for _, id := range h.selectedIDs {
+		if c := h.byID[id]; c != nil {
+			out = append(out, c.snapshot())
+		}
+	}
+	return out
+}
+
+// ClearSelection removes the persistent selection.
+func (h *History) ClearSelection() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.selected = 0
+	h.selectedIDs = nil
 }
 
 // Selected retourne la capture active.
@@ -336,6 +392,7 @@ func (h *History) Clear() {
 	h.order = nil
 	h.total = 0
 	h.selected = 0
+	h.selectedIDs = nil
 }
 
 // Counts retourne le nombre de requêtes enregistrées et de réponses reçues.

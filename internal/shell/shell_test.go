@@ -2,7 +2,9 @@ package shell
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -169,7 +172,7 @@ func TestMintSelectAndUse(t *testing.T) {
 	addCapture(t, hist)
 
 	sh.Execute("mint.select 1")
-	if !strings.Contains(out.String(), "sélectionnée") {
+	if !strings.Contains(out.String(), "Sélection persistante") {
 		t.Fatalf("select output:\n%s", out.String())
 	}
 	if _, ok := hist.Selected(); !ok {
@@ -200,6 +203,91 @@ func TestMintSelectAndUse(t *testing.T) {
 	sh.Execute("crl.show")
 	if !strings.Contains(out.String(), "Bearer supersecret") || !strings.Contains(out.String(), "session=abc") {
 		t.Fatalf("crl.show did not show full headers:\n%s", out.String())
+	}
+}
+
+func TestMintReplayRunsSelectedRequestsInParallel(t *testing.T) {
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skip("curl absent")
+	}
+	var started atomic.Int32
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started.Add(1)
+		if r.Header.Get("Authorization") != "Bearer kept" {
+			t.Errorf("Authorization lost during replay: %#v", r.Header)
+		}
+		time.Sleep(250 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(r.URL.Path))
+	})
+	ln, listenErr := net.Listen("tcp4", "127.0.0.1:0")
+	if listenErr != nil {
+		t.Skipf("loopback unavailable in this sandbox: %v", listenErr)
+	}
+	srv := &httptest.Server{Listener: ln, Config: &http.Server{Handler: handler}}
+	srv.Start()
+	defer srv.Close()
+	sh, out, _, hist, _ := newTestShell(t, "")
+	for i, path := range []string{"/one", "/two"} {
+		hist.AddRequest(mint.BridgeEvent{Type: "request", FlowID: strconv.Itoa(i), Method: "GET", URL: srv.URL + path, Timestamp: time.Now(), Headers: []mint.Header{{Name: "Authorization", Value: "Bearer kept"}}})
+	}
+	sh.Execute("mint.select 1 2")
+	start := time.Now()
+	sh.Execute("mint.replay")
+	elapsed := time.Since(start)
+	if started.Load() != 2 {
+		t.Fatalf("started %d requests", started.Load())
+	}
+	if elapsed >= 450*time.Millisecond {
+		t.Fatalf("batch took %s, expected parallel responses", elapsed)
+	}
+	for _, want := range []string{"#1", "#2", "200", "/one", "/two"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("missing %q in replay result:\n%s", want, out.String())
+		}
+	}
+}
+
+func TestMintReplayReportsTimeoutAndKeepsOtherErrors(t *testing.T) {
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skip("curl absent")
+	}
+	started := make(chan struct{}, 1)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started <- struct{}{}
+		time.Sleep(250 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	})
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("loopback unavailable in this sandbox: %v", err)
+	}
+	srv := &httptest.Server{Listener: ln, Config: &http.Server{Handler: handler}}
+	srv.Start()
+	defer srv.Close()
+	dead, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("loopback unavailable in this sandbox: %v", err)
+	}
+	deadURL := "http://" + dead.Addr().String() + "/refused"
+	_ = dead.Close()
+	sh, out, _, hist, _ := newTestShell(t, "")
+	for i, rawURL := range []string{srv.URL + "/timeout", deadURL} {
+		hist.AddRequest(mint.BridgeEvent{Type: "request", FlowID: strconv.Itoa(i), Method: "GET", URL: rawURL, Timestamp: time.Now()})
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	sh.ctx = ctx
+	sh.Execute("mint.select 1,2")
+	sh.Execute("mint.replay")
+	select {
+	case <-started:
+	default:
+		t.Fatal("delayed request never started")
+	}
+	text := out.String()
+	if !strings.Contains(text, "#1") || !strings.Contains(text, "#2") || !strings.Contains(text, "deadline exceeded") || !strings.Contains(text, "exit status 7") {
+		t.Fatalf("batch errors not attributed individually:\n%s", text)
 	}
 }
 
@@ -560,6 +648,43 @@ func TestLaunchUsesCurl(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Fatalf("launch output missing %q:\n%s", want, text)
 		}
+	}
+}
+
+func TestLaunchUsesExactUTF8BodyLength(t *testing.T) {
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skip("curl absent")
+	}
+	body := "café 🐈\n" + strings.Repeat("界", 8192)
+	received := make(chan struct {
+		body   string
+		length int64
+	}, 1)
+	srv := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		data, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read body: %v", err)
+		}
+		received <- struct {
+			body   string
+			length int64
+		}{string(data), r.ContentLength}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	sh, _, _, _, builder := newTestShell(t, "")
+	if err := builder.SetURL(srv.URL); err != nil {
+		t.Fatal(err)
+	}
+	_ = builder.AddHeader("Content-Length", "1")
+	builder.SetBodyText(body)
+	sh.Execute("crl.launch")
+	got := <-received
+	if got.body != body {
+		t.Fatalf("request body changed: got %d bytes, want %d", len(got.body), len(body))
+	}
+	if got.length != int64(len([]byte(body))) {
+		t.Fatalf("Content-Length = %d, want %d bytes", got.length, len([]byte(body)))
 	}
 }
 

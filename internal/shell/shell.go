@@ -6,14 +6,17 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -25,7 +28,7 @@ import (
 )
 
 const (
-	prompt           = "crl > "
+	prompt           = "CRL-CLI"
 	launchBodyLimit  = 32 << 10
 	maxPendingEvents = 1024
 )
@@ -469,6 +472,8 @@ func (s *Shell) executeMint(cmd, rest string) {
 		s.cmdMintSelect(rest)
 	case "mint.selected":
 		s.cmdMintSelected()
+	case "mint.replay":
+		s.cmdMintReplay(rest)
 	case "mint.filter":
 		s.cmdMintFilter(rest)
 	case "mint.clear":
@@ -561,7 +566,24 @@ func (s *Shell) cmdHeaderClear(rest string) {
 
 func (s *Shell) cmdJSON(rest string) {
 	if rest == "" {
-		s.errorf("usage : crl.json <json>")
+		body := s.builder.Body()
+		if !s.builder.BodySet() {
+			body = []byte("{}\n")
+		}
+		edited, err := editMultiline("crl-json-*.json", body)
+		if err != nil {
+			s.errorf("édition JSON : %v", err)
+			return
+		}
+		if !json.Valid(edited) {
+			s.errorf("JSON invalide ; corps précédent conservé")
+			return
+		}
+		if err := s.builder.SetJSON(string(edited)); err != nil {
+			s.errorf("%v", err)
+			return
+		}
+		s.printf("[CRL] Corps JSON configuré (%d octets).\n", s.builder.BodySize())
 		return
 	}
 	if err := s.builder.SetJSON(rest); err != nil {
@@ -575,12 +597,15 @@ func (s *Shell) cmdBody(rest string) {
 	if rest == "" {
 		body := s.builder.Body()
 		if !s.builder.BodySet() {
-			s.printf("[CRL] Aucun corps configuré.\n")
+			body = nil
+		}
+		edited, err := editMultiline("crl-body-*", body)
+		if err != nil {
+			s.errorf("édition du corps : %v", err)
 			return
 		}
-		s.printf("[CRL] Corps (%d octets) :\n", len(body))
-		rendered, _ := display.RenderBody(body, 4096)
-		s.printIndented(rendered, "  ")
+		s.builder.SetBody(edited)
+		s.printf("[CRL] Corps brut configuré (%d octets).\n", len(edited))
 		return
 	}
 	if strings.EqualFold(rest, "clear") {
@@ -1317,29 +1342,181 @@ func (s *Shell) cmdMintShow(rest string) {
 
 func (s *Shell) cmdMintSelect(rest string) {
 	if rest == "" {
-		s.errorf("usage : mint.select <id>")
+		s.errorf("usage : mint.select <id...>|clear")
 		return
 	}
-	id, err := parseID(rest)
+	if strings.EqualFold(strings.TrimSpace(rest), "clear") {
+		s.history.ClearSelection()
+		s.printf("[Mint] Sélection effacée.\n")
+		return
+	}
+	var ids []int
+	for _, item := range strings.Fields(strings.ReplaceAll(rest, ",", " ")) {
+		id, err := parseID(item)
+		if err != nil {
+			s.errorf("%v", err)
+			return
+		}
+		ids = append(ids, id)
+	}
+	captures, err := s.history.SelectMany(ids)
 	if err != nil {
 		s.errorf("%v", err)
 		return
 	}
-	c, ok := s.history.Select(id)
-	if !ok {
-		s.errorf("capture #%d introuvable", id)
+	s.printSelected(captures)
+}
+
+func (s *Shell) printSelected(captures []mint.Capture) {
+	p := s.pal
+	s.printf("[Mint] Sélection persistante (%d) — aucune requête envoyée :\n", len(captures))
+	for _, c := range captures {
+		s.printf("  #%d %s %s%s\n", c.ID, p.Method(c.Request.Method), c.Request.Host, p.Cyan(display.MaskURL(c.PathAndQuery())))
+	}
+}
+
+// cmdMintReplay starts each selected captured request concurrently, preserving
+// its own builder state and source ID. Results are printed after the whole batch.
+func (s *Shell) cmdMintReplay(rest string) {
+	if strings.TrimSpace(rest) != "" {
+		s.errorf("usage : mint.replay")
 		return
 	}
-	p := s.pal
-	s.printf("%s %s %s %s%s\n", p.BoldMagenta("[Mint]"), p.BoldCyan(fmt.Sprintf("Capture #%d sélectionnée :", c.ID)), p.Method(c.Request.Method), c.Request.Host, p.Cyan(display.MaskURL(c.PathAndQuery())))
-	s.printf("%s %s\n", p.BoldMagenta("[Mint]"), fmt.Sprintf("Aucune requête envoyée. mint.use %d pour l'importer dans CRL-CLI.", c.ID))
+	captures := s.history.SelectedMany()
+	if len(captures) == 0 {
+		s.errorf("aucune capture sélectionnée : utilisez mint.select <id> [id...]")
+		return
+	}
+	type result struct {
+		id                            int
+		method, url, status, duration string
+		details                       string
+		err                           error
+	}
+	ctx := s.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	results := make([]result, len(captures))
+	sem := make(chan struct{}, 4)
+	var wg sync.WaitGroup
+	for i, capture := range captures {
+		wg.Add(1)
+		go func(i int, c mint.Capture) {
+			defer wg.Done()
+			r := result{id: c.ID, method: c.Request.Method, url: c.Request.URL}
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			err, status, dur, details := s.replayCapture(ctx, c)
+			if err != nil {
+				r.err = err
+			} else {
+				r.status = status
+			}
+			r.duration = dur
+			r.details = details
+			results[i] = r
+		}(i, capture)
+	}
+	wg.Wait()
+	s.printf("[Mint] Résultats du rejeu parallèle (%d requêtes)\n", len(results))
+	s.printf("  ID  MÉTHODE  STATUT  DURÉE  URL / ERREUR\n")
+	for _, r := range results {
+		status := r.status
+		detail := r.url
+		if r.err != nil {
+			status = "ERREUR"
+			detail = r.err.Error()
+		}
+		s.printf("  #%d  %-7s  %-7s  %-8s %s\n", r.id, r.method, status, r.duration, sanitizeTerminal(detail))
+	}
+	for _, r := range results {
+		s.printf("\n[Mint] Réponse du rejeu #%d — %s %s\n", r.id, r.method, sanitizeTerminal(r.url))
+		if r.err != nil {
+			s.printf("  Erreur : %s\n", sanitizeTerminal(r.err.Error()))
+			continue
+		}
+		s.printf("  Statut : %s · durée : %s\n%s", r.status, r.duration, r.details)
+	}
+}
+
+func (s *Shell) replayCapture(ctx context.Context, c mint.Capture) (error, string, string, string) {
+	if ok, why := c.Importable(); !ok {
+		return fmt.Errorf("%s", why), "", "-", ""
+	}
+	b := request.New()
+	headers := make([]request.Header, 0, len(c.Request.Headers))
+	for _, h := range c.Request.Headers {
+		headers = append(headers, request.Header{Name: h.Name, Value: h.Value})
+	}
+	if err := b.Import(request.CapturedRequest{URL: c.Request.URL, Method: c.Request.Method, Headers: headers, Body: c.Request.Body, BodyPresent: len(c.Request.Body) > 0}); err != nil {
+		return err, "", "-", ""
+	}
+	// Replayed captures must not be recorded a second time by this tool's Mint
+	// proxy. Captured requests have no portable proxy setting, so replay direct.
+	if err := b.SetProxy("none"); err != nil {
+		return err, "", "-", ""
+	}
+	res := b.ResolveProxy("", false)
+	args, err := b.CurlArgs(res)
+	if err != nil {
+		return err, "", "-", ""
+	}
+	dir, err := os.MkdirTemp("", "crl-replay-*")
+	if err != nil {
+		return err, "", "-", ""
+	}
+	defer os.RemoveAll(dir)
+	headersPath, bodyPath := filepath.Join(dir, "headers"), filepath.Join(dir, "body")
+	cmd := exec.CommandContext(ctx, "curl", append(args, "--dump-header", headersPath, "--output", bodyPath, "-w", "%{http_code} %{time_total}")...)
+	if b.BodySet() {
+		cmd.Stdin = b.BodyReader()
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err(), "", "-", ""
+		}
+		return err, "", "-", ""
+	}
+	parts := strings.Fields(string(out))
+	if len(parts) < 2 {
+		return fmt.Errorf("réponse curl illisible"), "", "-", ""
+	}
+	d, _ := strconv.ParseFloat(parts[1], 64)
+	duration := (time.Duration(d * float64(time.Second))).String()
+	headerData, _ := os.ReadFile(headersPath)
+	_, parsedHeaders := response.ParseHeaderDump(headerData)
+	var bodySize int64
+	if info, statErr := os.Stat(bodyPath); statErr == nil {
+		bodySize = info.Size()
+	}
+	body := readFilePrefix(bodyPath, 32<<10)
+	view := response.RenderBody(body, bodySize, 32<<10, response.ModeAuto, parsedHeaders.ContentType())
+	var details strings.Builder
+	details.WriteString("  En-têtes de réponse:\n")
+	for _, h := range parsedHeaders {
+		details.WriteString("    " + s.headerLine(h.Name, h.Value) + "\n")
+	}
+	details.WriteString("  Corps:\n")
+	for _, line := range strings.Split(view.Text, "\n") {
+		details.WriteString("    " + line + "\n")
+	}
+	if view.Truncated {
+		details.WriteString("    […] corps tronqué à l'affichage\n")
+	}
+	return nil, parts[0], duration, details.String()
 }
 
 func (s *Shell) cmdMintSelected() {
+	if many := s.history.SelectedMany(); len(many) > 1 {
+		s.printSelected(many)
+		return
+	}
 	c, ok := s.history.Selected()
 	if !ok {
 		s.printf("[Mint] Aucune capture sélectionnée.\n")
-		s.printf("[Mint] Utilisez mint.requests puis mint.select <id>.\n")
+		s.printf("[Mint] Utilisez mint.requests puis mint.select <id...>.\n")
 		return
 	}
 	p := s.pal
@@ -1419,6 +1596,11 @@ func (s *Shell) cmdMintUse(rest string) {
 	var c mint.Capture
 	var ok bool
 	if id == 0 {
+		selected := s.history.SelectedMany()
+		if len(selected) > 1 {
+			s.errorf("plusieurs captures sélectionnées ; précisez mint.use <id> ou sélectionnez une seule capture")
+			return
+		}
 		c, ok = s.history.Selected()
 		if !ok {
 			s.errorf("aucune capture sélectionnée. usage : mint.use <id> ou mint.select <id> puis mint.use")
@@ -1532,13 +1714,52 @@ func processStateText(p palette, state mint.State) string {
 }
 
 func (s *Shell) promptText() string {
-	if !s.pal.Enabled {
-		return prompt
+	status := s.manager.Status()
+	state, glyph := "OFF", "○"
+	if status.State == mint.StateRunning {
+		state, glyph = "ON", "●"
 	}
-	if s.lastFailed {
-		return s.pal.BoldRed(prompt)
+	method := s.builder.Method()
+	host := ""
+	if raw := s.builder.URL(); raw != "" {
+		if u, err := url.Parse(raw); err == nil {
+			host = u.Host
+		}
 	}
-	return s.pal.BoldCyan(prompt)
+	if host != "" {
+		host = " · " + host
+	}
+	if len([]rune(method+host)) > 38 {
+		host = ""
+	}
+	line1, line2 := "+- CRL-CLI "+method+" - Mint "+state+host, "`-> "
+	if unicodeTerminal() {
+		line1, line2 = "╭─ CRL-CLI "+method+" ─ Mint "+glyph+" "+state+host, "╰─❯ "
+		line1 = s.pal.BoldBlue("╭─ CRL-CLI") + " " + s.pal.BoldCyan(method) + s.pal.Dim(" ─ Mint ") + s.pal.BoldGreen(glyph+" "+state) + s.pal.Cyan(host)
+		if status.State != mint.StateRunning {
+			line1 = s.pal.BoldBlue("╭─ CRL-CLI") + " " + s.pal.BoldCyan(method) + s.pal.Dim(" ─ Mint ") + s.pal.Dim("○ OFF") + s.pal.Cyan(host)
+		}
+	}
+	if s.pal.Enabled {
+		if s.lastFailed {
+			line2 = s.pal.BoldRed("╰─❯ ")
+		} else {
+			line2 = s.pal.BoldMagenta("╰─❯ ")
+		}
+	}
+	return line1 + "\r\n" + line2
+}
+
+func unicodeTerminal() bool {
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("TERM")), "dumb") {
+		return false
+	}
+	for _, key := range []string{"LC_ALL", "LC_CTYPE", "LANG"} {
+		if strings.Contains(strings.ToUpper(os.Getenv(key)), "UTF-8") {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Shell) field(label, value string) {
@@ -1557,7 +1778,47 @@ func (s *Shell) headerValue(name, value string) string {
 }
 
 func (s *Shell) headerLine(name, value string) string {
-	return s.pal.BoldCyan(sanitizeTerminal(name)) + s.pal.Dim(": ") + s.headerValue(name, value)
+	prefix := s.pal.BoldCyan(sanitizeTerminal(name)) + s.pal.Dim(": ")
+	clean := s.headerValue(name, value)
+	width := 80
+	if columns, err := strconv.Atoi(os.Getenv("COLUMNS")); err == nil && columns > 0 {
+		width = columns
+	}
+	if f, ok := s.out.w.(*os.File); ok {
+		width = terminalWidth(f.Fd())
+	}
+	available := width - utf8.RuneCountInString(name) - 4
+	if available < 16 {
+		available = 16
+	}
+	var b strings.Builder
+	for i, line := range strings.Split(clean, "\n") {
+		if i > 0 {
+			b.WriteString("\n    ")
+		}
+		if utf8.RuneCountInString(line) <= available {
+			b.WriteString(line)
+			continue
+		}
+		for len(line) > 0 {
+			n := available
+			if n > len(line) {
+				n = len(line)
+			}
+			for n > 0 && n < len(line) && !utf8.RuneStart(line[n]) {
+				n--
+			}
+			if n == 0 {
+				n = available
+			}
+			b.WriteString(line[:n])
+			line = line[n:]
+			if len(line) > 0 {
+				b.WriteString("\n    ")
+			}
+		}
+	}
+	return prefix + b.String()
 }
 
 func proxyResolutionText(res request.ProxyResolution) string {
@@ -1625,8 +1886,8 @@ func (s *Shell) printHelp() {
   crl.head                    Lister les en-têtes et leurs valeurs
   crl.head clear [Nom]        Supprimer un en-tête ou tous les en-têtes
   crl.head.clear [Nom]        Alias de suppression (aussi crl.header.clear)
-  crl.json <json>|clear       Définir du JSON valide ou effacer le corps
-  crl.body [texte|clear]      Définir, afficher ou effacer le corps brut
+	  crl.json [json]|clear       Éditer (sans argument), définir ou effacer le JSON
+	  crl.body [texte|clear]      Éditer le corps brut sans argument
   crl.body.clear              Alias pour effacer le corps
   crl.proxy <url|none|auto>   Définir le proxy (off=none ; clear/unset=auto)
   crl.proxy                   Afficher le proxy explicite et effectif
@@ -1650,7 +1911,8 @@ Commandes Mint (aide détaillée : mint.help)
   mint.watch [on|off]           Activer/suspendre les notifications, ou afficher l'état
   mint.events                  Afficher et vider les notifications mises en attente
   mint.request.show <id>       Détail complet (alias : mint.show)
-  mint.select <id>             Sélectionner une capture pour l'import
+	  mint.select <id...>|clear    Sélectionner une ou plusieurs captures
+	  mint.replay                  Rejouer en parallèle la sélection
   mint.selected                Afficher la capture sélectionnée
   mint.filter <texte|clear>    Filtrer par hôte, URL, chemin ou query string
   mint.clear [--yes|-y]        Vider l'historique (confirmation sauf avec --yes)
@@ -1675,7 +1937,8 @@ func (s *Shell) printMintHelp() {
   mint.watch [on|off]           Activer, suspendre ou afficher l'état des notifications
   mint.events                  Afficher les notifications accumulées pendant watch off
   mint.request.show <id>       Afficher le détail complet d'une capture (alias mint.show)
-  mint.select <id>             Sélectionner une capture pour mint.use
+	  mint.select <id...>|clear    Sélectionner une ou plusieurs captures
+	  mint.replay                  Rejouer en parallèle (lot limité à 4)
   mint.selected                Afficher l'identifiant sélectionné
   mint.filter <texte>          Filtrer par hôte, URL, chemin ou query string
   mint.filter clear            Retirer le filtre ; l'historique reste intact
@@ -1687,7 +1950,7 @@ DÉTAILS
   d'être enregistrées et restent consultables avec mint.requests/history.
   mint.events vide cette file après affichage. Elle conserve au plus 1024
   événements ; si elle déborde, les plus anciens sont abandonnés.
-  mint.use sans ID utilise mint.select ; --force remplace le constructeur
+	  mint.use sans ID requiert une sélection unique ; --force remplace le constructeur
   sans demander confirmation. Un corps de requête tronqué ne peut pas être importé.
   Les commandes de détail affichent URL et valeurs d'en-têtes complètes.
   Tapez help pour les commandes de construction et de rejeu CRL.

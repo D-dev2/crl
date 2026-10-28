@@ -8,6 +8,14 @@ import (
 	"unsafe"
 )
 
+func terminalWidth(fd uintptr) int {
+	var ws struct{ Row, Col, Xpixel, Ypixel uint16 }
+	if _, _, errno := syscall.Syscall6(syscall.SYS_IOCTL, fd, uintptr(syscall.TIOCGWINSZ), uintptr(unsafe.Pointer(&ws)), 0, 0, 0); errno == 0 && ws.Col > 0 {
+		return int(ws.Col)
+	}
+	return 80
+}
+
 func makeRaw(fd uintptr) (func(), error) {
 	var old syscall.Termios
 	if _, _, errno := syscall.Syscall6(syscall.SYS_IOCTL, fd, uintptr(syscall.TCGETS), uintptr(unsafe.Pointer(&old)), 0, 0, 0); errno != 0 {

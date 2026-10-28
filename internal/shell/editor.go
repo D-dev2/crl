@@ -3,9 +3,55 @@ package shell
 import (
 	"fmt"
 	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"unicode/utf8"
 )
+
+// editMultiline opens VISUAL/EDITOR with an existing UTF-8 body and returns
+// the exact bytes saved. The editor is executed directly, without a shell.
+func editMultiline(pattern string, initial []byte) ([]byte, error) {
+	name, err := os.CreateTemp("", pattern)
+	if err != nil {
+		return nil, err
+	}
+	path := name.Name()
+	defer os.Remove(path)
+	if _, err = name.Write(initial); err != nil {
+		name.Close()
+		return nil, err
+	}
+	if err = name.Close(); err != nil {
+		return nil, err
+	}
+	choice := strings.TrimSpace(os.Getenv("VISUAL"))
+	if choice == "" {
+		choice = strings.TrimSpace(os.Getenv("EDITOR"))
+	}
+	if choice == "" {
+		choice = "vi"
+	}
+	parts := strings.Fields(choice)
+	if len(parts) == 0 {
+		return nil, fmt.Errorf("éditeur vide")
+	}
+	if !filepath.IsAbs(parts[0]) {
+		if _, err := exec.LookPath(parts[0]); err != nil {
+			return nil, err
+		}
+	}
+	args := append(parts[1:], path)
+	cmd := exec.Command(parts[0], args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return nil, err
+	}
+	return os.ReadFile(path)
+}
 
 // editorResult est le résultat du traitement d'un lot d'octets saisis.
 type editorResult struct {
