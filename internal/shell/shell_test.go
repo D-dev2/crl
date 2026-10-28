@@ -729,7 +729,7 @@ func TestMintAuthHeadersSurviveSelectionImportAndReplay(t *testing.T) {
 	})
 
 	sh.Execute("mint.select 1")
-	if !strings.Contains(out.String(), "sélectionnée") {
+	if !strings.Contains(out.String(), "Sélection persistante") && !strings.Contains(out.String(), "sélectionnée") {
 		t.Fatalf("sélection absente :\n%s", out.String())
 	}
 	out.Reset()

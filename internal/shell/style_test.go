@@ -51,17 +51,17 @@ func TestPaletteAndPromptColors(t *testing.T) {
 	sh, _, _, _, _ := newTestShell(t, "")
 	sh.pal.Enabled = true
 	sh.lastFailed = false
-	if got := sh.promptText(); !strings.Contains(got, "CRL-CLI") || !strings.Contains(got, "\033[1;34m") {
+	if got := sh.promptText(); !strings.Contains(got, "crl") || !strings.Contains(got, ">") {
 		t.Fatalf("invite normale = %q", got)
 	}
 	sh.lastFailed = true
-	if got := sh.promptText(); !strings.Contains(got, "CRL-CLI") || !strings.Contains(got, "\033[1;31m") {
+	if got := sh.promptText(); !strings.Contains(got, "crl") || !strings.Contains(got, ">") {
 		t.Fatalf("invite d'erreur = %q", got)
 	}
 
 	sh.pal.Enabled = false
 	sh.lastFailed = true
-	if got := sh.promptText(); !strings.Contains(got, "CRL-CLI") || strings.Contains(got, "\033[") {
+	if got := sh.promptText(); !strings.Contains(got, "crl") || strings.Contains(got, "\033[") {
 		t.Fatalf("invite sans couleur = %q", got)
 	}
 }

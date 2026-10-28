@@ -10,8 +10,8 @@ constructeur `crl.*` sans l'envoyer.
 - Rejeu fidèle via `curl`, sans passer les données par un shell.
 - Réponses HTTP présentées avec statut, durée, en-têtes et corps lisible.
 - Modes d'affichage `auto`, `raw` et `pretty`, sans modifier les octets reçus.
-- Prompt compact CRL-CLI avec état Mint et méthode/host de la requête.
-- Édition multilignes de JSON et de corps brut via `$VISUAL` ou `$EDITOR`.
+- Prompt compact sur une ligne : `crl [GET] [Mint: ON] [Sel: N] >`, avec bilan du dernier rejeu multiple.
+- Édition JSON multiligne intégrée au shell (`:end` pour valider, `:cancel` pour annuler), sans `$EDITOR`/`$VISUAL`. Modification ciblée avec `crl.json set <chemin> = <valeur JSON>` ou suppression avec `crl.json delete <chemin>`.
 - Sélection de plusieurs captures Mint et rejeu concurrent avec `mint.replay`.
 - Proxy Mint démarré et arrêté par CRL-CLI, avec confirmation de disponibilité.
 - Capture en temps réel, historique, filtre, sélection et import.
@@ -198,10 +198,12 @@ crl.table
 crl.launch
 ```
 
-Sans argument, `crl.json` ouvre le JSON actuel dans `$VISUAL`, puis `$EDITOR`
-(repli sur `vi`) et valide le document avant de remplacer le corps. `crl.body`
-ouvre de la même manière le corps brut sans validation JSON. `crl.json clear`
-et `crl.body.clear` effacent le corps sans toucher aux autres en-têtes.
+Sans argument, `crl.json` entre en mode saisie JSON multiligne intégrée au shell
+(affiche le corps actuel en référence, saisie avec `:end` pour valider ou `:cancel` pour annuler).
+`crl.body` sans argument propose une saisie multiligne intégrée similaire sans validation JSON.
+`crl.json set <chemin> = <valeur JSON>` et `crl.json set user.role = "admin"` modifient un champ
+précis en préservant les autres propriétés. `crl.json delete <chemin>` supprime une propriété.
+`crl.json clear` et `crl.body.clear` effacent le corps sans toucher aux autres en-têtes.
 
 Pour rejouer simultanément plusieurs captures :
 
@@ -271,9 +273,12 @@ utilise automatiquement le proxy Mint. L'historique reste disponible après
 | `crl.head clear [Nom]` | supprime un en-tête nommé, ou tous sans argument |
 | `crl.head.clear [Nom]` | variante explicite de la commande précédente |
 | `crl.json <json>` | définit un corps JSON valide et `Content-Type: application/json` |
+| `crl.json` | saisie multiligne intégrée (`:end` pour valider, `:cancel` pour annuler) |
+| `crl.json set <chemin> = <valeur JSON>` | modifie un champ précis (objets imbriqués pris en charge) |
+| `crl.json delete <chemin>` | supprime une propriété précise |
 | `crl.json clear` | efface le corps sans modifier méthode ni en-têtes |
 | `crl.body <texte>` | définit un corps brut, sans modifier le `Content-Type` |
-| `crl.body` | affiche le corps courant |
+| `crl.body` | saisie multiligne intégrée sans validation JSON (`:end`/`:cancel`) |
 | `crl.body.clear` | supprime le corps |
 | `crl.proxy <url\|none\|auto>` | proxy explicite ; `none` désactive tout proxy ; `auto`, `clear` ou `unset` réactive le proxy Mint automatique |
 | `crl.proxy` | affiche le proxy explicite et le proxy effectif |
@@ -805,3 +810,19 @@ avant affichage.
 ## Licence
 
 MIT. Voir [LICENSE](LICENSE).
+
+## Mise à jour (session de stabilisation)
+
+- Prompt mono-ligne `crl [GET] [Mint: ON] [Sel: N] >` avec couleurs sobres, mise à jour dynamique et respect de `NO_COLOR`/terminal non-TTY.
+- Notifications Mint : pas d'écriture concurrente depuis le pont/goroutines pendant la saisie ; un seul lecteur `stdin`.
+- Sélection Mint distincte du constructeur préparé ; `crl.show`/`crl.table` cohérents ; `crl.launch` exécute selon la sélection (préparée, unique ou lot parallèle).
+- Édition JSON multiligne intégrée sans `$EDITOR`/`$VISUAL` (`:end`, `:cancel`), préservation du corps en cas d'erreur/annulation. Ajout de `crl.json set`/`delete` pour modifier/supprimer un champ précis en préservant le reste.
+- `crl.body` multiligne intégrée. Corps envoyé fidèlement (gestion Content-Length/`--data-binary` via stdin), pas de réutilisation aveugle après modification.
+- Rejeu parallèle conservant la source, bilan `[Envoyées: ...]`, historique associé.
+
+### Tests réellement exécutés
+- `gofmt -w .`
+- `go test ./...`
+- `go vet ./...`
+- `go test -race ./...`
+- `go build ./cmd/crl`

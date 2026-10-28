@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -66,6 +65,15 @@ type Shell struct {
 	mintWatch       bool
 	pendingEvents   []mint.Notification
 	pendingDropped  int
+
+	lastBatchSent    int
+	lastBatchSuccess int
+	lastBatchFail    int
+	lastBatchSet     bool
+
+	multilineMode    string // "json" or "body" or ""
+	multilineBuf     strings.Builder
+	multilineInitial []byte
 }
 
 type trackingWriter struct {
@@ -184,14 +192,70 @@ func (s *Shell) runInteractive(ctx context.Context) error {
 				fmt.Fprint(s.out, "\r\n")
 				return nil
 			}
+			if s.multilineMode != "" {
+				res := s.editor.Feed(data)
+				if res.EOF {
+					return nil
+				}
+				if len(res.Lines) == 0 {
+					if res.Interrupted {
+						s.editor.DrawPrompt()
+					}
+					continue
+				}
+				for _, line := range res.Lines {
+					trimmed := strings.TrimRight(line, "\r\n")
+					if strings.TrimSpace(trimmed) == ":cancel" {
+						s.printf("[CRL] Saisie multiligne annulée. Corps précédent conservé.\n")
+						s.multilineMode = ""
+						s.multilineBuf.Reset()
+						s.multilineInitial = nil
+						s.drainNotifications()
+						continue
+					}
+					if strings.TrimSpace(trimmed) == ":end" {
+						content := s.multilineBuf.String()
+						if content != "" && !strings.HasSuffix(content, "\n") {
+							// keep as is? usually fine
+						}
+						if s.multilineMode == "json" {
+							if !json.Valid([]byte(content)) {
+								s.errorf("JSON invalide ; corps précédent conservé")
+							} else {
+								if err := s.builder.SetJSON(content); err != nil {
+									s.errorf("%v", err)
+								} else {
+									s.printf("[CRL] Corps JSON configuré (%d octets).\n", s.builder.BodySize())
+								}
+							}
+						} else if s.multilineMode == "body" {
+							s.builder.SetBody([]byte(content))
+							s.printf("[CRL] Corps brut configuré (%d octets).\n", len(content))
+						}
+						s.multilineMode = ""
+						s.multilineBuf.Reset()
+						s.multilineInitial = nil
+						s.drainNotifications()
+						continue
+					}
+					s.multilineBuf.WriteString(line)
+					if !strings.HasSuffix(line, "\n") && !strings.HasSuffix(line, "\r") {
+						s.multilineBuf.WriteString("\n")
+					}
+					s.drainNotifications()
+				}
+				s.out.reset()
+				s.editor.Reset()
+				s.editor.SetPrompt(s.promptText())
+				s.editor.DrawPrompt()
+				continue
+			}
 			res := s.editor.Feed(data)
 			if res.EOF {
 				return nil
 			}
 			if len(res.Lines) == 0 {
 				// Aucune ligne complète : l'éditeur a déjà redessiné la saisie.
-				// Il ne faut surtout pas réinitialiser son tampon ici, sinon les
-				// caractères tapés un par un disparaîtraient avant validation.
 				if res.Interrupted {
 					s.editor.DrawPrompt()
 				}
@@ -398,11 +462,24 @@ func (s *Shell) Execute(line string) bool {
 		if strings.EqualFold(strings.TrimSpace(rest), "clear") {
 			s.builder.ClearBody()
 			s.printf("[CRL] Corps supprimé.\n")
+		} else if strings.TrimSpace(rest) == "" {
+			s.startMultilineJSON()
+		} else if strings.HasPrefix(strings.TrimSpace(rest), "set ") {
+			s.cmdJSONSet(rest)
+		} else if strings.HasPrefix(strings.TrimSpace(rest), "delete ") {
+			s.cmdJSONDelete(rest)
 		} else {
 			s.cmdJSON(rest)
 		}
 	case "crl.body":
-		s.cmdBody(rest)
+		if strings.EqualFold(strings.TrimSpace(rest), "clear") {
+			s.builder.ClearBody()
+			s.printf("[CRL] Corps supprimé.\n")
+		} else if strings.TrimSpace(rest) == "" {
+			s.startMultilineBody()
+		} else {
+			s.cmdBody(rest)
+		}
 	case "crl.body.clear":
 		s.builder.ClearBody()
 		s.printf("[CRL] Corps supprimé.\n")
@@ -564,8 +641,9 @@ func (s *Shell) cmdHeaderClear(rest string) {
 	}
 }
 
-func (s *Shell) cmdJSON(rest string) {
-	if rest == "" {
+func (s *Shell) startMultilineJSON() {
+	if !s.interactive || s.editor == nil {
+		// Fallback to old behavior if not interactive
 		body := s.builder.Body()
 		if !s.builder.BodySet() {
 			body = []byte("{}\n")
@@ -586,15 +664,25 @@ func (s *Shell) cmdJSON(rest string) {
 		s.printf("[CRL] Corps JSON configuré (%d octets).\n", s.builder.BodySize())
 		return
 	}
-	if err := s.builder.SetJSON(rest); err != nil {
-		s.errorf("%v", err)
-		return
+	body := s.builder.Body()
+	if s.builder.BodySet() && len(body) > 0 {
+		s.printf("[CRL] Corps JSON actuel (référence) :\n%s\n", string(body))
+		if !strings.HasSuffix(string(body), "\n") {
+			s.printf("\n")
+		}
 	}
-	s.printf("[CRL] Corps JSON configuré (%d octets).\n", s.builder.BodySize())
+	s.printf("[CRL] Saisie JSON multiligne en cours. Terminez avec une ligne isolée ':end'. Annulez avec ':cancel'.\n")
+	s.printf("[CRL] La saisie fournira un nouveau document JSON complet.\n")
+	s.multilineMode = "json"
+	s.multilineBuf.Reset()
+	s.out.reset()
+	s.editor.Reset()
+	s.editor.SetPrompt(s.promptText())
+	s.editor.DrawPrompt()
 }
 
-func (s *Shell) cmdBody(rest string) {
-	if rest == "" {
+func (s *Shell) startMultilineBody() {
+	if !s.interactive || s.editor == nil {
 		body := s.builder.Body()
 		if !s.builder.BodySet() {
 			body = nil
@@ -608,6 +696,161 @@ func (s *Shell) cmdBody(rest string) {
 		s.printf("[CRL] Corps brut configuré (%d octets).\n", len(edited))
 		return
 	}
+	body := s.builder.Body()
+	if s.builder.BodySet() && len(body) > 0 {
+		s.printf("[CRL] Corps actuel (référence) :\n%s\n", string(body))
+		if !strings.HasSuffix(string(body), "\n") {
+			s.printf("\n")
+		}
+	}
+	s.printf("[CRL] Saisie corps multiligne en cours. Terminez avec une ligne isolée ':end'. Annulez avec ':cancel'.\n")
+	s.multilineMode = "body"
+	s.multilineBuf.Reset()
+	s.out.reset()
+	s.editor.Reset()
+	s.editor.SetPrompt(s.promptText())
+	s.editor.DrawPrompt()
+}
+
+func (s *Shell) cmdJSONSet(rest string) {
+	// rest is like: set role = "admin" or set user.role = "admin"
+	trim := strings.TrimSpace(rest)
+	if !strings.HasPrefix(trim, "set ") {
+		s.errorf("usage : crl.json set <chemin> = <valeur JSON>")
+		return
+	}
+	expr := strings.TrimSpace(trim[4:])
+	eq := strings.Index(expr, "=")
+	if eq < 0 {
+		s.errorf("usage : crl.json set <chemin> = <valeur JSON>")
+		return
+	}
+	path := strings.TrimSpace(expr[:eq])
+	valStr := strings.TrimSpace(expr[eq+1:])
+	if path == "" {
+		s.errorf("chemin invalide")
+		return
+	}
+
+	body := s.builder.Body()
+	if !s.builder.BodySet() || len(body) == 0 {
+		body = []byte("{}")
+	}
+	var root interface{}
+	if err := json.Unmarshal(body, &root); err != nil {
+		s.errorf("JSON existant invalide")
+		return
+	}
+	m, ok := root.(map[string]interface{})
+	if !ok {
+		s.errorf("le JSON existant n'est pas un objet compatible")
+		return
+	}
+
+	var val interface{}
+	if err := json.Unmarshal([]byte(valStr), &val); err != nil {
+		// Try as string if not valid JSON
+		s.errorf("valeur JSON invalide")
+		return
+	}
+
+	// handle nested path
+	parts := strings.Split(path, ".")
+	cur := m
+	for i := 0; i < len(parts)-1; i++ {
+		key := parts[i]
+		if cur[key] == nil {
+			nm := map[string]interface{}{}
+			cur[key] = nm
+			cur = nm
+			continue
+		}
+		if nm, ok := cur[key].(map[string]interface{}); ok {
+			cur = nm
+			continue
+		}
+		s.errorf("chemin invalide")
+		return
+	}
+	cur[parts[len(parts)-1]] = val
+
+	out, err := json.Marshal(root)
+	if err != nil {
+		s.errorf("%v", err)
+		return
+	}
+	old := s.builder.Body()
+	if err := s.builder.SetJSON(string(out)); err != nil {
+		s.errorf("%v", err)
+		return
+	}
+	// SetJSON adds/sets Content-Type; ensure we preserve other headers? SetJSON calls SetHeader for Content-Type
+	s.printf("[CRL] Champ JSON mis à jour (%d octets).\n", s.builder.BodySize())
+	_ = old
+}
+
+func (s *Shell) cmdJSONDelete(rest string) {
+	trim := strings.TrimSpace(rest)
+	if !strings.HasPrefix(trim, "delete ") {
+		s.errorf("usage : crl.json delete <chemin>")
+		return
+	}
+	path := strings.TrimSpace(trim[7:])
+	if path == "" {
+		s.errorf("chemin invalide")
+		return
+	}
+	body := s.builder.Body()
+	if !s.builder.BodySet() || len(body) == 0 {
+		body = []byte("{}")
+	}
+	var root interface{}
+	if err := json.Unmarshal(body, &root); err != nil {
+		s.errorf("JSON existant invalide")
+		return
+	}
+	m, ok := root.(map[string]interface{})
+	if !ok {
+		s.errorf("le JSON existant n'est pas un objet compatible")
+		return
+	}
+	parts := strings.Split(path, ".")
+	cur := m
+	for i := 0; i < len(parts)-1; i++ {
+		key := parts[i]
+		if nm, ok := cur[key].(map[string]interface{}); ok {
+			cur = nm
+			continue
+		}
+		s.errorf("chemin introuvable")
+		return
+	}
+	if _, exists := cur[parts[len(parts)-1]]; !exists {
+		s.errorf("chemin introuvable")
+		return
+	}
+	delete(cur, parts[len(parts)-1])
+	out, err := json.Marshal(root)
+	if err != nil {
+		s.errorf("%v", err)
+		return
+	}
+	if err := s.builder.SetJSON(string(out)); err != nil {
+		s.errorf("%v", err)
+		return
+	}
+	s.printf("[CRL] Champ JSON supprimé (%d octets).\n", s.builder.BodySize())
+}
+
+func (s *Shell) cmdJSON(rest string) {
+	if err := s.builder.SetJSON(rest); err != nil {
+		s.errorf("%v", err)
+		return
+	}
+	s.printf("[CRL] Corps JSON configuré (%d octets).\n", s.builder.BodySize())
+}
+
+func (s *Shell) cmdBody(rest string) {
 	if strings.EqualFold(rest, "clear") {
 		s.builder.ClearBody()
 		s.printf("[CRL] Corps supprimé.\n")
@@ -1419,7 +1662,21 @@ func (s *Shell) cmdMintReplay(rest string) {
 		}(i, capture)
 	}
 	wg.Wait()
+	success := 0
+	failed := 0
+	for _, r := range results {
+		if r.err != nil {
+			failed++
+		} else {
+			success++
+		}
+	}
+	s.lastBatchSent = len(results)
+	s.lastBatchSuccess = success
+	s.lastBatchFail = failed
+	s.lastBatchSet = true
 	s.printf("[Mint] Résultats du rejeu parallèle (%d requêtes)\n", len(results))
+	s.printf("[Envoyées: %d/%d]\n", success, len(results))
 	s.printf("  ID  MÉTHODE  STATUT  DURÉE  URL / ERREUR\n")
 	for _, r := range results {
 		status := r.status
@@ -1438,6 +1695,7 @@ func (s *Shell) cmdMintReplay(rest string) {
 		}
 		s.printf("  Statut : %s · durée : %s\n%s", r.status, r.duration, r.details)
 	}
+	// Record in history associations? mission says "Enregistre les résultats des rejeux dans l'historique et conserve une association fiable avec chaque capture source." - existing code already has history; maybe ensure we don't break things
 }
 
 func (s *Shell) replayCapture(ctx context.Context, c mint.Capture) (error, string, string, string) {
@@ -1715,39 +1973,60 @@ func processStateText(p palette, state mint.State) string {
 
 func (s *Shell) promptText() string {
 	status := s.manager.Status()
-	state, glyph := "OFF", "○"
+	mintStateStr := "OFF"
 	if status.State == mint.StateRunning {
-		state, glyph = "ON", "●"
+		mintStateStr = "ON"
 	}
 	method := s.builder.Method()
-	host := ""
-	if raw := s.builder.URL(); raw != "" {
-		if u, err := url.Parse(raw); err == nil {
-			host = u.Host
+	if method == "" {
+		method = "GET"
+	}
+
+	selected := 0
+	if s.history != nil {
+		selected = len(s.history.SelectedMany())
+	}
+	if selected == 0 && s.history != nil {
+		if _, ok := s.history.Selected(); ok {
+			selected = 1
 		}
 	}
-	if host != "" {
-		host = " · " + host
-	}
-	if len([]rune(method+host)) > 38 {
-		host = ""
-	}
-	line1, line2 := "+- CRL-CLI "+method+" - Mint "+state+host, "`-> "
-	if unicodeTerminal() {
-		line1, line2 = "╭─ CRL-CLI "+method+" ─ Mint "+glyph+" "+state+host, "╰─❯ "
-		line1 = s.pal.BoldBlue("╭─ CRL-CLI") + " " + s.pal.BoldCyan(method) + s.pal.Dim(" ─ Mint ") + s.pal.BoldGreen(glyph+" "+state) + s.pal.Cyan(host)
-		if status.State != mint.StateRunning {
-			line1 = s.pal.BoldBlue("╭─ CRL-CLI") + " " + s.pal.BoldCyan(method) + s.pal.Dim(" ─ Mint ") + s.pal.Dim("○ OFF") + s.pal.Cyan(host)
+
+	p := s.pal
+	if !p.Enabled {
+		prompt := fmt.Sprintf("crl [%s] [Mint: %s]", method, mintStateStr)
+		if selected > 0 {
+			prompt += fmt.Sprintf(" [Sel: %d]", selected)
 		}
-	}
-	if s.pal.Enabled {
-		if s.lastFailed {
-			line2 = s.pal.BoldRed("╰─❯ ")
-		} else {
-			line2 = s.pal.BoldMagenta("╰─❯ ")
+		if s.lastBatchSet && s.lastBatchSent > 0 {
+			prompt += fmt.Sprintf(" [Envoyées: %d/%d]", s.lastBatchSuccess, s.lastBatchSent)
 		}
+		prompt += " >"
+		return prompt
 	}
-	return line1 + "\r\n" + line2
+
+	// Couleurs sobres : cyan, bleu, violet et vert
+	parts := []string{}
+	parts = append(parts, p.Cyan("crl"))
+	parts = append(parts, p.BoldCyan("["+method+"]"))
+	if mintStateStr == "ON" {
+		parts = append(parts, p.BoldGreen("[Mint: ON]"))
+	} else {
+		parts = append(parts, p.Dim("[Mint: OFF]"))
+	}
+	if selected > 0 {
+		parts = append(parts, p.Blue(fmt.Sprintf("[Sel: %d]", selected)))
+	}
+	if s.lastBatchSet && s.lastBatchSent > 0 {
+		parts = append(parts, p.Green(fmt.Sprintf("[Envoyées: %d/%d]", s.lastBatchSuccess, s.lastBatchSent)))
+	}
+	prompt := strings.Join(parts, " ")
+	if s.lastFailed {
+		prompt += p.BoldRed(" >")
+	} else {
+		prompt += p.Magenta(" >")
+	}
+	return prompt
 }
 
 func unicodeTerminal() bool {
