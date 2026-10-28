@@ -1,4 +1,4 @@
-D// Package display centralise les règles d'affichage de CRL-CLI :
+// Package display centralise les règles d'affichage de CRL-CLI :
 // masquage des secrets, rendu des URL et des corps HTTP.
 //
 // Ces fonctions ne modifient jamais les données utilisées pour rejouer une
