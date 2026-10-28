@@ -708,7 +708,7 @@ func (s *Shell) startMultilineBody() {
 			s.printf("\n")
 		}
 	}
-	s.printf("[CRL] Saisie corps multiligne en cours. Tapez votre corps ligne par ligne. Terminez par une ligne isolée ':end'. Annulez avec ':cancel'.\n")
+	s.printf("[CRL] Saisie multiligne en cours (JSON/XML/texte). Tapez votre contenu ligne par ligne. Terminez par une ligne isolée ':end'. Annulez avec ':cancel'.\n")
 	s.multilineMode = "body"
 	s.multilineBuf.Reset()
 	s.out.reset()
@@ -915,6 +915,57 @@ func (s *Shell) cmdCA(rest string) {
 }
 
 func (s *Shell) cmdShow() {
+	if s.history != nil {
+		selected := s.history.SelectedMany()
+		if len(selected) > 0 {
+			if len(selected) == 1 {
+				c := selected[0]
+				p := s.pal
+				s.printf("%s\n", p.BoldGreen(fmt.Sprintf("[CRL] Requête sélectionnée #%d (Mint)", c.ID)))
+				s.printf("%s\n", p.Dim("Aucune requête envoyée — utilisez crl.launch pour l'exécuter."))
+				s.rule(78)
+				s.field("Méthode", p.Method(c.Request.Method))
+				s.field("URL", p.Cyan(sanitizeTerminal(c.Request.URL)))
+				headers := c.Request.Headers
+				s.printf("\n  %s\n", p.BoldCyan(fmt.Sprintf("En-têtes (%d)", len(headers))))
+				if len(headers) == 0 {
+					s.printf("    %s\n", p.Dim("(aucun)"))
+				} else {
+					for _, h := range headers {
+						s.printf("    %s\n", s.headerLine(h.Name, h.Value))
+					}
+				}
+				if len(c.Request.Body) > 0 {
+					s.printf("\n  %s\n", p.BoldCyan(fmt.Sprintf("Corps (%d octets)", len(c.Request.Body))))
+					rendered, _ := display.RenderBody(c.Request.Body, 4096)
+					s.printIndented(rendered, "    ")
+				} else {
+					s.printf("\n  %s\n", p.BoldCyan("Corps (vide / non défini)"))
+				}
+				s.printf("\n")
+				s.rule(78)
+				s.printf("%s\n", p.Dim("crl.launch pour envoyer (ou mint.replay) · crl.table pour un résumé"))
+				return
+			}
+			// multiple selections
+			p := s.pal
+			s.printf("%s\n", p.BoldGreen(fmt.Sprintf("[CRL] Requêtes sélectionnées (%d)", len(selected))))
+			s.rule(78)
+			for _, c := range selected {
+				s.printf("  #%d %s %s\n", c.ID, p.Method(c.Request.Method), p.Cyan(sanitizeTerminal(c.Request.URL)))
+				if len(c.Request.Headers) > 0 {
+					s.printf("     %s\n", p.Dim(fmt.Sprintf("%d en-tête(s)", len(c.Request.Headers))))
+				}
+				if len(c.Request.Body) > 0 {
+					s.printf("     %s\n", p.Dim(fmt.Sprintf("corps %d octet(s)", len(c.Request.Body))))
+				}
+			}
+			s.printf("\n")
+			s.rule(78)
+			s.printf("%s\n", p.Dim("crl.launch ou mint.replay pour exécuter en parallèle"))
+			return
+		}
+	}
 	if s.builder.IsEmpty() {
 		s.printf("[CRL] Aucune requête préparée. Utilisez crl.host, crl.method, crl.head, crl.json ou mint.use.\n")
 		return
@@ -953,6 +1004,39 @@ func (s *Shell) cmdShow() {
 }
 
 func (s *Shell) cmdTable() {
+	if s.history != nil {
+		selected := s.history.SelectedMany()
+		if len(selected) > 0 {
+			p := s.pal
+			if len(selected) == 1 {
+				c := selected[0]
+				s.printf("%s\n", p.BoldGreen(fmt.Sprintf("[CRL] Tableau de la requête sélectionnée #%d", c.ID)))
+				s.field("MÉTHODE", p.Method(c.Request.Method))
+				s.field("URL", p.Cyan(display.MaskURL(c.Request.URL)))
+				s.field("EN-TÊTES", p.Bold(fmt.Sprintf("%d", len(c.Request.Headers))))
+				s.field("CORPS", p.Bold(fmt.Sprintf("%d octets", len(c.Request.Body))))
+				if len(c.Request.Headers) > 0 {
+					names := make([]string, 0, len(c.Request.Headers))
+					for _, h := range c.Request.Headers {
+						names = append(names, sanitizeTerminal(h.Name))
+					}
+					s.printf("\n  %s\n", p.BoldCyan(fmt.Sprintf("En-têtes (%d)", len(c.Request.Headers))))
+					s.printf("  %s\n", p.Dim(strings.Join(names, ", ")))
+					s.printf("  %s\n", p.Dim("crl.show affiche le détail complet des valeurs."))
+				}
+				return
+			}
+			s.printf("%s\n", p.BoldGreen(fmt.Sprintf("[CRL] Tableau des requêtes sélectionnées (%d)", len(selected))))
+			s.rule(78)
+			for _, c := range selected {
+				s.printf("  #%d %s %s\n", c.ID, p.Method(c.Request.Method), p.Cyan(display.MaskURL(c.Request.URL)))
+				s.printf("     %d en-tête(s), %d octet(s)\n", len(c.Request.Headers), len(c.Request.Body))
+			}
+			s.rule(78)
+			s.printf("%s\n", p.Dim("crl.show pour le détail · crl.launch/mint.replay pour exécuter"))
+			return
+		}
+	}
 	if s.builder.IsEmpty() {
 		s.printf("[CRL] Aucune requête préparée.\n")
 		return
