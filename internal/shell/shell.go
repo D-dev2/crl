@@ -89,19 +89,113 @@ type trackingWriter struct {
 	w     io.Writer
 	last  byte
 	wrote bool
+
+	// block décrit la sortie d'une commande. Le premier octet réellement
+	// affiché est précédé d'une ligne vide, et la fin de la commande est
+	// normalisée avec une nouvelle ligne. Cela évite que le prompt suivant
+	// soit collé à la dernière ligne d'un résultat, sans ajouter de \n\n
+	// dans chaque fonction de rendu.
+	block        bool
+	blockStarted bool
+	tail         []byte
 }
 
 func (t *trackingWriter) Write(p []byte) (int, error) {
+	if !t.block || t.blockStarted {
+		return t.write(p)
+	}
+
+	// Les rendus existants commencent parfois par un ou deux sauts de ligne.
+	// On les absorbe dans la séparation centralisée pour ne pas produire de
+	// ligne vide en double.
+	start := 0
+	for start < len(p) && (p[start] == '\n' || p[start] == '\r') {
+		start++
+	}
+	if start == len(p) {
+		// Un premier Write composé uniquement de sauts de ligne ne doit pas
+		// démarrer la sortie de la commande.
+		return len(p), nil
+	}
+
+	// La ligne du prompt vient d'être validée : une ligne vide sépare la
+	// commande de son résultat.
+	if _, err := t.write([]byte("\r\n")); err != nil {
+		return 0, err
+	}
+	t.blockStarted = true
+	if _, err := t.write(p[start:]); err != nil {
+		// Les octets initiaux ont été absorbés : on les compte comme écrits
+		// pour que l'appelant ne réessaie pas de les envoyer.
+		return len(p), err
+	}
+	return len(p), nil
+}
+
+func (t *trackingWriter) write(p []byte) (int, error) {
 	n, err := t.w.Write(p)
 	if n > 0 {
 		t.last = p[n-1]
 		t.wrote = true
+		t.tail = append(t.tail, p[:n]...)
+		if len(t.tail) > 4 {
+			t.tail = t.tail[len(t.tail)-4:]
+		}
 	}
 	return n, err
 }
 
 func (t *trackingWriter) needsNewline() bool { return t.wrote && t.last != '\n' }
-func (t *trackingWriter) reset()             { t.wrote = false; t.last = 0 }
+
+func (t *trackingWriter) reset() {
+	t.wrote = false
+	t.last = 0
+	t.tail = nil
+}
+
+func (t *trackingWriter) beginBlock() {
+	t.block = true
+	t.blockStarted = false
+}
+
+// finishBlock normalise la fin d'une commande : nouvelle ligne garantie puis
+// une ligne vide avant le prompt suivant. Si le rendu a déjà terminé par une
+// ligne vide, aucun saut supplémentaire n'est ajouté.
+func (t *trackingWriter) finishBlock() {
+	if !t.block || !t.blockStarted {
+		t.abortBlock()
+		return
+	}
+	if t.last != '\n' {
+		_, _ = t.write([]byte("\r\n"))
+	}
+	if !t.endsWithBlankLine() {
+		_, _ = t.write([]byte("\r\n"))
+	}
+	t.abortBlock()
+}
+
+func (t *trackingWriter) abortBlock() {
+	t.block = false
+	t.blockStarted = false
+}
+
+func (t *trackingWriter) endsWithBlankLine() bool {
+	// Un saut de ligne Windows contient \r\n : on compte les \n consécutifs
+	// en ignorant les \r intermédiaires.
+	newlines := 0
+	for i := len(t.tail) - 1; i >= 0; i-- {
+		switch t.tail[i] {
+		case '\n':
+			newlines++
+		case '\r':
+			continue
+		default:
+			return newlines >= 2
+		}
+	}
+	return newlines >= 2
+}
 
 // New crée un shell.
 func New(opts Options) (*Shell, error) {
@@ -161,17 +255,30 @@ func (s *Shell) Close() {
 func (s *Shell) runBatch(ctx context.Context) error {
 	for s.scanner.Scan() {
 		s.drainNotifications()
-		s.out.reset()
-		if exit := s.Execute(s.scanner.Text()); exit {
+		if exit := s.runCommand(s.scanner.Text()); exit {
 			return nil
-		}
-		if s.out.needsNewline() {
-			fmt.Fprint(s.out, "\n")
-			s.out.reset()
 		}
 		s.drainNotifications()
 	}
 	return s.scanner.Err()
+}
+
+// runCommand exécute une ligne en centralisant la séparation visuelle entre la
+// commande, sa sortie et le prompt suivant. Les fonctions de rendu ne gèrent
+// donc pas chacune leur propre marge finale.
+func (s *Shell) runCommand(line string) bool {
+	s.out.reset()
+	s.out.beginBlock()
+	exit := s.Execute(line)
+	if s.textArea != nil {
+		// L'éditeur multiligne possède déjà le terminal : il ne faut pas lui
+		// ajouter une ligne vide après son cadre.
+		s.out.abortBlock()
+	} else {
+		s.out.finishBlock()
+	}
+	s.out.reset()
+	return exit
 }
 
 func (s *Shell) runInteractive(ctx context.Context) error {
@@ -218,6 +325,7 @@ func (s *Shell) runInteractive(ctx context.Context) error {
 				return nil
 			}
 			if s.textArea != nil {
+				s.resizeTextArea()
 				action := s.textArea.Feed(data)
 				switch action {
 				case textAreaSave:
@@ -242,16 +350,12 @@ func (s *Shell) runInteractive(ctx context.Context) error {
 			}
 			exit := false
 			for _, line := range res.Lines {
-				s.out.reset()
-				if s.Execute(line) {
+				if s.runCommand(line) {
 					exit = true
 					break
 				}
 				if s.textArea != nil {
 					break
-				}
-				if s.out.needsNewline() {
-					fmt.Fprint(s.out, "\r\n")
 				}
 				s.drainNotifications()
 			}
@@ -755,11 +859,21 @@ func (s *Shell) openTextArea(kind string, b *request.Builder, targetID int, init
 	}
 	s.textKind, s.textBuilder, s.textTarget = kind, b, targetID
 	s.textArea = newTextArea(s.out, title, target, initial)
+	s.resizeTextArea()
+	s.out.reset()
+	s.textArea.Draw(s.pal, unicodeTerminal())
+}
+
+// resizeTextArea consulte à nouveau le terminal avant chaque rafraîchissement.
+// Cela couvre les redimensionnements sans installer un second gestionnaire de
+// signaux ni conserver une taille devenue obsolète.
+func (s *Shell) resizeTextArea() {
+	if s.textArea == nil {
+		return
+	}
 	if f, ok := s.in.(*os.File); ok {
 		s.textArea.SetSize(terminalWidth(f.Fd()), terminalHeight(f.Fd()))
 	}
-	s.out.reset()
-	s.textArea.Draw(s.pal, unicodeTerminal())
 }
 
 func (s *Shell) commitTextArea() {
@@ -767,11 +881,13 @@ func (s *Shell) commitTextArea() {
 	if s.textKind == "json" {
 		if err := validateJSON(content); err != nil {
 			s.textArea.message = err.Error()
+			s.resizeTextArea()
 			s.textArea.Draw(s.pal, unicodeTerminal())
 			return
 		}
 		if err := s.textBuilder.SetJSON(string(content)); err != nil {
 			s.textArea.message = err.Error()
+			s.resizeTextArea()
 			s.textArea.Draw(s.pal, unicodeTerminal())
 			return
 		}
@@ -791,14 +907,14 @@ func (s *Shell) closeTextArea(applied bool) {
 	if s.textArea == nil {
 		return
 	}
-	// Clear the editor panel from its saved origin without changing terminal
-	// mode; the shell has owned raw mode continuously and keeps its input reader.
-	fmt.Fprint(s.out, "\033[u\033[J")
+	// Efface le panneau depuis son origine réelle, sans changer le mode du
+	// terminal : le shell conserve la main sur le mode brut et son lecteur.
+	s.textArea.Clear()
+	s.out.reset()
 	s.textArea = nil
 	s.textBuilder = nil
 	s.textKind = ""
 	s.textTarget = 0
-	s.out.reset()
 	if applied && s.textResult != "" {
 		s.printf("%s\n", s.textResult)
 		s.textResult = ""
@@ -812,6 +928,9 @@ func (s *Shell) closeTextArea(applied bool) {
 			s.editor.PrintLines([]string{line})
 		}
 		s.textNotices = nil
+		// Le panneau a été effacé hors du bloc de commande : on rétablit ici
+		// la même ligne vide avant le prompt que pour les autres commandes.
+		s.printf("\n")
 		s.editor.DrawPrompt()
 	}
 }
@@ -2404,8 +2523,23 @@ func shellWords(input string) []string {
 	return out
 }
 
-// cmdMintReplay starts each selected captured request concurrently, preserving
-// its own builder state and source ID. Results are printed after the whole batch.
+type replayResult struct {
+	id       int
+	method   string
+	url      string
+	status   response.Status
+	duration string
+	headers  response.Headers
+	body     []byte
+	total    int64
+	bodyPath string
+	err      error
+	network  bool
+}
+
+// cmdMintReplay démarre chaque capture sélectionnée en parallèle, conserve son
+// identifiant et ne rend les résultats qu'après la fin du lot. Le rendu est
+// volontairement commun à toutes les réponses, comme pour crl.launch.
 func (s *Shell) cmdMintReplay(rest string) {
 	var captures []mint.Capture
 	var err error
@@ -2423,21 +2557,11 @@ func (s *Shell) cmdMintReplay(rest string) {
 		return
 	}
 	s.clearReplayArtifacts()
-	type result struct {
-		id                            int
-		method, url, status, duration string
-		statusCode                    int
-		responseSize                  int64
-		bodyPath                      string
-		network                       bool
-		details                       string
-		err                           error
-	}
 	ctx := s.ctx
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	results := make([]result, len(captures))
+	results := make([]replayResult, len(captures))
 	sem := make(chan struct{}, 4)
 	var wg sync.WaitGroup
 	for i, capture := range captures {
@@ -2450,7 +2574,7 @@ func (s *Shell) cmdMintReplay(rest string) {
 		wg.Add(1)
 		go func(i int, c mint.Capture, prepErr error) {
 			defer wg.Done()
-			r := result{id: c.ID, method: c.Request.Method, url: c.Request.URL}
+			r := replayResult{id: c.ID, method: c.Request.Method, url: c.Request.URL}
 			if prepErr != nil {
 				r.err = prepErr
 				results[i] = r
@@ -2460,26 +2584,16 @@ func (s *Shell) cmdMintReplay(rest string) {
 			case sem <- struct{}{}:
 			case <-ctx.Done():
 				r.err = ctx.Err()
+				r.network = true
 				results[i] = r
 				return
 			}
 			defer func() { <-sem }()
-			err, status, dur, details, code, size, bodyPath := s.replayCapture(ctx, c)
-			if err != nil {
-				r.err = err
-				r.network = true
-			} else {
-				r.status = status
-			}
-			r.duration = dur
-			r.details = details
-			r.statusCode = code
-			r.responseSize = size
-			r.bodyPath = bodyPath
-			results[i] = r
+			results[i] = s.replayCapture(ctx, c)
 		}(i, prepared, prepErr)
 	}
 	wg.Wait()
+
 	completed, successHTTP, httpErrors, networkErrors, executionErrors := 0, 0, 0, 0, 0
 	for _, r := range results {
 		if r.err != nil {
@@ -2488,34 +2602,13 @@ func (s *Shell) cmdMintReplay(rest string) {
 			} else {
 				executionErrors++
 			}
-		} else {
-			completed++
-			if r.statusCode >= 400 {
-				httpErrors++
-			} else if r.statusCode >= 200 && r.statusCode < 400 {
-				successHTTP++
-			}
+			continue
 		}
-	}
-	s.lastBatchSent = len(results)
-	s.lastBatchSuccess = completed
-	s.lastBatchFail = networkErrors
-	s.lastBatchSet = true
-	s.printf("[Mint] Résultats du rejeu parallèle (%d requêtes)\n", len(results))
-	s.printf("[Résumé] Total : %d · Terminées : %d · Succès HTTP : %d · Erreurs HTTP : %d · Erreurs réseau : %d · Erreurs de requête : %d\n", len(results), completed, successHTTP, httpErrors, networkErrors, executionErrors)
-	s.printf("  ID  MÉTHODE  STATUT  DURÉE  URL / ERREUR\n")
-	for _, r := range results {
-		status := r.status
-		detail := display.MaskURL(sanitizeTerminal(r.url))
-		if r.err != nil {
-			status = "ERREUR"
-			detail = r.err.Error()
-		}
-		prefix := fmt.Sprintf("  #%d  %-7s  %-7s  %-8s ", r.id, r.method, status, r.duration)
-		detailLines := display.WrapText(detail, s.termWidth()-len(prefix))
-		s.printf("%s%s\n", prefix, detailLines[0])
-		for _, cont := range detailLines[1:] {
-			s.printf("%s%s\n", strings.Repeat(" ", len(prefix)), cont)
+		completed++
+		if r.status.Code >= 400 {
+			httpErrors++
+		} else if r.status.Code >= 200 && r.status.Code < 400 {
+			successHTTP++
 		}
 	}
 	for _, r := range results {
@@ -2523,31 +2616,153 @@ func (s *Shell) cmdMintReplay(rest string) {
 			s.replayBodies[r.id] = r.bodyPath
 			s.replayDirs = append(s.replayDirs, filepath.Dir(r.bodyPath))
 		}
-		urlStr := display.MaskURL(sanitizeTerminal(r.url))
-		urlLines := display.WrapText(urlStr, max(20, s.termWidth()-10))
-		s.printf("\n[Mint] Réponse du rejeu #%d — %s %s\n", r.id, r.method, urlLines[0])
-		for _, cont := range urlLines[1:] {
-			s.printf("          %s\n", cont)
-		}
-		if r.err != nil {
-			s.printf("  Erreur : %s\n", sanitizeTerminal(r.err.Error()))
-			continue
-		}
-		s.printf("  Statut : %s · durée : %s · taille : %s\n%s", r.status, r.duration, display.FormatBytes(r.responseSize), r.details)
-		if r.responseSize > launchBodyLimit {
-			if r.responseSize <= 16<<20 {
-				s.printf("  Suite du corps : mint.replay.body %d %d\n", r.id, launchBodyLimit)
-			} else {
-				s.printf("  Corps complet privé : %s (accessible avec un outil local de lecture de fichier)\n", r.bodyPath)
-			}
-		}
 	}
-	// Record in history associations? mission says "Enregistre les résultats des rejeux dans l'historique et conserve une association fiable avec chaque capture source." - existing code already has history; maybe ensure we don't break things
+	s.lastBatchSent = len(results)
+	s.lastBatchSuccess = completed
+	s.lastBatchFail = networkErrors + executionErrors
+	s.lastBatchSet = true
+	s.printReplaySummary(results, completed, successHTTP, httpErrors, networkErrors, executionErrors)
 }
 
-func (s *Shell) replayCapture(ctx context.Context, c mint.Capture) (error, string, string, string, int, int64, string) {
+func (s *Shell) printReplaySummary(results []replayResult, completed, successHTTP, httpErrors, networkErrors, executionErrors int) {
+	p := s.pal
+	title := "Résultats du rejeu parallèle"
+	if len(results) == 1 {
+		title = "Résultat du rejeu"
+	}
+	s.printf("%s %s — %d requête(s)\n", p.BoldMagenta("[Mint]"), p.Bold(title), len(results))
+	s.printf("\n%s\n", p.BoldBlue("Résumé"))
+	s.printf("  Total : %d\n", len(results))
+	s.printf("  Terminées : %d\n", completed)
+	s.printf("  Succès HTTP : %d\n", successHTTP)
+	s.printf("  Erreurs HTTP : %d\n", httpErrors)
+	s.printf("  Erreurs réseau : %d\n", networkErrors)
+	if executionErrors > 0 {
+		s.printf("  Erreurs requête : %d\n", executionErrors)
+	}
+
+	s.printf("\n%s\n", p.BoldBlue("Résultats"))
+	header := fmt.Sprintf("%-5s %s %s %s %s", "ID", padCell("MÉTHODE", 7), padCell("STATUT", 7), padCell("DURÉE", 10), "URL / ERREUR")
+	s.printf("  %s\n", p.Dim(header))
+	for _, r := range results {
+		status := strconv.Itoa(r.status.Code)
+		detail := display.MaskURL(sanitizeTerminal(r.url))
+		if r.err != nil {
+			status = "ERREUR"
+			detail = sanitizeTerminal(r.err.Error())
+		}
+		prefix := fmt.Sprintf("  #%-4d %-7s %-7s %-10s ", r.id, r.method, status, r.duration)
+		detailLines := display.WrapText(detail, max(20, s.termWidth()-display.VisibleWidth(prefix)))
+		s.printf("%s%s\n", prefix, detailLines[0])
+		for _, cont := range detailLines[1:] {
+			s.printf("%s%s\n", strings.Repeat(" ", display.VisibleWidth(prefix)), cont)
+		}
+	}
+
+	for _, r := range results {
+		s.printf("\n")
+		s.printReplayResponse(r)
+	}
+}
+
+func (s *Shell) printReplayResponse(r replayResult) {
+	p := s.pal
+	width := s.boxWidth()
+	title := fmt.Sprintf(" RÉPONSE #%d ", r.id)
+	top := "╭─" + title
+	top += strings.Repeat("─", max(0, width-display.VisibleWidth(top)-1)) + "╮"
+	bottom := "╰" + strings.Repeat("─", max(0, width-2)) + "╯"
+	s.printf("%s\n", p.BoldCyan(top))
+
+	if r.err != nil {
+		kind := "Erreur d'exécution"
+		if r.network {
+			kind = "Erreur réseau"
+		}
+		s.printf("│ %s\n", p.BoldRed(kind))
+		s.replayField("Méthode", p.Method(r.method), width)
+		s.replayField("URL", p.Cyan(display.MaskURL(sanitizeTerminal(r.url))), width)
+		if r.duration != "" {
+			s.replayField("Durée", p.Cyan(r.duration), width)
+		}
+		s.replayField("Détail", p.Red(sanitizeTerminal(r.err.Error())), width)
+		s.printf("%s\n", p.BoldCyan(bottom))
+		return
+	}
+
+	s.replayField("Statut", p.StatusCode(r.status.Code, r.status.Label()), width)
+	s.replayField("Méthode", p.Method(r.method), width)
+	s.replayField("URL", p.Cyan(display.MaskURL(sanitizeTerminal(r.url))), width)
+	s.replayField("Durée", p.Cyan(r.duration), width)
+	s.replayField("Taille", p.Bold(display.FormatBytes(r.total)), width)
+
+	s.printf("│\n│ %s\n", p.BoldBlue(fmt.Sprintf("En-têtes de réponse (%d)", len(r.headers))))
+	if len(r.headers) == 0 {
+		s.printf("│   %s\n", p.Dim("(aucun)"))
+	} else {
+		for _, h := range r.headers {
+			s.printf("%s\n", s.headerLine(h.Name, h.Value, "│   "))
+		}
+	}
+
+	view := response.RenderBody(r.body, r.total, launchBodyLimit, s.outputMode, r.headers.ContentType())
+	s.printf("│\n│ %s\n", p.BoldBlue(fmt.Sprintf("Corps — %s (%s)", bodyKindLabel(view.Kind), display.FormatBytes(r.total))))
+	bodyWidth := max(10, width-4)
+	for _, line := range strings.Split(view.Text, "\n") {
+		for _, wrapped := range display.WrapText(sanitizeTerminal(line), bodyWidth) {
+			s.printf("│   %s\n", wrapped)
+		}
+	}
+	if view.Truncated {
+		s.printf("│   %s\n", p.BoldYellow(fmt.Sprintf("[…] Affichage limité à %s sur %s reçus ; le corps complet reste disponible.", display.FormatBytes(launchBodyLimit), display.FormatBytes(r.total))))
+	}
+	if r.bodyPath != "" && r.total > launchBodyLimit {
+		if r.total <= 16<<20 {
+			s.printf("│   %s\n", p.Dim(fmt.Sprintf("Corps complet : %s · suite : mint.replay.body %d %d", r.bodyPath, r.id, launchBodyLimit)))
+		} else {
+			s.printf("│   %s\n", p.Dim("Corps complet privé : "+r.bodyPath))
+		}
+	}
+	if r.status.Code >= 500 {
+		s.printf("│ %s\n", p.BoldRed("Erreur HTTP côté serveur : la réponse a bien été reçue, ce n'est pas une erreur réseau."))
+	} else if r.status.Code >= 400 {
+		s.printf("│ %s\n", p.BoldYellow("Erreur HTTP côté client : la réponse a bien été reçue."))
+	}
+	s.printf("%s\n", p.BoldCyan(bottom))
+}
+
+func (s *Shell) replayField(label, value string, width int) {
+	p := s.pal
+	label = padCell(label, 14)
+	prefix := "│ " + p.BoldCyan(label) + p.Dim(" : ")
+	available := width - display.VisibleWidth(prefix)
+	if available < 10 {
+		available = 10
+	}
+	lines := display.WrapText(value, available)
+	for i, line := range lines {
+		if i == 0 {
+			s.printf("%s%s\n", prefix, line)
+		} else {
+			s.printf("│ %s%s\n", strings.Repeat(" ", 17), line)
+		}
+	}
+}
+
+// replayCapture exécute une capture et conserve tout ce qui est nécessaire au
+// rendu structuré et à mint.replay.body. Aucun résultat n'est simulé : les
+// valeurs absentes restent absentes.
+func (s *Shell) replayCapture(ctx context.Context, c mint.Capture) replayResult {
+	r := replayResult{id: c.ID, method: c.Request.Method, url: c.Request.URL}
+	fail := func(err error) replayResult {
+		r.err = err
+		r.network = true
+		return r
+	}
 	if ok, why := c.Importable(); !ok {
-		return fmt.Errorf("%s", why), "", "-", "", 0, 0, ""
+		r.err = fmt.Errorf("%s", why)
+		r.network = false
+		return r
 	}
 	b := request.New()
 	headers := make([]request.Header, 0, len(c.Request.Headers))
@@ -2555,21 +2770,24 @@ func (s *Shell) replayCapture(ctx context.Context, c mint.Capture) (error, strin
 		headers = append(headers, request.Header{Name: h.Name, Value: h.Value})
 	}
 	if err := b.Import(request.CapturedRequest{URL: c.Request.URL, Method: c.Request.Method, Headers: headers, Body: c.Request.Body, BodyPresent: len(c.Request.Body) > 0}); err != nil {
-		return err, "", "-", "", 0, 0, ""
+		r.err = err
+		return r
 	}
 	// Replayed captures must not be recorded a second time by this tool's Mint
 	// proxy. Captured requests have no portable proxy setting, so replay direct.
 	if err := b.SetProxy("none"); err != nil {
-		return err, "", "-", "", 0, 0, ""
+		r.err = err
+		return r
 	}
 	res := b.ResolveProxy("", false)
 	args, err := b.CurlArgs(res)
 	if err != nil {
-		return err, "", "-", "", 0, 0, ""
+		r.err = err
+		return r
 	}
 	dir, err := os.MkdirTemp("", "crl-replay-*")
 	if err != nil {
-		return err, "", "-", "", 0, 0, ""
+		return fail(err)
 	}
 	keepDir := false
 	defer func() {
@@ -2586,57 +2804,55 @@ func (s *Shell) replayCapture(ctx context.Context, c mint.Capture) (error, strin
 	}
 	out, err := cmd.Output()
 	if err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err(), "", "-", "", 0, 0, ""
-		}
 		message := strings.TrimSpace(stderr.String())
-		if message != "" {
-			return fmt.Errorf("curl: %s", truncate(sanitizeTerminal(message), 600)), "", "-", "", 0, 0, ""
+		// Une connexion refusée (code curl 7) est une erreur réseau précise.
+		// Elle doit rester visible même si le contexte vient d'expirer, plutôt
+		// que d'être écrasée par un "deadline exceeded" générique.
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 7 {
+			if message != "" {
+				return fail(fmt.Errorf("curl: %s", truncate(sanitizeTerminal(message), 600)))
+			}
+			return fail(err)
 		}
-		return err, "", "-", "", 0, 0, ""
+		if ctx.Err() != nil {
+			return fail(ctx.Err())
+		}
+		if message != "" {
+			return fail(fmt.Errorf("curl: %s", truncate(sanitizeTerminal(message), 600)))
+		}
+		return fail(err)
 	}
 	parts := strings.Fields(string(out))
 	if len(parts) < 2 {
-		return fmt.Errorf("réponse curl illisible"), "", "-", "", 0, 0, ""
+		return fail(fmt.Errorf("réponse curl illisible"))
 	}
 	d, _ := strconv.ParseFloat(parts[1], 64)
-	duration := (time.Duration(d * float64(time.Second))).String()
+	r.duration = (time.Duration(d * float64(time.Second))).String()
 	headerData, _ := os.ReadFile(headersPath)
 	httpStatus, parsedHeaders := response.ParseHeaderDump(headerData)
-	var bodySize int64
-	if info, statErr := os.Stat(bodyPath); statErr == nil {
-		bodySize = info.Size()
+	code, _ := strconv.Atoi(parts[0])
+	if httpStatus.Code == 0 {
+		httpStatus.Code = code
 	}
-	body := readFilePrefix(bodyPath, 32<<10)
-	if bodySize <= 16<<20 {
+	if httpStatus.Code == 0 {
+		return fail(fmt.Errorf("aucun statut HTTP exploitable"))
+	}
+	r.status = httpStatus
+	r.headers = parsedHeaders
+	if info, statErr := os.Stat(bodyPath); statErr == nil {
+		r.total = info.Size()
+	}
+	r.body = readFilePrefix(bodyPath, launchBodyLimit)
+	if r.total <= 16<<20 {
 		if complete, readErr := os.ReadFile(bodyPath); readErr == nil {
-			body = display.MaskBody(complete)
+			r.body = display.MaskBody(complete)
 		}
 	} else {
-		body = []byte("[corps volumineux : aperçu masqué ; utilisez mint.replay.body pour consulter une page]")
+		r.body = []byte("[corps volumineux : aperçu masqué ; utilisez mint.replay.body pour consulter une page]")
 	}
-	view := response.RenderBody(body, bodySize, 32<<10, response.ModeAuto, parsedHeaders.ContentType())
-	var details strings.Builder
-	details.WriteString("  En-têtes de réponse:\n")
-	for _, h := range parsedHeaders {
-		details.WriteString(s.headerLine(h.Name, h.Value, "    ") + "\n")
-	}
-	details.WriteString("  Corps:\n")
-	for _, line := range strings.Split(view.Text, "\n") {
-		details.WriteString("    " + line + "\n")
-	}
-	if view.Truncated {
-		details.WriteString("    […] corps tronqué à l'affichage\n")
-		details.WriteString("    Consultez la capture source ou utilisez une sortie fichier dédiée.\n")
-	}
-	code, _ := strconv.Atoi(parts[0])
-	statusLabel := httpStatus.Label()
-	if statusLabel == "" {
-		statusLabel = parts[0]
-	}
-	details.WriteString("  Taille de réponse : " + display.FormatBytes(bodySize) + "\n")
+	r.bodyPath = bodyPath
 	keepDir = true
-	return nil, statusLabel, duration, details.String(), code, bodySize, bodyPath
+	return r
 }
 
 func (s *Shell) clearReplayArtifacts() {

@@ -12,20 +12,29 @@ import (
 // in the shell's existing raw-mode event loop, so there is only one owner of
 // the terminal and Mint notifications can be queued safely while it is open.
 type textArea struct {
-	out         io.Writer
-	title       string
-	target      string
-	buf         []rune
-	cursor      int
-	top         int
-	rows        int
-	width       int
-	escape      []byte
-	escapeAt    time.Time
-	utf8Bytes   []byte
-	lastCR      bool
-	message     string
-	originSaved bool
+	out       io.Writer
+	title     string
+	target    string
+	buf       []rune
+	cursor    int
+	top       int
+	rows      int
+	width     int
+	escape    []byte
+	escapeAt  time.Time
+	utf8Bytes []byte
+	lastCR    bool
+	message   string
+
+	// drawnRows est le nombre de lignes occupées par le dernier panneau.
+	// cursorOffset est la distance, en lignes, entre le haut du panneau et le
+	// curseur visible. Ces deux valeurs permettent de replacer le curseur par
+	// mouvements relatifs, sans dépendre de la mémoire de curseur ANSI qui
+	// devient fausse dès que le panneau provoque un défilement du terminal.
+	drawn        bool
+	drawnRows    int
+	cursorOffset int
+	termHeight   int
 }
 
 type textAreaAction uint8
@@ -38,22 +47,56 @@ const (
 
 func newTextArea(out io.Writer, title, target string, initial []byte) *textArea {
 	buffer := []rune(string(initial))
-	a := &textArea{out: out, title: title, target: target, buf: buffer, cursor: len(buffer), rows: 10, width: 78}
+	a := &textArea{out: out, title: title, target: target, buf: buffer, cursor: len(buffer), rows: textAreaMinRows, width: 78, termHeight: 24}
 	return a
 }
 
+const (
+	// Le panneau comporte huit lignes fixes : bord supérieur, titre, cible,
+	// séparateur, séparateur, deux lignes d'aide et bord inférieur.
+	textAreaFrameExtra = 8
+	textAreaMinRows    = 3
+	textAreaMaxRows    = 18
+)
+
 func (a *textArea) SetSize(width, height int) {
-	if width >= 32 {
+	if width > 0 {
 		if width > 100 {
 			width = 100
 		}
+		// Les très petites largeurs restent exploitables ; le cadre peut alors
+		// dépasser légèrement le terminal, mais aucun index négatif n'est créé.
+		if width < 20 {
+			width = 20
+		}
 		a.width = width - 2
 	}
-	if height > 12 {
-		a.rows = height - 10
-	} else {
-		a.rows = 3
+	if height > 0 {
+		a.termHeight = height
 	}
+
+	maxRows := a.termHeight - textAreaFrameExtra
+	if maxRows < 1 {
+		maxRows = 1
+	}
+	if maxRows > textAreaMaxRows {
+		maxRows = textAreaMaxRows
+	}
+
+	// Un petit JSON n'a pas besoin de remplir tout le terminal. On garde au
+	// moins trois lignes d'édition, puis on s'arrête à la hauteur disponible.
+	desired := strings.Count(a.Text(), "\n") + 2
+	if desired < textAreaMinRows {
+		desired = textAreaMinRows
+	}
+	if desired > maxRows {
+		desired = maxRows
+	}
+	if desired < 1 {
+		desired = 1
+	}
+	a.rows = desired
+	a.clampTop()
 }
 
 func (a *textArea) Text() string        { return string(a.buf) }
@@ -67,13 +110,28 @@ func (a *textArea) CancelPendingEscape() bool {
 	return true
 }
 
-func (a *textArea) Draw(p palette, unicode bool) {
-	if a.originSaved {
-		fmt.Fprint(a.out, "\033[u\033[J")
-	} else {
-		fmt.Fprint(a.out, "\r\033[s\033[J")
-		a.originSaved = true
+// Clear efface le panneau depuis la position réelle du curseur. Les
+// déplacements sont relatifs au curseur visible, pas à une position ANSI
+// mémorisée : si le panneau a fait défiler le terminal, le haut du panneau
+// reste joignable en remontant le nombre de lignes effectivement dessinées.
+func (a *textArea) Clear() {
+	if !a.drawn {
+		return
 	}
+	fmt.Fprint(a.out, "\r")
+	if a.cursorOffset > 0 {
+		fmt.Fprintf(a.out, "\033[%dA", a.cursorOffset)
+	}
+	fmt.Fprint(a.out, "\033[J")
+	a.drawn = false
+	a.drawnRows = 0
+	a.cursorOffset = 0
+}
+
+func (a *textArea) Draw(p palette, unicode bool) {
+	a.Clear()
+	fmt.Fprint(a.out, "\r")
+
 	left, right, horiz, top, mid, bottom := "|", "|", "-", "+", "+", "+"
 	if unicode {
 		left, right, horiz, top, mid, bottom = "│", "│", "─", "╭", "├", "╰"
@@ -100,9 +158,7 @@ func (a *textArea) Draw(p palette, unicode bool) {
 	if row >= a.top+a.rows {
 		a.top = row - a.rows + 1
 	}
-	if a.top < 0 {
-		a.top = 0
-	}
+	a.clampTop()
 	for i := 0; i < a.rows; i++ {
 		idx := a.top + i
 		content := "~"
@@ -118,8 +174,8 @@ func (a *textArea) Draw(p palette, unicode bool) {
 	} else {
 		line(left, right, "Flèches : déplacer   Suppr/Retour arrière : modifier")
 	}
-	fmt.Fprintf(a.out, "%s%s%s\033[u", bottom, bar, bottom)
-	// Move to the visible cursor position (two framing lines + title/target).
+	fmt.Fprintf(a.out, "%s%s%s", bottom, bar, bottom)
+
 	visibleRow := row - a.top
 	if visibleRow < 0 {
 		visibleRow = 0
@@ -127,23 +183,66 @@ func (a *textArea) Draw(p palette, unicode bool) {
 	if visibleRow >= a.rows {
 		visibleRow = a.rows - 1
 	}
-	visibleCol := col
-	maxCol := a.width - 4
-	if col >= maxCol {
-		visibleCol = col - maxCol + 1
+	_, visibleCol := a.horizontalStart(col)
+	// Le curseur est actuellement après le bord inférieur. On remonte jusqu'à
+	// la ligne de contenu visible, puis on avance jusqu'à la colonne calculée.
+	frameHeight := a.rows + textAreaFrameExtra
+	a.cursorOffset = 4 + visibleRow
+	if up := frameHeight - 1 - a.cursorOffset; up > 0 {
+		fmt.Fprintf(a.out, "\r\033[%dA", up)
+	} else {
+		fmt.Fprint(a.out, "\r")
 	}
-	if visibleCol > maxCol {
-		visibleCol = maxCol
+	if visibleCol+2 > 0 {
+		fmt.Fprintf(a.out, "\033[%dC", visibleCol+2)
 	}
-	fmt.Fprintf(a.out, "\033[4B\033[%dB\033[%dC", visibleRow, visibleCol+2)
+	a.drawn = true
+	a.drawnRows = frameHeight
+}
+
+func (a *textArea) clampTop() {
+	if a.top < 0 {
+		a.top = 0
+	}
+	row, _ := a.cursorPosition()
+	if row < a.top {
+		a.top = row
+	}
+	if a.rows > 0 && row >= a.top+a.rows {
+		a.top = row - a.rows + 1
+	}
+	if a.top < 0 {
+		a.top = 0
+	}
+}
+
+func (a *textArea) horizontalStart(col int) (start, visibleCol int) {
+	width := a.width - 4
+	if width < 1 {
+		width = 1
+	}
+	if col >= width {
+		start = col - width + 1
+	}
+	visibleCol = col - start
+	if visibleCol < 0 {
+		visibleCol = 0
+	}
+	if visibleCol > width-1 {
+		visibleCol = width - 1
+	}
+	return start, visibleCol
 }
 
 func (a *textArea) horizontalLine(line string, cursorLine bool, col int) string {
 	r := []rune(line)
 	start := 0
+	if cursorLine {
+		start, _ = a.horizontalStart(col)
+	}
 	width := a.width - 4
-	if cursorLine && col >= width {
-		start = col - width + 1
+	if width < 1 {
+		width = 1
 	}
 	end := start + width
 	if end > len(r) {

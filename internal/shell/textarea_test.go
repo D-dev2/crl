@@ -57,6 +57,42 @@ func TestTextAreaNaturalNewlinesAndVerticalScroll(t *testing.T) {
 
 func (a *textArea) cursorPositionRow() int { row, _ := a.cursorPosition(); return row }
 
+func TestTextAreaFrameIsCompactAndRedrawClearsPreviousFrame(t *testing.T) {
+	var out bytes.Buffer
+	a := newTextArea(&out, "JSON", "actif", []byte(`{}`))
+	a.SetSize(100, 24)
+	if a.rows != textAreaMinRows {
+		t.Fatalf("hauteur pour un JSON court = %d, attendu %d", a.rows, textAreaMinRows)
+	}
+	a.Draw(palette{}, false)
+	if got := strings.Count(out.String(), "~"); got > 2 {
+		t.Fatalf("cadre compact avec %d lignes ~ : %q", got, out.String())
+	}
+
+	out.Reset()
+	a.Feed([]byte("x"))
+	a.Draw(palette{}, false)
+	redraw := out.String()
+	if !strings.Contains(redraw, "\033[J") || strings.Contains(redraw, "\033[u") {
+		t.Fatalf("le redessin ne remplace pas le panneau précédent : %q", redraw)
+	}
+	if !strings.Contains(redraw, "Ctrl+S : valider") {
+		t.Fatalf("redessin incomplet : %q", redraw)
+	}
+
+	long := newTextArea(&bytes.Buffer{}, "JSON", "actif", []byte(strings.Repeat("x\n", 100)))
+	long.SetSize(100, 24)
+	if long.rows < textAreaMinRows || long.rows > long.termHeight-textAreaFrameExtra || long.rows > textAreaMaxRows {
+		t.Fatalf("hauteur non bornée : %d lignes pour un terminal de %d", long.rows, long.termHeight)
+	}
+	small := newTextArea(&bytes.Buffer{}, "JSON", "actif", []byte(`{}`))
+	small.SetSize(20, 10)
+	if small.width != 18 {
+		t.Fatalf("largeur pour un terminal de 20 colonnes = %d", small.width)
+	}
+	small.Draw(palette{}, false)
+}
+
 func TestTextAreaEscapeAndValidationPreserveOriginal(t *testing.T) {
 	sh, _, _, _, b := newTestShell(t, "")
 	if err := b.SetJSON(`{"role":"user"}`); err != nil {
