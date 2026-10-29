@@ -60,6 +60,12 @@ type Shell struct {
 
 	interactive bool
 	editor      *editor
+	textArea    *textArea
+	textKind    string
+	textBuilder *request.Builder
+	textTarget  int
+	textNotices []string
+	textResult  string
 	inputCh     <-chan []byte
 	scanner     *bufio.Scanner
 	ctx         context.Context
@@ -77,11 +83,6 @@ type Shell struct {
 	lastBatchSuccess int
 	lastBatchFail    int
 	lastBatchSet     bool
-
-	multilineMode      string // "json" or "body" or ""
-	multilineBuf       strings.Builder
-	multilineInitial   []byte
-	multilineTargetIDs []int
 }
 
 type trackingWriter struct {
@@ -189,7 +190,19 @@ func (s *Shell) runInteractive(ctx context.Context) error {
 	s.editor.DrawPrompt()
 
 	for {
+		var escapeTimer <-chan time.Time
+		if s.textArea != nil && s.textArea.EscapePending() {
+			remaining := 80*time.Millisecond - time.Since(s.textArea.escapeAt)
+			if remaining < 0 {
+				remaining = 0
+			}
+			escapeTimer = time.After(remaining)
+		}
 		select {
+		case <-escapeTimer:
+			if s.textArea != nil && s.textArea.CancelPendingEscape() {
+				s.closeTextArea(false)
+			}
 		case <-ctx.Done():
 			fmt.Fprint(s.out, "\r\n")
 			return nil
@@ -204,111 +217,16 @@ func (s *Shell) runInteractive(ctx context.Context) error {
 				fmt.Fprint(s.out, "\r\n")
 				return nil
 			}
-			if s.multilineMode != "" {
-				res := s.editor.Feed(data)
-				if res.EOF {
-					return nil
+			if s.textArea != nil {
+				action := s.textArea.Feed(data)
+				switch action {
+				case textAreaSave:
+					s.commitTextArea()
+				case textAreaCancel:
+					s.closeTextArea(false)
+				default:
+					s.textArea.Draw(s.pal, unicodeTerminal())
 				}
-				if len(res.Lines) == 0 {
-					if res.Interrupted {
-						s.editor.DrawPrompt()
-					}
-					continue
-				}
-				for _, line := range res.Lines {
-					trimmed := strings.TrimRight(line, "\r\n")
-					if strings.TrimSpace(trimmed) == ":cancel" {
-						s.printf("[CRL] Saisie multiligne annulée. Corps précédent conservé.\n")
-						s.multilineMode = ""
-						s.multilineBuf.Reset()
-						s.multilineInitial = nil
-						s.multilineTargetIDs = nil
-						s.drainNotifications()
-						s.out.reset()
-						s.editor.Reset()
-						s.editor.SetPrompt(s.promptText())
-						s.editor.DrawPrompt()
-						continue
-					}
-					if strings.TrimSpace(trimmed) == ":end" {
-						content := s.multilineBuf.String()
-						if s.multilineMode == "json" {
-							if !json.Valid([]byte(content)) {
-								s.errorf("JSON invalide ; corps précédent conservé")
-							} else if len(s.multilineTargetIDs) > 0 {
-								ok, failed := 0, 0
-								for _, id := range s.multilineTargetIDs {
-									c, found := s.history.Get(id)
-									if !found {
-										failed++
-										s.errorf("requête #%d introuvable", id)
-										continue
-									}
-									b, e := s.requestBuilderFor(c)
-									if e == nil {
-										e = b.SetJSON(content)
-									}
-									if e != nil {
-										failed++
-										s.errorf("requête #%d : %v", id, e)
-									} else {
-										s.requestBodyReplaced[id] = true
-										ok++
-									}
-								}
-								s.printf("[CRL] JSON appliqué : %d réussite(s), %d échec(s).\n", ok, failed)
-							} else {
-								if err := s.builder.SetJSON(content); err != nil {
-									s.errorf("%v", err)
-								} else {
-									s.printf("[CRL] Corps JSON configuré (%d octets).\n", s.builder.BodySize())
-								}
-							}
-						} else if s.multilineMode == "body" {
-							if len(s.multilineTargetIDs) > 0 {
-								ok, failed := 0, 0
-								for _, id := range s.multilineTargetIDs {
-									if c, found := s.history.Get(id); found {
-										if b, e := s.requestBuilderFor(c); e == nil {
-											b.SetBody([]byte(content))
-											s.requestBodyReplaced[id] = true
-											ok++
-											continue
-										} else {
-											s.errorf("requête #%d : %v", id, e)
-										}
-									} else {
-										s.errorf("requête #%d introuvable", id)
-									}
-									failed++
-								}
-								s.printf("[CRL] Corps appliqué : %d réussite(s), %d échec(s).\n", ok, failed)
-							} else {
-								s.builder.SetBody([]byte(content))
-								s.printf("[CRL] Corps brut configuré (%d octets).\n", len(content))
-							}
-						}
-						s.multilineMode = ""
-						s.multilineBuf.Reset()
-						s.multilineInitial = nil
-						s.multilineTargetIDs = nil
-						s.drainNotifications()
-						s.out.reset()
-						s.editor.Reset()
-						s.editor.SetPrompt(s.promptText())
-						s.editor.DrawPrompt()
-						continue
-					}
-					s.multilineBuf.WriteString(line)
-					if !strings.HasSuffix(line, "\n") && !strings.HasSuffix(line, "\r") {
-						s.multilineBuf.WriteString("\n")
-					}
-					s.drainNotifications()
-				}
-				s.out.reset()
-				s.editor.Reset()
-				s.editor.SetPrompt(s.promptText())
-				s.editor.DrawPrompt()
 				continue
 			}
 			res := s.editor.Feed(data)
@@ -329,6 +247,9 @@ func (s *Shell) runInteractive(ctx context.Context) error {
 					exit = true
 					break
 				}
+				if s.textArea != nil {
+					break
+				}
 				if s.out.needsNewline() {
 					fmt.Fprint(s.out, "\r\n")
 				}
@@ -336,6 +257,9 @@ func (s *Shell) runInteractive(ctx context.Context) error {
 			}
 			if exit {
 				return nil
+			}
+			if s.textArea != nil {
+				continue
 			}
 			s.out.reset()
 			s.editor.Reset()
@@ -395,6 +319,10 @@ func (s *Shell) handleNotification(n mint.Notification) {
 	}
 	lines := s.formatNotification(n)
 	if len(lines) == 0 {
+		return
+	}
+	if s.textArea != nil {
+		s.textNotices = append(s.textNotices, lines...)
 		return
 	}
 	if s.editor != nil {
@@ -498,7 +426,7 @@ func (s *Shell) Execute(line string) bool {
 	cmd, rest := splitCommand(line)
 	switch cmd {
 	case "help", "?":
-		s.printHelp()
+		s.printHelp(rest)
 		return false
 	case "exit", "quit":
 		return true
@@ -525,7 +453,7 @@ func (s *Shell) Execute(line string) bool {
 			s.builder.ClearBody()
 			s.printf("[CRL] Corps supprimé.\n")
 		} else if strings.TrimSpace(rest) == "" {
-			s.startMultilineJSON()
+			s.showJSONState()
 		} else if words := shellWords(rest); len(words) > 1 && (strings.EqualFold(words[1], "set") || strings.EqualFold(words[1], "delete") || strings.EqualFold(words[1], "edit") || strings.EqualFold(words[1], "clear")) {
 			s.cmdTargetJSON(rest)
 		} else if strings.HasPrefix(strings.TrimSpace(rest), "set ") {
@@ -540,7 +468,7 @@ func (s *Shell) Execute(line string) bool {
 			s.builder.ClearBody()
 			s.printf("[CRL] Corps supprimé.\n")
 		} else if strings.TrimSpace(rest) == "" {
-			s.startMultilineBody()
+			s.showBodyState()
 		} else if words := shellWords(rest); len(words) > 1 && (strings.EqualFold(words[1], "edit") || strings.EqualFold(words[1], "clear") || strings.EqualFold(words[1], "set")) {
 			s.cmdTargetBody(rest)
 		} else {
@@ -563,6 +491,10 @@ func (s *Shell) Execute(line string) bool {
 		s.cmdOutput(rest)
 	case "mint", "mint.help":
 		s.printMintHelp()
+	case "crl.help":
+		s.printCrlHelp()
+	case "mint.unselect":
+		s.cmdMintUnselect(rest)
 	default:
 		if strings.HasPrefix(cmd, "mint.") {
 			s.executeMint(cmd, rest)
@@ -625,6 +557,8 @@ func (s *Shell) executeMint(cmd, rest string) {
 		s.cmdMintClear(rest)
 	case "mint.use":
 		s.cmdMintUse(rest)
+	case "mint.unselect":
+		s.cmdMintUnselect(rest)
 	default:
 		s.errorf("commande Mint inconnue %q. Tapez mint.help.", cmd)
 	}
@@ -682,7 +616,7 @@ func (s *Shell) cmdHeader(rest string) {
 		}
 		s.printf("[CRL] En-têtes (%d) :\n", len(headers))
 		for _, h := range headers {
-			s.printf("  %s\n", s.headerLine(h.Name, h.Value))
+			s.printf("%s\n", s.headerLine(h.Name, h.Value, "  "))
 		}
 	case strings.EqualFold(rest, "clear"):
 		s.builder.ClearHeaders()
@@ -723,48 +657,39 @@ func (s *Shell) cmdHeaderClear(rest string) {
 	}
 }
 
-func (s *Shell) startMultilineJSON() {
+func (s *Shell) startJSONEditor() {
 	if !s.interactive || s.editor == nil {
-		// Fallback to old behavior if not interactive
 		body := s.builder.Body()
 		if !s.builder.BodySet() {
 			body = []byte("{}\n")
 		}
-		edited, err := editMultiline("crl-json-*.json", body)
-		if err != nil {
-			s.errorf("édition JSON : %v", err)
+		for {
+			edited, err := editMultiline("crl-json-*.json", body)
+			if err != nil {
+				s.errorf("édition JSON : %v ; corps précédent conservé", err)
+				return
+			}
+			if err := validateJSON(edited); err != nil {
+				s.errorf("%v ; le document édité est conservé pour correction", err)
+				body = edited
+				continue
+			}
+			if err := s.builder.SetJSON(string(edited)); err != nil {
+				s.errorf("%v", err)
+				return
+			}
+			s.printf("[CRL] Corps JSON configuré (%d octets).\n", s.builder.BodySize())
 			return
-		}
-		if !json.Valid(edited) {
-			s.errorf("JSON invalide ; corps précédent conservé")
-			return
-		}
-		if err := s.builder.SetJSON(string(edited)); err != nil {
-			s.errorf("%v", err)
-			return
-		}
-		s.printf("[CRL] Corps JSON configuré (%d octets).\n", s.builder.BodySize())
-		return
-	}
-	body := s.builder.Body()
-	if s.builder.BodySet() && len(body) > 0 {
-		preview, _ := display.RenderBody(display.MaskBody(body), 0)
-		s.printf("[CRL] Corps JSON actuel (référence masquée) :\n%s\n", preview)
-		if !strings.HasSuffix(string(body), "\n") {
-			s.printf("\n")
 		}
 	}
-	s.printf("[CRL] Saisie JSON multiligne en cours. Tapez votre JSON ligne par ligne. Terminez par une ligne isolée ':end'. Annulez avec ':cancel'.\n")
-	s.printf("[CRL] La saisie fournira un nouveau document JSON complet.\n")
-	s.multilineMode = "json"
-	s.multilineBuf.Reset()
-	s.out.reset()
-	s.editor.Reset()
-	s.editor.SetPrompt(s.promptText())
-	s.editor.DrawPrompt()
+	initial := s.builder.Body()
+	if !s.builder.BodySet() || len(initial) == 0 {
+		initial = []byte("{}\n")
+	}
+	s.openTextArea("json", s.builder, 0, initial)
 }
 
-func (s *Shell) startMultilineBody() {
+func (s *Shell) startBodyEditor() {
 	if !s.interactive || s.editor == nil {
 		body := s.builder.Body()
 		if !s.builder.BodySet() {
@@ -779,21 +704,145 @@ func (s *Shell) startMultilineBody() {
 		s.printf("[CRL] Corps brut configuré (%d octets).\n", len(edited))
 		return
 	}
-	body := s.builder.Body()
-	if s.builder.BodySet() && len(body) > 0 {
-		preview, _ := display.RenderBody(display.MaskBody(body), 0)
-		s.printf("[CRL] Corps actuel (référence masquée) :\n%s\n", preview)
-		if !strings.HasSuffix(string(body), "\n") {
-			s.printf("\n")
+	initial := s.builder.Body()
+	s.openTextArea("body", s.builder, 0, initial)
+	return
+}
+
+func (s *Shell) openTextArea(kind string, b *request.Builder, targetID int, initial []byte) {
+	if !s.interactive || s.editor == nil {
+		pattern := "crl-body-*"
+		if kind == "json" {
+			pattern = "crl-json-*.json"
+		}
+		content := append([]byte(nil), initial...)
+		for {
+			edited, err := editMultiline(pattern, content)
+			if err != nil {
+				s.errorf("édition : %v ; corps précédent conservé", err)
+				return
+			}
+			if kind == "json" {
+				if err := validateJSON(edited); err != nil {
+					s.errorf("%v ; le document édité est conservé pour correction", err)
+					content = edited
+					continue
+				}
+				if err := b.SetJSON(string(edited)); err != nil {
+					s.errorf("%v", err)
+					return
+				}
+			} else {
+				b.SetBody(edited)
+			}
+			if targetID > 0 {
+				s.requestBodyReplaced[targetID] = true
+			}
+			s.printf("[CRL] Corps %s appliqué (%d octets).\n", kind, len(edited))
+			return
 		}
 	}
-	s.printf("[CRL] Saisie multiligne en cours (JSON/XML/texte). Tapez votre contenu ligne par ligne. Terminez par une ligne isolée ':end'. Annulez avec ':cancel'.\n")
-	s.multilineMode = "body"
-	s.multilineBuf.Reset()
+	target := "constructeur actif"
+	title := "CRL JSON EDITOR"
+	if kind == "body" {
+		title = "CRL BODY EDITOR"
+	}
+	if kind == "json" && len(initial) == 0 {
+		initial = []byte("{}\n")
+	}
+	if targetID > 0 {
+		target = fmt.Sprintf("requête #%d", targetID)
+	}
+	s.textKind, s.textBuilder, s.textTarget = kind, b, targetID
+	s.textArea = newTextArea(s.out, title, target, initial)
+	if f, ok := s.in.(*os.File); ok {
+		s.textArea.SetSize(terminalWidth(f.Fd()), terminalHeight(f.Fd()))
+	}
 	s.out.reset()
-	s.editor.Reset()
-	s.editor.SetPrompt(s.promptText())
-	s.editor.DrawPrompt()
+	s.textArea.Draw(s.pal, unicodeTerminal())
+}
+
+func (s *Shell) commitTextArea() {
+	content := []byte(s.textArea.Text())
+	if s.textKind == "json" {
+		if err := validateJSON(content); err != nil {
+			s.textArea.message = err.Error()
+			s.textArea.Draw(s.pal, unicodeTerminal())
+			return
+		}
+		if err := s.textBuilder.SetJSON(string(content)); err != nil {
+			s.textArea.message = err.Error()
+			s.textArea.Draw(s.pal, unicodeTerminal())
+			return
+		}
+	} else {
+		s.textBuilder.SetBody(content)
+	}
+	if s.textTarget > 0 {
+		s.requestBodyReplaced[s.textTarget] = true
+		s.textResult = fmt.Sprintf("[CRL] Corps de la requête #%d modifié (%d octets).", s.textTarget, len(content))
+	} else {
+		s.textResult = fmt.Sprintf("[CRL] Corps %s appliqué (%d octets).", map[string]string{"json": "JSON", "body": "brut"}[s.textKind], len(content))
+	}
+	s.closeTextArea(true)
+}
+
+func (s *Shell) closeTextArea(applied bool) {
+	if s.textArea == nil {
+		return
+	}
+	// Clear the editor panel from its saved origin without changing terminal
+	// mode; the shell has owned raw mode continuously and keeps its input reader.
+	fmt.Fprint(s.out, "\033[u\033[J")
+	s.textArea = nil
+	s.textBuilder = nil
+	s.textKind = ""
+	s.textTarget = 0
+	s.out.reset()
+	if applied && s.textResult != "" {
+		s.printf("%s\n", s.textResult)
+		s.textResult = ""
+	} else if !applied {
+		s.printf("[CRL] Édition annulée ; corps précédent conservé.\n")
+	}
+	if s.editor != nil {
+		s.editor.Reset()
+		s.editor.SetPrompt(s.promptText())
+		for _, line := range s.textNotices {
+			s.editor.PrintLines([]string{line})
+		}
+		s.textNotices = nil
+		s.editor.DrawPrompt()
+	}
+}
+
+func validateJSON(data []byte) error {
+	var value json.RawMessage
+	if err := json.Unmarshal(data, &value); err != nil {
+		var syntax *json.SyntaxError
+		if errors.As(err, &syntax) {
+			prefix := data[:maxInt(0, minInt(int(syntax.Offset)-1, len(data)))]
+			line := strings.Count(string(prefix), "\n") + 1
+			lastNL := strings.LastIndexByte(string(prefix), '\n')
+			column := len([]rune(string(prefix[lastNL+1:]))) + 1
+			return fmt.Errorf("JSON invalide, ligne %d colonne %d : %s", line, column, syntax.Error())
+		}
+		return fmt.Errorf("JSON invalide : %w", err)
+	}
+	return nil
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (s *Shell) cmdJSONSet(rest string) {
@@ -836,14 +885,7 @@ func (s *Shell) cmdTargetJSON(rest string) {
 			s.errorf("%v", e)
 			return
 		}
-		previous := s.builder
-		s.builder = b
-		s.multilineTargetIDs = []int{captures[0].ID}
-		s.startMultilineJSON()
-		s.builder = previous
-		if s.multilineMode == "" {
-			s.multilineTargetIDs = nil
-		}
+		s.openTextArea("json", b, captures[0].ID, b.Body())
 	case "clear":
 		s.applyCaptureChanges(captures, func(b *request.Builder) error { b.ClearBody(); return nil })
 		for _, c := range captures {
@@ -894,14 +936,7 @@ func (s *Shell) cmdTargetBody(rest string) {
 			s.errorf("%v", e)
 			return
 		}
-		previous := s.builder
-		s.builder = b
-		s.multilineTargetIDs = []int{captures[0].ID}
-		s.startMultilineBody()
-		s.builder = previous
-		if s.multilineMode == "" {
-			s.multilineTargetIDs = nil
-		}
+		s.openTextArea("body", b, captures[0].ID, b.Body())
 	default:
 		s.errorf("opération de corps inconnue : %s", words[1])
 	}
@@ -1046,6 +1081,26 @@ func (s *Shell) cmdBody(rest string) {
 	s.printf("[CRL] Corps brut configuré (%d octets).\n", s.builder.BodySize())
 }
 
+func (s *Shell) showJSONState() {
+	body := s.builder.Body()
+	if !s.builder.BodySet() || len(body) == 0 {
+		s.printf("[CRL] Aucun JSON configuré. usage : crl.json <JSON>\n")
+		return
+	}
+	s.printf("[CRL] JSON actuel (%d octets) :\n", len(body))
+	s.printIndented(string(body), "  ")
+}
+
+func (s *Shell) showBodyState() {
+	body := s.builder.Body()
+	if !s.builder.BodySet() || len(body) == 0 {
+		s.printf("[CRL] Aucun corps configuré. usage : crl.body <texte>\n")
+		return
+	}
+	s.printf("[CRL] Corps actuel (%d octets) :\n", len(body))
+	s.printIndented(string(body), "  ")
+}
+
 func (s *Shell) cmdProxy(rest string) {
 	switch {
 	case rest == "":
@@ -1174,7 +1229,7 @@ func (s *Shell) cmdShow(rest string) {
 	res := s.proxyResolution()
 	s.printf("%s\n", p.BoldGreen("[CRL] Requête préparée"))
 	s.printf("%s\n", p.Dim("Aucune requête envoyée — utilisez crl.launch pour l'exécuter."))
-	s.rule(78)
+	s.rule(s.termWidth())
 	s.field("Méthode", p.Method(s.builder.Method()))
 	s.field("URL", p.Cyan(display.MaskURL(sanitizeTerminal(s.builder.URL()))))
 	if s.activeMintID > 0 {
@@ -1191,7 +1246,7 @@ func (s *Shell) cmdShow(rest string) {
 		s.printf("    %s\n", p.Dim("(aucun)"))
 	} else {
 		for _, h := range headers {
-			s.printf("    %s\n", s.headerLine(h.Name, h.Value))
+			s.printf("%s\n", s.headerLine(h.Name, h.Value, "    "))
 		}
 	}
 	if s.builder.BodySet() {
@@ -1205,7 +1260,7 @@ func (s *Shell) cmdShow(rest string) {
 		s.printf("\n  %s\n", p.BoldCyan("Corps (vide / non défini)"))
 	}
 	s.printf("\n")
-	s.rule(78)
+	s.rule(s.termWidth())
 	s.printf("%s\n", p.Dim("crl.launch pour envoyer · crl.table pour un résumé"))
 }
 
@@ -1255,35 +1310,51 @@ func (s *Shell) showCapture(c mint.Capture, offset int) {
 		s.errorf("requête #%d : %v", c.ID, err)
 		return
 	}
-	s.printf("\n╭─ REQUEST #%d ───────────────────────────────────────────\n", c.ID)
-	s.printf("│ Méthode : %s\n│ URL     : %s\n│ Source  : Mint · capture #%d\n│ Capturée: %s\n", p.Method(b.Method()), display.MaskURL(sanitizeTerminal(b.URL())), c.ID, c.StartedAt.Local().Format("2006-01-02 15:04:05.000"))
+
+	width := s.termWidth()
+	title := fmt.Sprintf(" REQUEST #%d ", c.ID)
+	top := "╭─" + title + strings.Repeat("─", max(0, width-display.VisibleWidth("╭─"+title)))
+	bottom := "╰" + strings.Repeat("─", max(0, width-1))
+
+	s.printf("\n%s\n", top)
+	s.printf("%s\n", s.headerLine("Méthode", p.Method(b.Method()), "│ "))
+	s.printf("%s\n", s.headerLine("URL", display.MaskURL(sanitizeTerminal(b.URL())), "│ "))
+	s.printf("%s\n", s.headerLine("Source", fmt.Sprintf("Mint · capture #%d", c.ID), "│ "))
+	s.printf("%s\n", s.headerLine("Capturée", c.StartedAt.Local().Format("2006-01-02 15:04:05.000"), "│ "))
+
 	u, _ := url.Parse(b.URL())
 	if u != nil {
-		s.printf("│ Chemin  : %s\n", display.MaskURL(sanitizeTerminal(u.EscapedPath()+func() string {
-			if u.RawQuery != "" {
-				return "?" + u.RawQuery
-			}
-			return ""
-		}())))
+		pathStr := u.EscapedPath()
+		if pathStr == "" {
+			pathStr = "/"
+		}
+		if u.RawQuery != "" {
+			pathStr += "?" + u.RawQuery
+		}
+		s.printf("%s\n", s.headerLine("Chemin", display.MaskURL(sanitizeTerminal(pathStr)), "│ "))
 	}
+
 	headers := b.Headers()
 	ctype := ""
-	s.printf("│\n│ EN-TÊTES (%d)\n", len(headers))
+	s.printf("│\n")
+	s.printf("│ EN-TÊTES (%d)\n", len(headers))
 	if len(headers) == 0 {
 		s.printf("│   (aucun)\n")
 	}
 	for _, h := range headers {
-		s.printf("│   %s\n", s.headerLine(h.Name, h.Value))
+		s.printf("%s\n", s.headerLine(h.Name, h.Value, "│   "))
 		if strings.EqualFold(h.Name, "Content-Type") {
 			ctype = h.Value
 		}
 	}
 	if ctype != "" {
-		s.printf("│ Type de contenu : %s\n", sanitizeTerminal(ctype))
+		s.printf("%s\n", s.headerLine("Type de contenu", sanitizeTerminal(ctype), "│ "))
 	}
+
 	body := b.Body()
 	displayBody := display.MaskBody(body)
-	s.printf("│\n│ CORPS (%s)\n", display.FormatBytes(int64(len(body))))
+	s.printf("│\n")
+	s.printf("│ CORPS (%s)\n", display.FormatBytes(int64(len(body))))
 	if c.Request.BodyTruncated {
 		s.printf("│   [capture tronquée : %d octets conservés sur %d]\n", len(body), c.Request.BodySize)
 	}
@@ -1299,8 +1370,11 @@ func (s *Shell) showCapture(c mint.Capture, offset int) {
 			}
 			page := displayBody[offset:end]
 			rendered, _ := display.RenderBody(page, 0)
+			bodyWidth := max(10, width-4)
 			for _, line := range strings.Split(rendered, "\n") {
-				s.printf("│   %s\n", line)
+				for _, wline := range display.WrapText(line, bodyWidth) {
+					s.printf("│   %s\n", wline)
+				}
 			}
 			if end < len(displayBody) {
 				s.printf("│   […] octets affichés %d-%d sur %d · suite : crl.show %d body %d\n", offset, end, len(displayBody), c.ID, end)
@@ -1311,11 +1385,14 @@ func (s *Shell) showCapture(c mint.Capture, offset int) {
 		}
 	} else {
 		rendered, _ := display.RenderBody(displayBody, 0)
+		bodyWidth := max(10, width-4)
 		for _, line := range strings.Split(rendered, "\n") {
-			s.printf("│   %s\n", line)
+			for _, wline := range display.WrapText(line, bodyWidth) {
+				s.printf("│   %s\n", wline)
+			}
 		}
 	}
-	s.printf("╰──────────────────────────────────────────────────────────\n")
+	s.printf("%s\n", bottom)
 }
 
 func (s *Shell) cmdTable() {
@@ -1336,18 +1413,26 @@ func (s *Shell) cmdTable() {
 						names = append(names, sanitizeTerminal(h.Name))
 					}
 					s.printf("\n  %s\n", p.BoldCyan(fmt.Sprintf("En-têtes (%d)", len(c.Request.Headers))))
-					s.printf("  %s\n", p.Dim(strings.Join(names, ", ")))
+					namesStr := strings.Join(names, ", ")
+					for _, line := range display.WrapText(namesStr, s.termWidth()-4) {
+						s.printf("  %s\n", p.Dim(line))
+					}
 					s.printf("  %s\n", p.Dim("crl.show affiche le détail complet des valeurs."))
 				}
 				return
 			}
 			s.printf("%s\n", p.BoldGreen(fmt.Sprintf("[CRL] Tableau des requêtes sélectionnées (%d)", len(selected))))
-			s.rule(78)
+			s.rule(s.termWidth())
 			for _, c := range selected {
-				s.printf("  #%d %s %s\n", c.ID, p.Method(c.Request.Method), p.Cyan(display.MaskURL(c.Request.URL)))
+				urlStr := display.MaskURL(c.Request.URL)
+				urlLines := display.WrapText(urlStr, max(20, s.termWidth()-10))
+				s.printf("  #%d %s %s\n", c.ID, p.Method(c.Request.Method), p.Cyan(urlLines[0]))
+				for _, cont := range urlLines[1:] {
+					s.printf("          %s\n", p.Cyan(cont))
+				}
 				s.printf("     %d en-tête(s), %d octet(s)\n", len(c.Request.Headers), len(c.Request.Body))
 			}
-			s.rule(78)
+			s.rule(s.termWidth())
 			s.printf("%s\n", p.Dim("crl.show pour le détail · crl.launch/mint.replay pour exécuter"))
 			return
 		}
@@ -1375,7 +1460,10 @@ func (s *Shell) cmdTable() {
 			names = append(names, sanitizeTerminal(h.Name))
 		}
 		s.printf("\n  %s\n", p.BoldCyan(fmt.Sprintf("En-têtes (%d)", len(headers))))
-		s.printf("  %s\n", p.Dim(strings.Join(names, ", ")))
+		namesStr := strings.Join(names, ", ")
+		for _, line := range display.WrapText(namesStr, s.termWidth()-4) {
+			s.printf("  %s\n", p.Dim(line))
+		}
 		s.printf("  %s\n", p.Dim("crl.show affiche le détail complet des valeurs."))
 	}
 }
@@ -1449,7 +1537,7 @@ func (s *Shell) launchWithBuilder(b *request.Builder, args []string, res request
 
 	p := s.pal
 	s.printf("%s\n", p.BoldGreen("[CRL] Requête envoyée"))
-	s.rule(78)
+	s.rule(s.termWidth())
 	s.field("Méthode", p.Method(b.Method()))
 	s.field("URL", p.Cyan(display.MaskURL(sanitizeTerminal(b.URL()))))
 	s.field("Proxy", s.proxyValue(res))
@@ -1614,7 +1702,7 @@ func (s *Shell) printTransportFailure(failure response.CurlFailure) {
 		title = "Erreur de connexion"
 	}
 	s.printf("\n%s\n", p.BoldRed("[CRL] "+title))
-	s.rule(78)
+	s.rule(s.termWidth())
 	s.field("Type", p.BoldRed(failure.Label))
 	s.field("Code curl", p.Bold(strconv.Itoa(failure.Code)))
 	s.field("Statut HTTP", p.Dim("aucune réponse HTTP reçue"))
@@ -1631,7 +1719,7 @@ func (s *Shell) printHTTPResponse(status response.Status, headers response.Heade
 func (s *Shell) printHTTPResponseWithBuilder(b *request.Builder, status response.Status, headers response.Headers, meta response.CurlMeta, body []byte, total int64, bodyPath string) {
 	p := s.pal
 	s.printf("\n%s\n", p.BoldGreen("[CRL] Réponse HTTP"))
-	s.rule(78)
+	s.rule(s.termWidth())
 	s.field("Statut", p.StatusCode(status.Code, sanitizeTerminal(status.Label())))
 	s.field("Méthode", p.Method(b.Method()))
 	s.field("URL demandée", p.Cyan(display.MaskURL(sanitizeTerminal(b.URL()))))
@@ -1652,7 +1740,7 @@ func (s *Shell) printHTTPResponseWithBuilder(b *request.Builder, status response
 		s.printf("    %s\n", p.Dim("(aucun)"))
 	} else {
 		for _, h := range headers {
-			s.printf("    %s\n", s.headerLine(h.Name, h.Value))
+			s.printf("%s\n", s.headerLine(h.Name, h.Value, "    "))
 		}
 	}
 	s.printResponseBody(body, total, bodyPath, headers.ContentType())
@@ -1792,7 +1880,7 @@ func (s *Shell) cmdMintConfig() {
 	}
 
 	s.printf("%s\n", p.BoldMagenta("[Mint] Configuration du proxy"))
-	s.rule(78)
+	s.rule(s.termWidth())
 	s.field("État Mint", proxyStateBadge(p, st))
 	s.field("Processus", processStateText(p, st.State))
 	s.field("Écoute", p.Cyan(mint.ListenAddress(st.ListenHost, st.Port)))
@@ -1883,14 +1971,34 @@ func (s *Shell) cmdMintRequests(all bool) {
 		return
 	}
 	p := s.pal
-	const (
-		idWidth     = 4
-		methodWidth = 7
-		hostWidth   = 26
-		pathWidth   = 42
-		statusWidth = 8
-		durWidth    = 9
-	)
+	width := s.termWidth()
+
+	// Largeurs de colonnes adaptatives : ID, MÉTHODE, STATUT et DURÉE ont des
+	// largeurs fixes minimales ; l'espace restant est partagé entre HÔTE et CHEMIN.
+	idWidth := 4
+	methodWidth := 7
+	statusWidth := 8
+	durWidth := 9
+	sepWidth := 10 // 5 séparateurs de 2 caractères
+
+	minTotal := idWidth + methodWidth + statusWidth + durWidth + sepWidth
+	if width < minTotal {
+		width = minTotal
+	}
+	remaining := width - minTotal
+	hostWidth := remaining / 2
+	if hostWidth > 26 {
+		hostWidth = 26
+	}
+	pathWidth := remaining - hostWidth
+	if pathWidth < 10 {
+		pathWidth = 10
+		hostWidth = remaining - pathWidth
+		if hostWidth < 5 {
+			hostWidth = 5
+		}
+	}
+
 	header := fmt.Sprintf("%s  %s  %s  %s  %s  %s",
 		padCell("ID", idWidth),
 		padCell("MÉTHODE", methodWidth),
@@ -1899,7 +2007,7 @@ func (s *Shell) cmdMintRequests(all bool) {
 		padCell("STATUT", statusWidth),
 		padCell("DURÉE", durWidth))
 	s.printf("%s\n", p.Bold(header))
-	s.rule(idWidth + methodWidth + hostWidth + pathWidth + statusWidth + durWidth + 10)
+	s.rule(width)
 	for _, c := range captures {
 		host := c.Request.Host
 		if host == "" {
@@ -1946,7 +2054,7 @@ func (s *Shell) cmdMintShow(rest string) {
 		p.Method(c.Request.Method),
 		captureStatus(p, c, c.StatusLabelText()),
 		p.Dim(c.DurationLabel()))
-	s.rule(78)
+	s.rule(s.termWidth())
 	if c.FlowID != "" {
 		s.field("Flux", p.Dim(c.FlowID))
 	}
@@ -1969,7 +2077,7 @@ func (s *Shell) cmdMintShow(rest string) {
 			s.printf("      %s\n", p.Dim("(aucun)"))
 		} else {
 			for _, h := range c.Request.Headers {
-				s.printf("      %s\n", s.headerLine(h.Name, h.Value))
+				s.printf("%s\n", s.headerLine(h.Name, h.Value, "      "))
 			}
 		}
 		s.printf("    %s\n", p.BoldCyan(fmt.Sprintf("Corps (%d octets%s)", len(c.Request.Body), truncatedSuffix(c.Request.BodyTruncated, c.Request.BodySize))))
@@ -1985,7 +2093,7 @@ func (s *Shell) cmdMintShow(rest string) {
 			s.printf("      %s\n", p.Dim("(aucun)"))
 		} else {
 			for _, h := range c.Response.Headers {
-				s.printf("      %s\n", s.headerLine(h.Name, h.Value))
+				s.printf("%s\n", s.headerLine(h.Name, h.Value, "      "))
 			}
 		}
 		s.printf("    %s\n", p.BoldCyan(fmt.Sprintf("Corps (%d octets%s)", len(c.Response.Body), truncatedSuffix(c.Response.BodyTruncated, c.Response.BodySize))))
@@ -2070,7 +2178,12 @@ func (s *Shell) printSelected(captures []mint.Capture) {
 	p := s.pal
 	s.printf("[Mint] Sélection persistante (%d) — aucune requête envoyée :\n", len(captures))
 	for _, c := range captures {
-		s.printf("  #%d %s %s%s\n", c.ID, p.Method(c.Request.Method), c.Request.Host, p.Cyan(display.MaskURL(c.PathAndQuery())))
+		urlStr := display.MaskURL(c.PathAndQuery())
+		urlLines := display.WrapText(urlStr, max(20, s.termWidth()-20))
+		s.printf("  #%d %s %s%s\n", c.ID, p.Method(c.Request.Method), c.Request.Host, p.Cyan(urlLines[0]))
+		for _, cont := range urlLines[1:] {
+			s.printf("          %s\n", p.Cyan(cont))
+		}
 	}
 }
 
@@ -2202,7 +2315,7 @@ func (s *Shell) cmdTargetHeader(words []string) {
 			}
 			s.printf("[CRL] En-têtes de #%d (%d) :\n", c.ID, len(b.Headers()))
 			for _, h := range b.Headers() {
-				s.printf("  %s\n", s.headerLine(h.Name, h.Value))
+				s.printf("%s\n", s.headerLine(h.Name, h.Value, "  "))
 			}
 		}
 		return
@@ -2398,14 +2511,24 @@ func (s *Shell) cmdMintReplay(rest string) {
 			status = "ERREUR"
 			detail = r.err.Error()
 		}
-		s.printf("  #%d  %-7s  %-7s  %-8s %s\n", r.id, r.method, status, r.duration, sanitizeTerminal(detail))
+		prefix := fmt.Sprintf("  #%d  %-7s  %-7s  %-8s ", r.id, r.method, status, r.duration)
+		detailLines := display.WrapText(detail, s.termWidth()-len(prefix))
+		s.printf("%s%s\n", prefix, detailLines[0])
+		for _, cont := range detailLines[1:] {
+			s.printf("%s%s\n", strings.Repeat(" ", len(prefix)), cont)
+		}
 	}
 	for _, r := range results {
 		if r.bodyPath != "" {
 			s.replayBodies[r.id] = r.bodyPath
 			s.replayDirs = append(s.replayDirs, filepath.Dir(r.bodyPath))
 		}
-		s.printf("\n[Mint] Réponse du rejeu #%d — %s %s\n", r.id, r.method, display.MaskURL(sanitizeTerminal(r.url)))
+		urlStr := display.MaskURL(sanitizeTerminal(r.url))
+		urlLines := display.WrapText(urlStr, max(20, s.termWidth()-10))
+		s.printf("\n[Mint] Réponse du rejeu #%d — %s %s\n", r.id, r.method, urlLines[0])
+		for _, cont := range urlLines[1:] {
+			s.printf("          %s\n", cont)
+		}
 		if r.err != nil {
 			s.printf("  Erreur : %s\n", sanitizeTerminal(r.err.Error()))
 			continue
@@ -2496,7 +2619,7 @@ func (s *Shell) replayCapture(ctx context.Context, c mint.Capture) (error, strin
 	var details strings.Builder
 	details.WriteString("  En-têtes de réponse:\n")
 	for _, h := range parsedHeaders {
-		details.WriteString("    " + s.headerLine(h.Name, h.Value) + "\n")
+		details.WriteString(s.headerLine(h.Name, h.Value, "    ") + "\n")
 	}
 	details.WriteString("  Corps:\n")
 	for _, line := range strings.Split(view.Text, "\n") {
@@ -2746,6 +2869,32 @@ func (s *Shell) cmdMintUse(rest string) {
 	s.printf("[Mint] Aucune requête envoyée. Utilisez crl.show puis crl.launch.\n")
 }
 
+func (s *Shell) cmdMintUnselect(rest string) {
+	rest = strings.TrimSpace(rest)
+	if strings.EqualFold(rest, "all") || rest == "" {
+		s.history.ClearSelection()
+		s.printf("[Mint] Sélection effacée.\n")
+		return
+	}
+	words := strings.Fields(rest)
+	if len(words) != 1 {
+		s.errorf("usage : mint.unselect <id>|all")
+		return
+	}
+	id, err := parseID(words[0])
+	if err != nil {
+		s.errorf("%v", err)
+		return
+	}
+	s.history.RemoveSelection([]int{id})
+	remaining := s.history.SelectedMany()
+	if len(remaining) > 0 {
+		s.printSelected(remaining)
+	} else {
+		s.printf("[Mint] Requête #%d retirée de la sélection. Sélection vide.\n", id)
+	}
+}
+
 func (s *Shell) proxyResolution() request.ProxyResolution {
 	mintURL, active := s.manager.ProxyURL()
 	return s.builder.ResolveProxy(mintURL, active)
@@ -2870,7 +3019,24 @@ func unicodeTerminal() bool {
 }
 
 func (s *Shell) field(label, value string) {
-	fmt.Fprintf(s.out, "  %s : %s\n", s.pal.BoldCyan(padCell(label, 17)), value)
+	p := s.pal
+	width := s.termWidth()
+	labelPadded := padCell(label, 17)
+	labelVisible := display.VisibleWidth(labelPadded)
+	valueStart := 2 + labelVisible + 3 // "  " + label + " : "
+	available := width - valueStart
+	if available < 10 {
+		available = 10
+	}
+	lines := display.WrapText(value, available)
+	indent := strings.Repeat(" ", valueStart)
+	for i, line := range lines {
+		if i == 0 {
+			fmt.Fprintf(s.out, "  %s : %s\n", p.BoldCyan(labelPadded), line)
+		} else {
+			fmt.Fprintf(s.out, "%s%s\n", indent, line)
+		}
+	}
 }
 
 func (s *Shell) rule(width int) {
@@ -2884,48 +3050,33 @@ func (s *Shell) headerValue(name, value string) string {
 	return sanitizeTerminal(display.MaskHeaderValue(name, value))
 }
 
-func (s *Shell) headerLine(name, value string) string {
-	prefix := s.pal.BoldCyan(sanitizeTerminal(name)) + s.pal.Dim(": ")
+func (s *Shell) headerLine(name, value string, outerPrefix string) string {
+	p := s.pal
+	nameClean := sanitizeTerminal(name)
+	nameVisible := display.VisibleWidth(nameClean)
+	prefix := p.BoldCyan(nameClean) + p.Dim(": ")
 	clean := s.headerValue(name, value)
-	width := 80
-	if columns, err := strconv.Atoi(os.Getenv("COLUMNS")); err == nil && columns > 0 {
-		width = columns
+
+	width := s.termWidth()
+	totalPrefix := display.VisibleWidth(outerPrefix) + nameVisible + 2
+	available := width - totalPrefix
+	if available < 10 {
+		available = 10
 	}
-	if f, ok := s.out.w.(*os.File); ok {
-		width = terminalWidth(f.Fd())
-	}
-	available := width - utf8.RuneCountInString(name) - 4
-	if available < 16 {
-		available = 16
-	}
+
+	lines := display.WrapText(clean, available)
+	valueIndent := outerPrefix + strings.Repeat(" ", nameVisible+2)
+
 	var b strings.Builder
-	for i, line := range strings.Split(clean, "\n") {
-		if i > 0 {
-			b.WriteString("\n    ")
-		}
-		if utf8.RuneCountInString(line) <= available {
-			b.WriteString(line)
-			continue
-		}
-		for len(line) > 0 {
-			n := available
-			if n > len(line) {
-				n = len(line)
-			}
-			for n > 0 && n < len(line) && !utf8.RuneStart(line[n]) {
-				n--
-			}
-			if n == 0 {
-				n = available
-			}
-			b.WriteString(line[:n])
-			line = line[n:]
-			if len(line) > 0 {
-				b.WriteString("\n    ")
-			}
-		}
+	b.WriteString(outerPrefix)
+	b.WriteString(prefix)
+	b.WriteString(lines[0])
+	for i := 1; i < len(lines); i++ {
+		b.WriteString("\n")
+		b.WriteString(valueIndent)
+		b.WriteString(lines[i])
 	}
-	return prefix + b.String()
+	return b.String()
 }
 
 func proxyResolutionText(res request.ProxyResolution) string {
@@ -2985,90 +3136,86 @@ func (s *Shell) confirm(question string) bool {
 	return answer == "y" || answer == "yes" || answer == "o" || answer == "oui"
 }
 
-func (s *Shell) printHelp() {
-	s.printf(`Commandes CRL-CLI
-  crl.host <url>              Définir l'URL ; sans argument, l'afficher
-	  crl.method <méthode>        Définir la méthode active
-	  crl.method <méthode> set <cible> Modifier la méthode des captures Mint
-	  crl.head/header <Nom: val>  Ajouter/remplacer un en-tête actif
-	  crl.head set <cible> <Nom> <valeur> Modifier l'en-tête des captures
-	  crl.head delete <cible> <Nom> Supprimer l'en-tête des captures
-	  crl.json <cible> set|delete ... Modifier un champ JSON de capture
-	  crl.body <cible> edit|set|clear Éditer le corps d'une capture
-  crl.head                    Lister les en-têtes et leurs valeurs
-  crl.head clear [Nom]        Supprimer un en-tête ou tous les en-têtes
-  crl.head.clear [Nom]        Alias de suppression (aussi crl.header.clear)
-	  crl.json [json]|clear       Éditer (sans argument), définir ou effacer le JSON
-	  crl.body [texte|clear]      Éditer le corps brut sans argument
-  crl.body.clear              Alias pour effacer le corps
-  crl.proxy <url|none|auto>   Définir le proxy (off=none ; clear/unset=auto)
-  crl.proxy                   Afficher le proxy explicite et effectif
-  crl.ca [fichier|off]        Définir/afficher le CA PEM (off/none/clear : système)
-	  crl.show [id|active [body offset]] Afficher les requêtes détaillées
-  crl.table                   Résumé avec valeurs d'URL sensibles masquées
-  crl.output [auto|raw|pretty] Choisir le rendu du corps des réponses
-	  crl.launch [cibles|active]  Envoyer la sélection, les cibles ou l'actif
-  reset                       Réinitialiser le constructeur
-  clear                       Effacer l'écran en mode interactif
-  help | ?                    Afficher cette aide
-  exit | quit                 Quitter et arrêter proprement Mint
+func (s *Shell) helpWidth() int {
+	if f, ok := s.out.w.(*os.File); ok {
+		return terminalWidth(f.Fd())
+	}
+	return 80
+}
 
-Commandes Mint (aide détaillée : mint.help)
-  mint.proxy [status]         Afficher l'état du proxy
-  mint.proxy on|start          Démarrer le proxy ; off|stop l'arrêter
-  mint.proxy config            Configuration effective et prérequis
-  mint.proxy.port <port>       Changer le port lorsque le proxy est arrêté
-  mint.requests                Lister les captures selon le filtre courant
-  mint.history                 Lister toutes les captures, sans filtre
-  mint.watch [on|off]           Activer/suspendre les notifications, ou afficher l'état
-  mint.events                  Afficher et vider les notifications mises en attente
-  mint.request.show <id>       Détail complet (alias : mint.show)
-	  mint.select <ids>|all         Sélectionner ; add/remove/clear modifient la sélection
-	  mint.replay [cibles]         Rejouer en parallèle (IDs, selected ou all)
-	  mint.replay.body <id> [offset] Lire une page du corps d'une réponse
-  mint.selected                Afficher la capture sélectionnée
-  mint.filter <texte|clear>    Filtrer par hôte, URL, chemin ou query string
-  mint.clear [--yes|-y]        Vider l'historique (confirmation sauf avec --yes)
-  mint.use [id] [--force]      Importer dans CRL sans envoyer la requête
-  mint | mint.help             Afficher l'aide détaillée de Mint
-`)
+// termWidth retourne la largeur du terminal en colonnes. Il consulte d'abord
+// la variable COLUMNS, puis l'ioctl du terminal, puis retourne 80 par défaut.
+func (s *Shell) termWidth() int {
+	if w := os.Getenv("COLUMNS"); w != "" {
+		if n, err := strconv.Atoi(w); err == nil && n > 10 {
+			return n
+		}
+	}
+	if f, ok := s.out.w.(*os.File); ok {
+		return terminalWidth(f.Fd())
+	}
+	return 80
+}
+
+// boxWidth retourne la largeur maximale à utiliser pour un cadre, bornée
+// entre 40 et 200 colonnes.
+func (s *Shell) boxWidth() int {
+	w := s.termWidth()
+	if w < 40 {
+		return 40
+	}
+	if w > 200 {
+		return 200
+	}
+	return w
+}
+
+func (s *Shell) printHelp(query string) {
+	if query == "" {
+		s.printGeneralHelp()
+		return
+	}
+	if !renderHelp(s.out, s.pal, query, unicodeTerminal(), s.helpWidth()) {
+		s.errorf("aucune aide trouvée pour %q ; utilisez help pour la liste des commandes", query)
+	}
+}
+
+func (s *Shell) printGeneralHelp() {
+	p := s.pal
+	fmt.Fprintf(s.out, "\n%s\n", p.BoldCyan("╭─ CRL-CLI "))
+	fmt.Fprintf(s.out, "%s\n", p.Bold("│  CRL-CLI — client HTTP en ligne de commande avec proxy de capture Mint"))
+	fmt.Fprintf(s.out, "%s\n", p.Cyan("╰─────────────────────────────────────────────────────────────────────────────"))
+	fmt.Fprintf(s.out, "\n%s\n", p.BoldBlue("PRÉSENTATION"))
+	fmt.Fprintf(s.out, "  %s\n", p.Dim("CRL  : construire et envoyer des requêtes HTTP (crl.host, crl.method, crl.head, crl.json, crl.body, crl.launch)."))
+	fmt.Fprintf(s.out, "  %s\n", p.Dim("Mint : capturer le trafic HTTP via un proxy local, sélectionner et rejouer des requêtes (mint.proxy, mint.requests, mint.select, mint.replay)."))
+	fmt.Fprintf(s.out, "\n%s\n", p.BoldBlue("AIDE DÉTAILLÉE"))
+	fmt.Fprintf(s.out, "  %s  %s\n", p.Cyan("crl.help"), p.Dim("toutes les commandes CRL (construction, envoi, inspection)."))
+	fmt.Fprintf(s.out, "  %s  %s\n", p.Cyan("mint.help"), p.Dim("toutes les commandes Mint (capture, sélection, rejeu, proxy)."))
+	fmt.Fprintf(s.out, "\n%s\n", p.BoldBlue("WORKFLOW TYPIQUE"))
+	fmt.Fprintf(s.out, "  %s\n", p.Dim("1. crl.host <url>        — définir l'URL cible"))
+	fmt.Fprintf(s.out, "  %s\n", p.Dim("2. crl.method <GET|POST|…> — définir la méthode"))
+	fmt.Fprintf(s.out, "  %s\n", p.Dim("3. crl.json <JSON>       — ou crl.body <texte> pour configurer le corps"))
+	fmt.Fprintf(s.out, "  %s\n", p.Dim("4. crl.launch            — envoyer la requête"))
+	fmt.Fprintf(s.out, "  %s\n", p.Dim("   mint.proxy on          — démarrer le proxy de capture"))
+	fmt.Fprintf(s.out, "  %s\n", p.Dim("   mint.requests          — lister les captures"))
+	fmt.Fprintf(s.out, "  %s\n", p.Dim("   mint.select 1 2 3      — sélectionner des captures"))
+	fmt.Fprintf(s.out, "  %s\n", p.Dim("   crl.launch             — rejouer la sélection (ou crl.launch 5 pour une seule)"))
+	fmt.Fprintf(s.out, "\n%s\n", p.Dim("Utilisez crl.help ou mint.help pour la liste complète des commandes de chaque catégorie."))
+	fmt.Fprintf(s.out, "\n")
+	renderHelp(s.out, s.pal, "", unicodeTerminal(), s.helpWidth())
 }
 
 func (s *Shell) printMintHelp() {
-	s.printf(`Mint — capture HTTP via mitmproxy
+	renderHelp(s.out, s.pal, "mint", unicodeTerminal(), s.helpWidth())
+	s.printf("\n[Mint] Le rejeu est explicite : sélectionnez avec mint.select, puis lancez mint.replay.\n")
+	s.printf("[Mint] mint.use importe une capture dans le constructeur actif sans modifier la sélection ni envoyer la requête.\n")
+}
 
-  PROXY
-  mint.proxy [status]          État du proxy, port, captures, réponses et pont
-  mint.proxy on|start          Démarrer mitmdump et attendre que Mint soit prêt
-  mint.proxy off|stop          Arrêter le proxy lancé par CRL-CLI ; garder l'historique
-  mint.proxy config            Afficher la configuration et les prérequis
-  mint.proxy.port <port>       Changer le port (proxy à l'arrêt)
-
-  CAPTURES ET NOTIFICATIONS
-  mint.requests                Lister les captures correspondant au filtre
-  mint.history                 Lister tout l'historique, sans appliquer le filtre
-  mint.watch [on|off]           Activer, suspendre ou afficher l'état des notifications
-  mint.events                  Afficher les notifications accumulées pendant watch off
-  mint.request.show <id>       Afficher le détail complet d'une capture (alias mint.show)
-	  mint.select <ids>|all         Sélectionner ; add/remove/clear modifient la sélection
-	  mint.replay [cibles]         Rejouer en parallèle (lot limité à 4)
-	  mint.replay.body <id> [offset] Lire une page du corps d'une réponse
-	  mint.selected                Afficher les requêtes sélectionnées
-  mint.filter <texte>          Filtrer par hôte, URL, chemin ou query string
-  mint.filter clear            Retirer le filtre ; l'historique reste intact
-  mint.clear [--yes|-y]        Vider l'historique ; demander confirmation par défaut
-  mint.use [id] [--force]      Importer une capture dans CRL, sans envoyer la requête
-
-DÉTAILS
-  mint.watch off met en attente les notifications ; les captures continuent
-  d'être enregistrées et restent consultables avec mint.requests/history.
-  mint.events vide cette file après affichage. Elle conserve au plus 1024
-  événements ; si elle déborde, les plus anciens sont abandonnés.
-	  mint.use sans ID requiert une sélection unique ; --force remplace le constructeur
-  sans demander confirmation. Un corps de requête tronqué ne peut pas être importé.
-  Les commandes de détail affichent URL et valeurs d'en-têtes complètes.
-  Tapez help pour les commandes de construction et de rejeu CRL.
-`)
+func (s *Shell) printCrlHelp() {
+	renderHelp(s.out, s.pal, "crl", unicodeTerminal(), s.helpWidth())
+	s.printf("\n[CRL] crl.launch : sans argument, envoie le constructeur actif (ou rejoue la sélection Mint si une existe).\n")
+	s.printf("[CRL] crl.launch <id> : envoie uniquement la capture indiquée, sans modifier la sélection.\n")
+	s.printf("[CRL] crl.launch active : envoie le constructeur actif.\n")
 }
 
 func (s *Shell) printf(format string, args ...interface{}) {
@@ -3083,17 +3230,41 @@ func (s *Shell) decoratePrefix(msg string) string {
 	switch {
 	case strings.HasPrefix(msg, "[CRL] Erreur :"):
 		return s.pal.BoldRed("[CRL] Erreur :") + s.pal.Red(msg[len("[CRL] Erreur :"):])
+	case strings.HasPrefix(msg, "[CRL] Échec :"), strings.HasPrefix(msg, "[CRL] ERREUR"):
+		return s.pal.BoldRed("[CRL]") + s.pal.Red(msg[len("[CRL]"):])
+	case strings.HasPrefix(msg, "[CRL] Attention"), strings.HasPrefix(msg, "[CRL] Avertissement"):
+		return s.pal.BoldYellow("[CRL]") + s.pal.Yellow(msg[len("[CRL]"):])
+	case strings.HasPrefix(msg, "[CRL] Aucune"), strings.HasPrefix(msg, "[CRL] Aucun"), strings.HasPrefix(msg, "[CRL] En-tête ") && strings.Contains(msg, " absent"):
+		return s.pal.BoldYellow("[CRL]") + s.pal.Yellow(msg[len("[CRL]"):])
+	case strings.HasPrefix(msg, "[CRL] OK"):
+		return s.pal.BoldGreen("[CRL]") + s.pal.Green(msg[len("[CRL]"):])
 	case strings.HasPrefix(msg, "[CRL] "):
-		return s.pal.BoldGreen("[CRL]") + msg[len("[CRL]"):]
+		body := msg[len("[CRL]"):]
+		lower := strings.ToLower(body)
+		if containsAny(lower, "configuré", "configurée", "ajouté", "ajoutée", "supprimé", "supprimée", "modifié", "modifiée", "appliqué", "appliquée", "réinitialisé", "réinitialisée", "envoyée", "envoyé", "effacé", "effacée", "activées", "activés") {
+			return s.pal.BoldGreen("[CRL]") + s.pal.Green(body)
+		}
+		return s.pal.BoldCyan("[CRL]") + s.pal.White(body)
 	case strings.HasPrefix(msg, "[Mint] Échec"), strings.HasPrefix(msg, "[Mint] Erreur"):
 		return s.pal.Red(msg)
-	case strings.HasPrefix(msg, "[Mint] Attention"):
+	case strings.HasPrefix(msg, "[Mint] Attention"), strings.HasPrefix(msg, "[Mint] Aucune"), strings.HasPrefix(msg, "[Mint] Aucun"), strings.HasPrefix(msg, "[Mint] Indisponible"):
 		return s.pal.Yellow(msg)
+	case strings.HasPrefix(msg, "[Mint] Démarré"), strings.HasPrefix(msg, "[Mint] Arrêté"), strings.HasPrefix(msg, "[Mint] Capture enregistrée"):
+		return s.pal.BoldGreen("[Mint]") + s.pal.Green(msg[len("[Mint]"):])
 	case strings.HasPrefix(msg, "[Mint] "):
-		return s.pal.BoldMagenta("[Mint]") + msg[len("[Mint]"):]
+		return s.pal.BoldMagenta("[Mint]") + s.pal.White(msg[len("[Mint]"):])
 	default:
 		return msg
 	}
+}
+
+func containsAny(text string, fragments ...string) bool {
+	for _, fragment := range fragments {
+		if strings.Contains(text, fragment) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Shell) errorf(format string, args ...interface{}) {
@@ -3115,6 +3286,10 @@ func (s *Shell) failf(format string, args ...interface{}) {
 }
 
 func (s *Shell) printIndented(text, prefix string) {
+	wrapWidth := s.termWidth() - len(prefix)
+	if wrapWidth < 10 {
+		wrapWidth = 10
+	}
 	for _, line := range strings.Split(text, "\n") {
 		line = sanitizeTerminal(line)
 		if s.pal.Enabled && (strings.Contains(line, "tronqué") || strings.HasPrefix(line, "[corps binaire")) {
@@ -3122,7 +3297,9 @@ func (s *Shell) printIndented(text, prefix string) {
 		}
 		// On écrit directement : un corps peut commencer par « [CRL] » ou
 		// « [Mint] » sans que cela doive déclencher la coloration des préfixes.
-		fmt.Fprintf(s.out, "%s%s\n", prefix, line)
+		for _, wline := range display.WrapText(line, wrapWidth) {
+			fmt.Fprintf(s.out, "%s%s\n", prefix, wline)
+		}
 	}
 }
 

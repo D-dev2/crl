@@ -65,3 +65,28 @@ func TestPaletteAndPromptColors(t *testing.T) {
 		t.Fatalf("invite sans couleur = %q", got)
 	}
 }
+
+func TestCommandHelpIsAlignedFilteredAndColorControlled(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	sh, out, _, _, _ := newTestShell(t, "")
+	sh.Execute("?")
+	text := out.String()
+	for _, want := range []string{"Commandes CRL-CLI", "REQUÊTES", "INSPECTION ET ENVOI", "MINT", "crl.host", "mint.replay", "help [commande]"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("aide générale sans %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "\t") || strings.Contains(text, "\033[") {
+		t.Fatalf("aide non alignée ou couleur non désactivée:\n%q", text)
+	}
+	out.Reset()
+	sh.Execute("help crl.json")
+	if !strings.Contains(out.String(), "crl.json <id> edit") || strings.Contains(out.String(), "mint.proxy") {
+		t.Fatalf("aide filtrée incorrecte:\n%s", out.String())
+	}
+	out.Reset()
+	sh.Execute("help commande.inconnue")
+	if !strings.Contains(out.String(), "aucune aide trouvée") {
+		t.Fatalf("erreur d'aide absente:\n%s", out.String())
+	}
+}

@@ -65,6 +65,7 @@ func (p Palette) Yellow(text string) string    { return p.Paint("33", text) }
 func (p Palette) Blue(text string) string      { return p.Paint("34", text) }
 func (p Palette) Magenta(text string) string   { return p.Paint("35", text) }
 func (p Palette) Cyan(text string) string      { return p.Paint("36", text) }
+func (p Palette) White(text string) string     { return p.Paint("37", text) }
 func (p Palette) BoldRed(text string) string   { return p.Paint("1;31", text) }
 func (p Palette) BoldGreen(text string) string { return p.Paint("1;32", text) }
 func (p Palette) BoldYellow(text string) string {

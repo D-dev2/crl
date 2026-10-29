@@ -11,7 +11,7 @@ constructeur `crl.*` sans l'envoyer.
 - Réponses HTTP présentées avec statut, durée, en-têtes et corps lisible.
 - Modes d'affichage `auto`, `raw` et `pretty`, sans modifier les octets reçus.
 - Prompt compact sur une ligne : `crl [GET] [Mint: ON] [Sel: N] >`, avec bilan du dernier rejeu multiple.
-- Édition JSON multiligne intégrée au shell (`:end` pour valider, `:cancel` pour annuler), sans `$EDITOR`/`$VISUAL`. Modification ciblée avec `crl.json set <chemin> = <valeur JSON>` ou suppression avec `crl.json delete <chemin>`.
+- Éditeur JSON interactif intégré au terminal : flèches, insertion, suppression, défilement vertical et horizontal, `Ctrl+S` pour valider et `Esc` pour annuler. Modification ciblée avec `crl.json set <chemin> = <valeur JSON>` ou suppression avec `crl.json delete <chemin>`.
 - Sélection de plusieurs captures Mint et rejeu concurrent avec `mint.replay`.
 - Proxy Mint démarré et arrêté par CRL-CLI, avec confirmation de disponibilité.
 - Capture en temps réel, historique, filtre, sélection et import.
@@ -198,9 +198,7 @@ crl.table
 crl.launch
 ```
 
-Sans argument, `crl.json` entre en mode saisie JSON multiligne intégrée au shell
-(affiche le corps actuel en référence, saisie avec `:end` pour valider ou `:cancel` pour annuler).
-`crl.body` sans argument propose une saisie multiligne intégrée similaire sans validation JSON.
+`crl.json` sans argument ouvre l’éditeur interactif intégré, prérempli avec le corps actuel. Utilisez les flèches pour déplacer le curseur, `Ctrl+S` pour valider et `Esc` pour annuler. Une erreur JSON garde le document dans l’éditeur pour correction. `crl.body` utilise le même éditeur sans validation JSON.
 `crl.json set <chemin> = <valeur JSON>` et `crl.json set user.role = "admin"` modifient un champ
 précis en préservant les autres propriétés. `crl.json delete <chemin>` supprime une propriété.
 `crl.json clear` et `crl.body.clear` effacent le corps sans toucher aux autres en-têtes.
@@ -277,14 +275,14 @@ utilise automatiquement le proxy Mint. L'historique reste disponible après
 | `crl.head show <cible>` | affiche les en-têtes masquant les valeurs sensibles |
 | `crl.head.clear [Nom]` | variante explicite de la commande précédente |
 | `crl.json <json>` | définit un corps JSON valide et `Content-Type: application/json` |
-| `crl.json` | saisie multiligne intégrée (`:end` pour valider, `:cancel` pour annuler) |
+| `crl.json` | ouvrir l’éditeur intégré (`Ctrl+S` applique, `Esc` annule) |
 | `crl.json set <chemin> = <valeur JSON>` | modifie un champ précis (objets imbriqués pris en charge) |
 | `crl.json delete <chemin>` | supprime une propriété précise |
 | `crl.json <cible> set <chemin> = <valeur JSON>` | applique le changement JSON aux captures ciblées sans toucher les originales |
-| `crl.json <id> edit` | édite le JSON de cette capture seulement ; `:end` applique après validation, `:cancel` annule |
+| `crl.json <id> edit` | édite le JSON de cette capture seulement ; `Ctrl+S` applique après validation |
 | `crl.json clear` | efface le corps sans modifier méthode ni en-têtes |
 | `crl.body <texte>` | définit un corps brut, sans modifier le `Content-Type` |
-| `crl.body` | saisie multiligne intégrée sans validation JSON (`:end`/`:cancel`) |
+| `crl.body` | ouvrir l’éditeur intégré, sans validation JSON |
 | `crl.body <id> edit` | édite le corps brut d'une capture seulement |
 | `crl.body <cible> set <texte>` / `clear` | définit ou efface les corps des captures ciblées |
 | `crl.body.clear` | supprime le corps |
@@ -827,8 +825,8 @@ MIT. Voir [LICENSE](LICENSE).
 - Prompt mono-ligne `crl [GET] [Mint: ON] [Sel: N] >` ; la méthode devient `[Actif: GET]` avec une sélection pour éviter toute ambiguïté.
 - Notifications Mint : pas d'écriture concurrente depuis le pont/goroutines pendant la saisie ; un seul lecteur `stdin`.
 - Sélection Mint et constructeur actif indépendants ; `crl.show` détaille toutes les captures sélectionnées ; modifications ciblées stockées en copies de travail, captures originales inchangées.
-- Édition JSON multiligne intégrée sans `$EDITOR`/`$VISUAL` (`:end`, `:cancel`), préservation du corps en cas d'erreur/annulation. Ajout de `crl.json set`/`delete` pour modifier/supprimer un champ précis en préservant le reste.
-- `crl.body` multiligne intégrée. Corps envoyé fidèlement (gestion Content-Length/`--data-binary` via stdin), pas de réutilisation aveugle après modification.
+- Éditeur JSON TUI intégré au shell avec déplacement curseur, insertion/suppression, défilement, validation `Ctrl+S` et annulation `Esc` ; les erreurs de syntaxe conservent le texte édité et le corps initial reste intact tant que la validation échoue. `crl.json set`/`delete` modifie un champ sans écraser le reste.
+- `crl.body` utilise le même éditeur interactif, sans validation JSON. Corps envoyé fidèlement (gestion Content-Length/`--data-binary` via stdin), pas de réutilisation aveugle après modification.
 - Rejeu parallèle avec sections et résumé par identifiant ; erreurs HTTP distinctes des erreurs réseau ; `mint.replay.body <id> [offset]` consulte le corps jusqu'à 16 Mio.
 
 ### Tests réellement exécutés

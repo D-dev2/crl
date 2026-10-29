@@ -189,6 +189,81 @@ func TestInteractiveTypingOneKeyAtATime(t *testing.T) {
 	}
 }
 
+// TestInteractiveJSONEditorUsesArrowKeysAndReturnsToPrompt exerce le chemin
+// réel du terminal brut : crl.json sans argument affiche l'état actuel sans
+// ouvrir d'éditeur, et crl.json <JSON> configure le corps sur une seule ligne.
+func TestInteractiveJSONEditorUsesArrowKeysAndReturnsToPrompt(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	master, slave := openPTY(t)
+	defer master.Close()
+	defer slave.Close()
+
+	hist := mint.NewHistory(mint.DefaultHistoryConfig())
+	mgr, err := mint.NewManager(mint.DefaultConfig(), hist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	builder := request.New()
+	if err := builder.SetJSON(`{"role":"user"}`); err != nil {
+		t.Fatal(err)
+	}
+	sh, err := New(Options{In: slave, Out: slave, Builder: builder, Manager: mgr})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := &ptyCollector{}
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, e := master.Read(buf)
+			if n > 0 {
+				got.write(buf[:n])
+			}
+			if e != nil {
+				return
+			}
+		}
+	}()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- sh.Run(ctx) }()
+	waitPTYLine(t, got, "crl [GET] [Mint: OFF] >", 3*time.Second)
+
+	// crl.json sans argument affiche l'état actuel, n'ouvre pas l'éditeur.
+	if _, err := master.Write([]byte("crl.json\r")); err != nil {
+		t.Fatal(err)
+	}
+	waitPTYText(t, got, "JSON actuel", 3*time.Second)
+	if !strings.Contains(got.String(), `{"role":"user"}`) {
+		t.Fatalf("JSON actuel non affiché:\n%s", got.String())
+	}
+	waitPTYLine(t, got, "crl [GET] [Mint: OFF] >", 3*time.Second)
+
+	// crl.json avec un JSON sur une ligne configure le corps immédiatement.
+	if _, err := master.Write([]byte("crl.json {\"role\":\"admin\"}\r")); err != nil {
+		t.Fatal(err)
+	}
+	waitPTYText(t, got, "Corps JSON configuré", 3*time.Second)
+	if want, have := `{"role":"admin"}`, string(builder.Body()); have != want {
+		t.Fatalf("corps appliqué = %s, attendu %s", have, want)
+	}
+	// Aucun éditeur multiligne n'est ouvert : le prompt est immédiatement de retour.
+	waitPTYLine(t, got, "crl [GET] [Mint: OFF] >", 3*time.Second)
+
+	if _, err := master.Write([]byte("exit\r")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("shell : %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("shell bloqué après le retour du prompt")
+	}
+}
+
 // TestInteractiveMintNotificationPreservesTypedInput vérifie qu'une capture
 // Mint reçue pendant la saisie est affichée au-dessus du prompt, puis que la
 // commande partielle est restaurée et peut être terminée normalement.

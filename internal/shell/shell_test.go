@@ -420,7 +420,7 @@ func TestMintReplayReportsTimeoutAndKeepsOtherErrors(t *testing.T) {
 		t.Fatal("delayed request never started")
 	}
 	text := out.String()
-	if !strings.Contains(text, "#1") || !strings.Contains(text, "#2") || !strings.Contains(text, "deadline exceeded") || !strings.Contains(text, "exit status 7") {
+	if !strings.Contains(text, "#1") || !strings.Contains(text, "#2") || !strings.Contains(text, "deadline exceeded") || !strings.Contains(text, "(7)") {
 		t.Fatalf("batch errors not attributed individually:\n%s", text)
 	}
 }
@@ -869,9 +869,9 @@ func TestMintAuthHeadersSurviveSelectionImportAndReplay(t *testing.T) {
 	out.Reset()
 	sh.Execute("mint.request.show 1")
 	detail := out.String()
-	for _, want := range []string{"Bearer auth-secret", "session=abc", "api-secret", "proxy-secret"} {
+	for _, want := range []string{"Bearer ***", "***"} {
 		if !strings.Contains(detail, want) {
-			t.Fatalf("valeur %q absente de la capture :\n%s", want, detail)
+			t.Fatalf("valeur masquée %q absente de la capture :\n%s", want, detail)
 		}
 	}
 
@@ -896,8 +896,8 @@ func TestMintAuthHeadersSurviveSelectionImportAndReplay(t *testing.T) {
 
 	out.Reset()
 	sh.Execute("crl.show")
-	if !strings.Contains(out.String(), "Bearer auth-secret") {
-		t.Fatalf("crl.show ne restitue pas l'authentification :\n%s", out.String())
+	if !strings.Contains(out.String(), "Bearer ***") {
+		t.Fatalf("crl.show ne masque pas l'authentification :\n%s", out.String())
 	}
 
 	out.Reset()
@@ -970,8 +970,8 @@ func TestLaunchHTTPResponseLayoutAndPrettyJSON(t *testing.T) {
 	if strings.Contains(text, `{"b":2`) {
 		t.Fatalf("JSON not pretty-printed:\n%s", text)
 	}
-	if !strings.Contains(text, "Set-Cookie: session=secret") {
-		t.Fatalf("full response header missing:\n%s", text)
+	if !strings.Contains(text, "Set-Cookie: ***") {
+		t.Fatalf("masked response header missing:\n%s", text)
 	}
 	if strings.Contains(text, "\033[") {
 		t.Fatalf("launch emitted ANSI on a non-terminal buffer:\n%s", text)
@@ -1262,8 +1262,8 @@ func TestRealMintAutoProxyInShell(t *testing.T) {
 	if !strings.Contains(launchText, cfg.ListenHost+":"+strconv.Itoa(cfg.Port)) {
 		t.Fatalf("proxy Mint automatique non annoncé :\n%s", launchText)
 	}
-	if !strings.Contains(launchText, "token=secret") {
-		t.Fatalf("URL complète absente de crl.launch :\n%s", launchText)
+	if !strings.Contains(launchText, "token=***") {
+		t.Fatalf("URL masquée absente de crl.launch :\n%s", launchText)
 	}
 
 	var capture mint.Capture
@@ -1299,5 +1299,331 @@ func TestRealMintAutoProxyInShell(t *testing.T) {
 	}
 	if len(hist.List()) == 0 {
 		t.Fatal("captures perdues après arrêt du proxy")
+	}
+}
+
+// --- Tests pour l'aide (crl.help, mint.help, help, ?) ---
+
+func TestCrlHelpListsAllCrlCommands(t *testing.T) {
+	sh, out, _, _, _ := newTestShell(t, "")
+	sh.Execute("crl.help")
+	text := out.String()
+	for _, cmd := range []string{
+		"crl.host", "crl.method", "crl.head", "crl.header",
+		"crl.json", "crl.body", "crl.proxy", "crl.ca",
+		"crl.show", "crl.table", "crl.output", "crl.launch",
+		"crl.help",
+	} {
+		if !strings.Contains(text, cmd) {
+			t.Errorf("crl.help ne liste pas %q:\n%s", cmd, text)
+		}
+	}
+	// Le lancement individuel doit être documenté.
+	if !strings.Contains(text, "crl.launch <id>") && !strings.Contains(text, "crl.launch 5") {
+		t.Errorf("crl.help ne documente pas le lancement individuel:\n%s", text)
+	}
+}
+
+func TestMintHelpListsAllMintCommands(t *testing.T) {
+	sh, out, _, _, _ := newTestShell(t, "")
+	sh.Execute("mint.help")
+	text := out.String()
+	for _, cmd := range []string{
+		"mint.proxy", "mint.requests", "mint.history",
+		"mint.request.show", "mint.select", "mint.selected",
+		"mint.replay", "mint.filter", "mint.use", "mint.clear",
+		"mint.unselect",
+	} {
+		if !strings.Contains(text, cmd) {
+			t.Errorf("mint.help ne liste pas %q:\n%s", cmd, text)
+		}
+	}
+}
+
+func TestHelpAndQuestionShowGeneralOverview(t *testing.T) {
+	for _, cmd := range []string{"help", "?"} {
+		sh, out, _, _, _ := newTestShell(t, "")
+		sh.Execute(cmd)
+		text := out.String()
+		for _, want := range []string{
+			"CRL-CLI", "PRÉSENTATION", "CRL", "Mint",
+			"crl.help", "mint.help", "WORKFLOW",
+		} {
+			if !strings.Contains(text, want) {
+				t.Errorf("%s ne contient pas %q:\n%s", cmd, want, text)
+			}
+		}
+	}
+}
+
+// --- Tests pour la sélection et la désélection ---
+
+func TestMintSelectRemoveAndClear(t *testing.T) {
+	sh, out, _, hist, _ := newTestShell(t, "")
+	// Ajouter des captures
+	for i := 1; i <= 3; i++ {
+		hist.AddRequest(mint.BridgeEvent{
+			Type:      "request",
+			FlowID:    fmt.Sprintf("flow-%d", i),
+			Timestamp: time.Now(),
+			Method:    "GET",
+			URL:       fmt.Sprintf("http://example.test/%d", i),
+		})
+	}
+
+	// Sélectionner 1, 2, 3
+	sh.Execute("mint.select 1 2 3")
+	out.Reset()
+	sh.Execute("mint.selected")
+	if !strings.Contains(out.String(), "#1") || !strings.Contains(out.String(), "#2") || !strings.Contains(out.String(), "#3") {
+		t.Fatalf("sélection 1,2,3 incorrecte:\n%s", out.String())
+	}
+
+	// Retirer la requête 2
+	out.Reset()
+	sh.Execute("mint.select remove 2")
+	if !strings.Contains(out.String(), "#1") || strings.Contains(out.String(), "#2") || !strings.Contains(out.String(), "#3") {
+		t.Fatalf("après remove 2, 2 ne devrait plus être sélectionné:\n%s", out.String())
+	}
+
+	// Remplacer par la seule requête 5 (n'existe pas encore → erreur)
+	out.Reset()
+	sh.Execute("mint.select 5")
+	if !strings.Contains(out.String(), "introuvable") {
+		t.Fatalf("ID 5 n'existe pas, devrait échouer:\n%s", out.String())
+	}
+	// La sélection précédente (1 et 3) doit être intacte car l'opération a échoué
+	out.Reset()
+	sh.Execute("mint.selected")
+	if !strings.Contains(out.String(), "#1") || !strings.Contains(out.String(), "#3") {
+		t.Fatalf("sélection précédente doit être préservée après échec:\n%s", out.String())
+	}
+
+	// Tout désélectionner
+	out.Reset()
+	sh.Execute("mint.select clear")
+	sh.Execute("mint.selected")
+	if strings.Contains(out.String(), "#1") || strings.Contains(out.String(), "#3") {
+		t.Fatalf("après clear, rien ne devrait être sélectionné:\n%s", out.String())
+	}
+
+	// Sélectionner toutes les captures
+	out.Reset()
+	sh.Execute("mint.select all")
+	sh.Execute("mint.selected")
+	for i := 1; i <= 3; i++ {
+		if !strings.Contains(out.String(), fmt.Sprintf("#%d", i)) {
+			t.Errorf("mint.select all devrait inclure #%d:\n%s", i, out.String())
+		}
+	}
+}
+
+func TestMintUnselectAlias(t *testing.T) {
+	sh, out, _, hist, _ := newTestShell(t, "")
+	hist.AddRequest(mint.BridgeEvent{
+		Type:      "request",
+		FlowID:    "flow-1",
+		Timestamp: time.Now(),
+		Method:    "GET",
+		URL:       "http://example.test/1",
+	})
+	hist.AddRequest(mint.BridgeEvent{
+		Type:      "request",
+		FlowID:    "flow-2",
+		Timestamp: time.Now(),
+		Method:    "POST",
+		URL:       "http://example.test/2",
+	})
+
+	sh.Execute("mint.select all")
+	out.Reset()
+	sh.Execute("mint.unselect 1")
+	if strings.Contains(out.String(), "#1") || !strings.Contains(out.String(), "#2") {
+		t.Fatalf("mint.unselect 1 devrait retirer #1 et garder #2:\n%s", out.String())
+	}
+
+	out.Reset()
+	sh.Execute("mint.unselect all")
+	sh.Execute("mint.selected")
+	if strings.Contains(out.String(), "#2") {
+		t.Fatalf("mint.unselect all devrait tout vider:\n%s", out.String())
+	}
+}
+
+func TestMintSelectInvalidID(t *testing.T) {
+	sh, out, _, _, _ := newTestShell(t, "")
+	sh.Execute("mint.select abc")
+	if !strings.Contains(out.String(), "identifiant") && !strings.Contains(out.String(), "invalide") {
+		t.Fatalf("ID invalide devrait produire une erreur:\n%s", out.String())
+	}
+}
+
+// --- Tests pour le lancement individuel ---
+
+func TestCrlLaunchIndividualCapture(t *testing.T) {
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skip("curl absent")
+	}
+	sh, out, _, hist, builder := newTestShell(t, "")
+
+	srv := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		data, _ := io.ReadAll(r.Body)
+		t.Logf("serveur a reçu: %s %s body=%s", r.Method, r.URL.Path, string(data))
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte("reçu-individuel"))
+	}))
+	defer srv.Close()
+
+	// Ajouter deux captures
+	hist.AddRequest(mint.BridgeEvent{
+		Type:      "request",
+		FlowID:    "flow-1",
+		Timestamp: time.Now(),
+		Method:    "GET",
+		URL:       srv.URL + "/un",
+		Body:      []byte("body-un"), BodySize: 7,
+	})
+	hist.AddRequest(mint.BridgeEvent{
+		Type:      "request",
+		FlowID:    "flow-2",
+		Timestamp: time.Now(),
+		Method:    "POST",
+		URL:       srv.URL + "/deux",
+		Headers:   []mint.Header{{Name: "X-Test", Value: "valeur"}},
+		Body:      []byte("body-deux"), BodySize: 9,
+	})
+
+	// Sélectionner les deux
+	sh.Execute("mint.select 1 2")
+	out.Reset()
+
+	// Lancer uniquement la capture 1
+	sh.Execute("crl.launch 1")
+	text := out.String()
+	t.Logf("sortie launch 1:\n%s", text)
+
+	// La capture 1 doit avoir été exécutée
+	if !strings.Contains(text, "201") && !strings.Contains(text, "réçu-individuel") {
+		t.Fatalf("capture 1 n'a pas été exécutée:\n%s", text)
+	}
+
+	// Vérifier que la sélection est toujours intacte
+	out.Reset()
+	sh.Execute("mint.selected")
+	if !strings.Contains(out.String(), "#1") || !strings.Contains(out.String(), "#2") {
+		t.Fatalf("sélection doit rester intacte après launch individuel:\n%s", out.String())
+	}
+
+	// Vérifier que le constructeur actif n'a pas été modifié
+	if builder.URL() != "" {
+		t.Fatalf("constructeur actif ne devrait pas être modifié: %q", builder.URL())
+	}
+}
+
+func TestCrlLaunchNoArgumentReplaysSelection(t *testing.T) {
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skip("curl absent")
+	}
+	sh, out, _, hist, _ := newTestShell(t, "")
+
+	srv := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok-selection"))
+	}))
+	defer srv.Close()
+
+	hist.AddRequest(mint.BridgeEvent{
+		Type:      "request",
+		FlowID:    "flow-1",
+		Timestamp: time.Now(),
+		Method:    "GET",
+		URL:       srv.URL + "/sel",
+	})
+
+	sh.Execute("mint.select 1")
+	out.Reset()
+	sh.Execute("crl.launch")
+	text := out.String()
+	if !strings.Contains(text, "200") && !strings.Contains(text, "ok-selection") {
+		t.Fatalf("crl.launch sans argument devrait rejouer la sélection:\n%s", text)
+	}
+}
+
+// --- Tests pour crl.json et crl.body sur une ligne ---
+
+func TestCrlJsonSingleLine(t *testing.T) {
+	sh, out, _, _, builder := newTestShell(t, "")
+
+	// JSON valide sur une ligne
+	sh.Execute(`crl.json {"username":"test","role":"user"}`)
+	if !builder.BodySet() {
+		t.Fatal("JSON devrait être configuré")
+	}
+	if string(builder.Body()) != `{"username":"test","role":"user"}` {
+		t.Fatalf("corps JSON incorrect: %q", string(builder.Body()))
+	}
+	if !strings.Contains(out.String(), "configuré") {
+		t.Fatalf("confirmation manquante:\n%s", out.String())
+	}
+
+	// crl.json sans argument affiche l'état
+	out.Reset()
+	sh.Execute("crl.json")
+	if !strings.Contains(out.String(), "JSON actuel") {
+		t.Fatalf("crl.json sans arg devrait afficher l'état:\n%s", out.String())
+	}
+
+	// JSON invalide
+	out.Reset()
+	sh.Execute(`crl.json {invalid json}`)
+	if !strings.Contains(out.String(), "invalide") {
+		t.Fatalf("JSON invalide devrait être rejeté:\n%s", out.String())
+	}
+
+	// Le corps précédent doit être conservé
+	if string(builder.Body()) != `{"username":"test","role":"user"}` {
+		t.Fatalf("corps précédent doit être conservé après JSON invalide: %q", string(builder.Body()))
+	}
+}
+
+func TestCrlJsonWithSpacesAndUnicode(t *testing.T) {
+	sh, _, _, _, builder := newTestShell(t, "")
+
+	// JSON avec des espaces et caractères accentués
+	sh.Execute(`crl.json {"nom":"café","ville":"🌍"}`)
+	if string(builder.Body()) != `{"nom":"café","ville":"🌍"}` {
+		t.Fatalf("JSON Unicode incorrect: %q", string(builder.Body()))
+	}
+}
+
+func TestCrlBodySingleLine(t *testing.T) {
+	sh, out, _, _, builder := newTestShell(t, "")
+
+	// Body textuel avec des espaces
+	sh.Execute(`crl.body {"message":"hello world","active":true}`)
+	if !builder.BodySet() {
+		t.Fatal("body devrait être configuré")
+	}
+	if string(builder.Body()) != `{"message":"hello world","active":true}` {
+		t.Fatalf("corps incorrect: %q", string(builder.Body()))
+	}
+
+	// crl.body sans argument affiche l'état
+	out.Reset()
+	sh.Execute("crl.body")
+	if !strings.Contains(out.String(), "Corps actuel") {
+		t.Fatalf("crl.body sans arg devrait afficher l'état:\n%s", out.String())
+	}
+
+	// crl.body avec des guillemets
+	out.Reset()
+	sh.Execute(`crl.body dire "bonjour"`)
+	if string(builder.Body()) != `dire "bonjour"` {
+		t.Fatalf("corps avec guillemets incorrect: %q", string(builder.Body()))
+	}
+
+	// Retour immédiat au prompt (pas de mode interactif)
+	if strings.Contains(out.String(), "EDITOR") || strings.Contains(out.String(), "éditeur") {
+		t.Fatalf("crl.body ne devrait pas ouvrir d'éditeur:\n%s", out.String())
 	}
 }

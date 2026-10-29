@@ -8,4 +8,5 @@ func makeRaw(fd uintptr) (func(), error) {
 	return nil, fmt.Errorf("édition interactive non prise en charge sur cette plateforme")
 }
 
-func terminalWidth(fd uintptr) int { return 80 }
+func terminalWidth(fd uintptr) int  { return 80 }
+func terminalHeight(fd uintptr) int { return 24 }
