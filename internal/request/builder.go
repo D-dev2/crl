@@ -69,6 +69,9 @@ func (b *Builder) SetMethod(method string) error {
 // URL retourne l'URL brute, avec son encodage et sa chaîne de requête exacts.
 func (b *Builder) URL() string { return b.rawURL }
 
+// ClearURL retire l'URL cible sans toucher aux en-têtes, au corps ni au proxy.
+func (b *Builder) ClearURL() { b.rawURL = "" }
+
 // SetURL définit l'URL cible. Si le schéma est absent, http:// est ajouté.
 // L'URL n'est jamais reconstruite à partir de composants : les caractères
 // encodés, les paramètres répétés et les valeurs vides sont conservés.

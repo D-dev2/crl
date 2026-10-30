@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -1356,6 +1357,30 @@ func TestHelpAndQuestionShowGeneralOverview(t *testing.T) {
 	}
 }
 
+func TestAllHelpViewsExplainTargetsAndLaunchAllRejection(t *testing.T) {
+	for _, cmd := range []string{"help", "?", "crl.help", "mint.help"} {
+		t.Run(cmd, func(t *testing.T) {
+			sh, out, _, _, _ := newTestShell(t, "")
+			sh.Execute(cmd)
+			text := out.String()
+			for _, want := range []string{
+				"CIBLES ET VALEURS",
+				"<id>", "<ids>", "<cible>",
+				"séparés par des espaces",
+				"virgules",
+				"selected",
+				"all",
+				"crl.launch all",
+				"mint.select all",
+			} {
+				if !strings.Contains(text, want) {
+					t.Errorf("%s ne clarifie pas %q :\n%s", cmd, want, text)
+				}
+			}
+		})
+	}
+}
+
 // --- Tests pour la sélection et la désélection ---
 
 func TestMintSelectRemoveAndClear(t *testing.T) {
@@ -1625,5 +1650,223 @@ func TestCrlBodySingleLine(t *testing.T) {
 	// Retour immédiat au prompt (pas de mode interactif)
 	if strings.Contains(out.String(), "EDITOR") || strings.Contains(out.String(), "éditeur") {
 		t.Fatalf("crl.body ne devrait pas ouvrir d'éditeur:\n%s", out.String())
+	}
+}
+
+func TestParseTargetHeaderArgsAcceptsStandardAndLegacyForms(t *testing.T) {
+	cases := []struct {
+		name      string
+		args      []string
+		wantName  string
+		wantValue string
+		wantErr   bool
+	}{
+		{"deux-points et valeur avec espace", []string{"X-Test:", "two", "words"}, "X-Test", "two words", false},
+		{"deux-points et valeur avec deux-points internes", []string{"X-Debug:", "étape:", "détail"}, "X-Debug", "étape: détail", false},
+		{"deux-points collés à la valeur", []string{"X-Test:a:b"}, "X-Test", "a:b", false},
+		{"ancienne forme sans deux-points", []string{"X-Test", "two", "words"}, "X-Test", "two words", false},
+		{"valeur entre guillemets avec espaces internes", []string{"X-Spaces:", "valeur  avec   espaces"}, "X-Spaces", "valeur  avec   espaces", false},
+		{"valeur vide explicite", []string{"X-Empty:", ""}, "X-Empty", "", false},
+		{"valeur absente", []string{"X-Test:"}, "", "", true},
+		{"nom invalide", []string{"bad name:", "x"}, "", "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			name, value, err := parseTargetHeaderArgs(tc.args)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("parseTargetHeaderArgs(%q) sans erreur", tc.args)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseTargetHeaderArgs(%q) : %v", tc.args, err)
+			}
+			if name != tc.wantName || value != tc.wantValue {
+				t.Fatalf("parseTargetHeaderArgs(%q) = %q %q, attendu %q %q", tc.args, name, value, tc.wantName, tc.wantValue)
+			}
+		})
+	}
+}
+
+func TestLaunchAllRejectedAndSelectionReplayScoped(t *testing.T) {
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skip("curl absent")
+	}
+	var mu sync.Mutex
+	counts := map[string]int{}
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		counts[r.URL.Path]++
+		mu.Unlock()
+		switch r.URL.Path {
+		case "/unauth":
+			w.WriteHeader(http.StatusUnauthorized)
+		case "/fail":
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+		_, _ = w.Write([]byte(r.URL.Path))
+	})
+	srv := newTestHTTPServer(t, handler)
+	defer srv.Close()
+	snapshot := func() map[string]int {
+		mu.Lock()
+		defer mu.Unlock()
+		out := make(map[string]int, len(counts))
+		for k, v := range counts {
+			out[k] = v
+		}
+		return out
+	}
+	reset := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		counts = map[string]int{}
+	}
+	assertCounts := func(want map[string]int) {
+		t.Helper()
+		got := snapshot()
+		for path, n := range want {
+			if got[path] != n {
+				t.Fatalf("requêtes %s = %d, attendu %d (toutes : %#v)", path, got[path], n, got)
+			}
+		}
+		for path, n := range got {
+			if want[path] == 0 && n != 0 {
+				t.Fatalf("requête inattendue %s envoyée %d fois (toutes : %#v)", path, n, got)
+			}
+		}
+	}
+
+	sh, out, _, hist, _ := newTestShell(t, "")
+	paths := []string{"/one", "/two", "/three", "/unauth", "/fail"}
+	for i, path := range paths {
+		hist.AddRequest(mint.BridgeEvent{
+			Type: "request", FlowID: fmt.Sprintf("launch-%d", i), Method: "GET",
+			URL: srv.URL + path, Timestamp: time.Now(),
+		})
+	}
+	sh.Execute("mint.select 1 2")
+
+	// all est refusé pour crl.launch et n'envoie strictement rien.
+	out.Reset()
+	reset()
+	sh.Execute("crl.launch all")
+	if text := out.String(); !strings.Contains(text, "n'est pas une cible valide") || !strings.Contains(text, "mint.select all") {
+		t.Fatalf("refus de crl.launch all imprécis :\n%s", text)
+	}
+	assertCounts(map[string]int{})
+	if selected := hist.SelectedMany(); len(selected) != 2 || selected[0].ID != 1 || selected[1].ID != 2 {
+		t.Fatalf("crl.launch all a modifié la sélection : %#v", selected)
+	}
+
+	// Sans argument : uniquement la sélection 1,2.
+	reset()
+	sh.Execute("crl.launch")
+	assertCounts(map[string]int{"/one": 1, "/two": 1})
+
+	// Une cible explicite ne rejoue que cette capture et ne change pas la sélection.
+	reset()
+	sh.Execute("crl.launch 2")
+	assertCounts(map[string]int{"/two": 1})
+	if selected := hist.SelectedMany(); len(selected) != 2 || selected[0].ID != 1 || selected[1].ID != 2 {
+		t.Fatalf("crl.launch 2 a modifié la sélection : %#v", selected)
+	}
+
+	// mint.replay all reste une cible explicite distincte de la sélection.
+	reset()
+	sh.Execute("mint.replay all")
+	assertCounts(map[string]int{"/one": 1, "/two": 1, "/three": 1, "/unauth": 1, "/fail": 1})
+
+	// La sélection de toutes les captures se fait par mint.select all.
+	sh.Execute("mint.select all")
+	reset()
+	out.Reset()
+	sh.Execute("crl.launch")
+	assertCounts(map[string]int{"/one": 1, "/two": 1, "/three": 1, "/unauth": 1, "/fail": 1})
+	text := out.String()
+	if !strings.Contains(text, "401 Unauthorized") || !strings.Contains(text, "500 Internal Server Error") {
+		t.Fatalf("les réponses HTTP 401/500 ne sont pas des réponses :\n%s", text)
+	}
+	if strings.Contains(text, "Erreur réseau") {
+		t.Fatalf("une réponse 401/500 a été confondue avec une erreur réseau :\n%s", text)
+	}
+}
+
+func TestTargetHeaderColonSyntaxReachesHTTPServer(t *testing.T) {
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skip("curl absent")
+	}
+	gotHeaders := make(chan http.Header, 1)
+	srv := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/headers" {
+			gotHeaders <- r.Header.Clone()
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	sh, out, _, hist, _ := newTestShell(t, "")
+	hist.AddRequest(mint.BridgeEvent{Type: "request", FlowID: "headers", Method: "GET", URL: srv.URL + "/headers", Timestamp: time.Now()})
+
+	sh.Execute("crl.head set 1 sec-fetch-dest: iframe")
+	sh.Execute("crl.head set 1 X-Debug: étape: détail")
+	sh.Execute(`crl.head set 1 X-Spaces: "valeur  avec   espaces"`)
+	sh.Execute("crl.head set 1 Content-Type: application/json; charset=utf-8")
+	sh.Execute("crl.head set 1 X-Remove: yes")
+	sh.Execute("crl.head delete 1 X-Remove:")
+
+	out.Reset()
+	sh.Execute(`crl.head set 1 "bad name": x`)
+	if !strings.Contains(out.String(), "invalide") {
+		t.Fatalf("un nom d'en-tête invalide a été accepté :\n%s", out.String())
+	}
+	b, err := sh.requestBuilderFor(mustCapture(t, hist, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range b.Headers() {
+		if h.Name == "bad name" {
+			t.Fatal("l'en-tête au nom invalide a été ajouté")
+		}
+		if h.Name == "X-Remove" {
+			t.Fatal("la suppression avec un deux-points final a échoué")
+		}
+	}
+	want := map[string]string{
+		"Sec-Fetch-Dest": "iframe",
+		"X-Debug":        "étape: détail",
+		"X-Spaces":       "valeur  avec   espaces",
+		"Content-Type":   "application/json; charset=utf-8",
+	}
+	for name, value := range want {
+		found := false
+		for _, h := range b.Headers() {
+			if strings.EqualFold(h.Name, name) {
+				found = true
+				if h.Value != value {
+					t.Fatalf("%s = %q, attendu %q", name, h.Value, value)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("%s absent des en-têtes préparés : %#v", name, b.Headers())
+		}
+	}
+
+	sh.Execute("crl.launch 1")
+	select {
+	case headers := <-gotHeaders:
+		for name, value := range want {
+			if got := headers.Get(name); got != value {
+				t.Fatalf("en-tête reçu %s = %q, attendu %q (reçus : %#v)", name, got, value, headers)
+			}
+		}
+		if got := headers.Get("X-Remove"); got != "" {
+			t.Fatalf("X-Remove supprimé localement mais reçu : %q", got)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("la requête avec en-têtes n'a pas atteint le serveur")
 	}
 }

@@ -285,7 +285,7 @@ func TestPTYJSONEditorKeepsOneCompactFrameAndRestoresPrompt(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- sh.Run(ctx) }()
-	waitPTYLine(t, got, "crl [GET] [Mint: OFF] >", 3*time.Second)
+	waitPTYLine(t, got, testPrompt, 3*time.Second)
 
 	if _, err := master.Write([]byte("crl.json 1 edit\r")); err != nil {
 		t.Fatal(err)
@@ -338,12 +338,12 @@ func TestPTYJSONEditorKeepsOneCompactFrameAndRestoresPrompt(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitPTYText(t, got, "Corps de la requête #1 modifié", 3*time.Second)
-	waitPTYLine(t, got, "crl [GET] [Mint: OFF] >", 3*time.Second)
+	waitPTYLine(t, got, testPrompt, 3*time.Second)
 	screen = screenFrom(got.String())
 	if strings.Contains(screen.text(), "CRL JSON EDITOR") {
 		t.Fatalf("cadre non effacé après validation :\n%s", screen.text())
 	}
-	if !previousLineIsBlank(screen.text(), "crl [GET] [Mint: OFF] >") {
+	if !previousLineIsBlank(screen.text(), testPrompt) {
 		t.Fatalf("prompt collé au résultat après validation :\n%s", screen.text())
 	}
 	if b, err := sh.requestBuilderFor(mustCapture(t, hist, 1)); err != nil {
@@ -362,7 +362,7 @@ func TestPTYJSONEditorKeepsOneCompactFrameAndRestoresPrompt(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitPTYText(t, got, "Édition annulée", 3*time.Second)
-	waitPTYLine(t, got, "crl [GET] [Mint: OFF] >", 3*time.Second)
+	waitPTYLine(t, got, testPrompt, 3*time.Second)
 	screen = screenFrom(got.String())
 	if strings.Contains(screen.text(), "CRL JSON EDITOR") {
 		t.Fatalf("cadre non effacé après annulation :\n%s", screen.text())
@@ -438,7 +438,7 @@ func TestPTYLaunchAndReplayStartResultOnNewLineAndKeepPromptSeparate(t *testing.
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- sh.Run(ctx) }()
-	waitPTYLine(t, got, "crl [GET] [Mint: OFF] >", 3*time.Second)
+	waitPTYLine(t, got, testPrompt, 3*time.Second)
 
 	// crl.launch actif : la sortie doit commencer après la ligne de commande
 	// et le prompt ne doit pas être collé au dernier en-tête/corps.
@@ -446,14 +446,14 @@ func TestPTYLaunchAndReplayStartResultOnNewLineAndKeepPromptSeparate(t *testing.
 		t.Fatal(err)
 	}
 	waitPTYText(t, got, "URL configurée", 3*time.Second)
-	waitPTYLine(t, got, "crl [GET] [Mint: OFF] >", 3*time.Second)
+	waitPTYLine(t, got, testPrompt, 3*time.Second)
 	if _, err := master.Write([]byte("crl.launch\r")); err != nil {
 		t.Fatal(err)
 	}
 	waitPTYText(t, got, "Corps de la réponse", 5*time.Second)
-	waitPTYLine(t, got, "crl [GET] [Mint: OFF] >", 5*time.Second)
+	waitPTYLine(t, got, testPrompt, 5*time.Second)
 	launchScreen := screenFrom(got.String())
-	if !previousLineIsBlank(launchScreen.text(), "crl [GET] [Mint: OFF] >") {
+	if !previousLineIsBlank(launchScreen.text(), testPrompt) {
 		t.Fatalf("prompt collé à crl.launch :\n%s", launchScreen.text())
 	}
 
@@ -465,9 +465,9 @@ func TestPTYLaunchAndReplayStartResultOnNewLineAndKeepPromptSeparate(t *testing.
 	waitPTYText(t, got, "RÉPONSE #1", 5*time.Second)
 	waitPTYText(t, got, "En-têtes de réponse", 5*time.Second)
 	waitPTYText(t, got, "Corps — JSON", 5*time.Second)
-	waitPTYLine(t, got, "crl [GET] [Mint: OFF] [Envoyées: 1/1] >", 5*time.Second)
+	waitPTYLine(t, got, testPrompt, 5*time.Second)
 	replayScreen := screenFrom(got.String())
-	if !previousLineIsBlank(replayScreen.text(), "crl [GET] [Mint: OFF] [Envoyées: 1/1] >") {
+	if !previousLineIsBlank(replayScreen.text(), testPrompt) {
 		t.Fatalf("prompt collé au rejeu :\n%s", replayScreen.text())
 	}
 	for _, want := range []string{"Résumé", "Résultats", "RÉPONSE #1", "Statut", "Corps — JSON"} {

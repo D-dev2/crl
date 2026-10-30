@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"strings"
 	"unicode/utf8"
 )
@@ -82,7 +83,18 @@ func HeaderSensitive(name string) bool {
 // d'authentification (Bearer, Basic, ...) est conservé : il aide à
 // comprendre la requête sans révéler le secret.
 func MaskHeaderValue(name, value string) string {
-	return value
+	if !HeaderSensitive(name) || strings.TrimSpace(value) == "" {
+		return value
+	}
+	// Les schémas d'authentification (Bearer, Basic, Digest…) restent
+	// visibles : ils indiquent le mécanisme sans révéler le secret.
+	if i := strings.IndexByte(value, ' '); i > 0 {
+		switch strings.ToLower(value[:i]) {
+		case "bearer", "basic", "digest", "negotiate", "ntlm", "token", "apikey", "api-key":
+			return value[:i] + " ***"
+		}
+	}
+	return "***"
 }
 
 // HeaderLine rend une ligne d'en-tête prête pour l'affichage, valeur
@@ -112,7 +124,38 @@ func QuerySensitive(name string) bool {
 // La structure brute de l'URL (encodage, paramètres répétés, valeurs vides,
 // ordre) est préservée ; seul le texte affiché est modifié.
 func MaskURL(raw string) string {
-	return raw
+	q := strings.IndexByte(raw, '?')
+	if q < 0 {
+		return raw
+	}
+	query := raw[q+1:]
+	fragment := ""
+	if h := strings.IndexByte(query, '#'); h >= 0 {
+		fragment = query[h:]
+		query = query[:h]
+	}
+	if query == "" {
+		return raw
+	}
+	segments := strings.Split(query, "&")
+	for i, segment := range segments {
+		if segment == "" {
+			continue
+		}
+		name := segment
+		if eq := strings.IndexByte(segment, '='); eq >= 0 {
+			name = segment[:eq]
+		}
+		decoded, err := url.QueryUnescape(name)
+		if err != nil {
+			decoded = name
+		}
+		if !QuerySensitive(decoded) {
+			continue
+		}
+		segments[i] = name + "=***"
+	}
+	return raw[:q+1] + strings.Join(segments, "&") + fragment
 }
 
 func RenderBody(body []byte, limit int) (string, bool) {
@@ -137,7 +180,52 @@ func RenderBody(body []byte, limit int) (string, bool) {
 // MaskBody returns a display-only copy of a JSON body with common credential
 // fields obscured. The bytes held by a request are never modified.
 func MaskBody(body []byte) []byte {
-	return append([]byte(nil), body...)
+	copied := append([]byte(nil), body...)
+	decoder := json.NewDecoder(bytes.NewReader(copied))
+	decoder.UseNumber()
+	var root any
+	if err := decoder.Decode(&root); err != nil {
+		return copied
+	}
+	masked, changed := maskJSONValue(root)
+	if !changed {
+		return copied
+	}
+	encoded, err := json.MarshalIndent(masked, "", "  ")
+	if err != nil {
+		return copied
+	}
+	return encoded
+}
+
+// maskJSONValue masque les valeurs des propriétés dont le nom est sensible.
+// Le booléen indique si au moins une valeur a été remplacée.
+func maskJSONValue(value any) (any, bool) {
+	switch node := value.(type) {
+	case map[string]any:
+		changed := false
+		for key, child := range node {
+			if QuerySensitive(key) {
+				node[key] = "***"
+				changed = true
+				continue
+			}
+			updated, childChanged := maskJSONValue(child)
+			node[key] = updated
+			changed = changed || childChanged
+		}
+		return node, changed
+	case []any:
+		changed := false
+		for i, child := range node {
+			updated, childChanged := maskJSONValue(child)
+			node[i] = updated
+			changed = changed || childChanged
+		}
+		return node, changed
+	default:
+		return value, false
+	}
 }
 
 func hasBinaryControl(body []byte) bool {

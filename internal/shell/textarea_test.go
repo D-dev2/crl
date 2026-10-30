@@ -93,6 +93,37 @@ func TestTextAreaFrameIsCompactAndRedrawClearsPreviousFrame(t *testing.T) {
 	small.Draw(palette{}, false)
 }
 
+func TestTextAreaRendersControlCharactersWithoutTerminalSideEffects(t *testing.T) {
+	original := "entête\r\n\tligne accentuée éàü \x1b[31mrouge\x00fin\rdernière"
+	var out bytes.Buffer
+	a := newTextArea(&out, "BODY", "test", []byte(original))
+	a.SetSize(70, 20)
+	a.Draw(palette{}, false)
+	got := out.String()
+
+	if a.Text() != original {
+		t.Fatalf("l'affichage a modifié le contenu : %q, attendu %q", a.Text(), original)
+	}
+	if strings.Contains(got, "\x00") || strings.Contains(got, "\t") {
+		t.Fatalf("caractère de contrôle brut dans le panneau : %q", got)
+	}
+	if strings.Contains(got, "\x1b[31m") {
+		t.Fatalf("séquence ANSI du contenu interprétée par le terminal : %q", got)
+	}
+	for i := 0; i < len(got); i++ {
+		if got[i] != '\r' {
+			continue
+		}
+		if i == 0 || (i+1 < len(got) && (got[i+1] == '\n' || got[i+1] == '\x1b')) {
+			continue
+		}
+		t.Fatalf("retour chariot brut hors fin de ligne à l'offset %d : %q", i, got)
+	}
+	if !strings.Contains(got, "␍") || !strings.Contains(got, "·") {
+		t.Fatalf("les contrôles ne sont pas rendus de façon visible : %q", got)
+	}
+}
+
 func TestTextAreaEscapeAndValidationPreserveOriginal(t *testing.T) {
 	sh, _, _, _, b := newTestShell(t, "")
 	if err := b.SetJSON(`{"role":"user"}`); err != nil {

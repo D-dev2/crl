@@ -14,10 +14,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"crl-cli/internal/display"
@@ -519,14 +521,32 @@ func (s *Shell) formatNotification(n mint.Notification) []string {
 	}
 }
 
-// Execute traite une ligne de commande. Il retourne true si le shell doit
-// se terminer.
+// Execute traite une ligne de commande, éventuellement composée de plusieurs
+// commandes séparées par « & ». Il retourne true si le shell doit se terminer.
 func (s *Shell) Execute(line string) bool {
+	parts := splitCommandChain(line)
+	if len(parts) == 0 {
+		return false
+	}
+	s.lastFailed = false
+	for i, part := range parts {
+		if s.executeOne(part) {
+			return true
+		}
+		// Une commande en échec interrompt l'enchaînement : « crl.host …
+		// & crl.launch » ne doit pas envoyer une requête incomplète.
+		if s.lastFailed && i < len(parts)-1 {
+			break
+		}
+	}
+	return false
+}
+
+func (s *Shell) executeOne(line string) bool {
 	line = strings.TrimSpace(line)
 	if line == "" {
 		return false
 	}
-	s.lastFailed = false
 	cmd, rest := splitCommand(line)
 	switch cmd {
 	case "help", "?":
@@ -553,31 +573,13 @@ func (s *Shell) Execute(line string) bool {
 	case "crl.head.clear", "crl.header.clear":
 		s.cmdHeaderClear(rest)
 	case "crl.json":
-		if strings.EqualFold(strings.TrimSpace(rest), "clear") {
-			s.builder.ClearBody()
-			s.printf("[CRL] Corps supprimé.\n")
-		} else if strings.TrimSpace(rest) == "" {
-			s.showJSONState()
-		} else if words := shellWords(rest); len(words) > 1 && (strings.EqualFold(words[1], "set") || strings.EqualFold(words[1], "delete") || strings.EqualFold(words[1], "edit") || strings.EqualFold(words[1], "clear")) {
-			s.cmdTargetJSON(rest)
-		} else if strings.HasPrefix(strings.TrimSpace(rest), "set ") {
-			s.cmdJSONSet(rest)
-		} else if strings.HasPrefix(strings.TrimSpace(rest), "delete ") {
-			s.cmdJSONDelete(rest)
-		} else {
-			s.cmdJSON(rest)
-		}
+		s.cmdJSONCommand(rest)
 	case "crl.body":
-		if strings.EqualFold(strings.TrimSpace(rest), "clear") {
-			s.builder.ClearBody()
-			s.printf("[CRL] Corps supprimé.\n")
-		} else if strings.TrimSpace(rest) == "" {
-			s.showBodyState()
-		} else if words := shellWords(rest); len(words) > 1 && (strings.EqualFold(words[1], "edit") || strings.EqualFold(words[1], "clear") || strings.EqualFold(words[1], "set")) {
-			s.cmdTargetBody(rest)
-		} else {
-			s.cmdBody(rest)
-		}
+		s.cmdBodyCommand(rest)
+	case "crl.cookie":
+		s.cmdCookie(rest)
+	case "crl.param":
+		s.cmdParam(rest)
 	case "crl.body.clear":
 		s.builder.ClearBody()
 		s.printf("[CRL] Corps supprimé.\n")
@@ -669,6 +671,42 @@ func (s *Shell) executeMint(cmd, rest string) {
 }
 
 func (s *Shell) cmdSetURL(rest string) {
+	words := shellWords(rest)
+	if len(words) > 0 && (strings.EqualFold(words[0], "add") || strings.EqualFold(words[0], "remove")) {
+		action := strings.ToLower(words[0])
+		target, tail := takeTargetSpec(words[1:])
+		if target == "" {
+			if action == "add" {
+				s.errorf("usage : crl.host add <cible> <url>")
+			} else {
+				s.errorf("usage : crl.host remove <cible>")
+			}
+			return
+		}
+		captures, err := s.resolveTargets(target)
+		if err != nil {
+			s.errorf("%v", err)
+			return
+		}
+		if action == "add" {
+			if len(tail) == 0 {
+				s.errorf("usage : crl.host add <cible> <url>")
+				return
+			}
+			rawURL := strings.Join(tail, " ")
+			s.applyCaptureChanges(captures, func(b *request.Builder) error { return b.SetURL(rawURL) })
+			return
+		}
+		if len(tail) != 0 {
+			s.errorf("usage : crl.host remove <cible>")
+			return
+		}
+		s.applyCaptureChanges(captures, func(b *request.Builder) error {
+			b.ClearURL()
+			return nil
+		})
+		return
+	}
 	if rest == "" {
 		if s.builder.URL() == "" {
 			s.errorf("aucune URL configurée. usage : crl.host <url>")
@@ -689,7 +727,41 @@ func (s *Shell) cmdSetMethod(rest string) {
 		s.printf("[CRL] Méthode : %s\n", s.builder.Method())
 		return
 	}
-	if words := shellWords(rest); len(words) >= 3 && strings.EqualFold(words[1], "set") {
+	words := shellWords(rest)
+	if len(words) > 0 && (strings.EqualFold(words[0], "add") || strings.EqualFold(words[0], "remove")) {
+		action := strings.ToLower(words[0])
+		target, tail := takeTargetSpec(words[1:])
+		if target == "" {
+			if action == "add" {
+				s.errorf("usage : crl.method add <cible> <méthode>")
+			} else {
+				s.errorf("usage : crl.method remove <cible>")
+			}
+			return
+		}
+		captures, err := s.resolveTargets(target)
+		if err != nil {
+			s.errorf("%v", err)
+			return
+		}
+		if action == "add" {
+			if len(tail) != 1 {
+				s.errorf("usage : crl.method add <cible> <méthode>")
+				return
+			}
+			method := tail[0]
+			s.applyCaptureChanges(captures, func(b *request.Builder) error { return b.SetMethod(method) })
+			return
+		}
+		if len(tail) != 0 {
+			s.errorf("usage : crl.method remove <cible>")
+			return
+		}
+		s.applyCaptureChanges(captures, func(b *request.Builder) error { return b.SetMethod("GET") })
+		return
+	}
+	// Ancienne forme conservée : crl.method <méthode> set <cible>.
+	if len(words) >= 3 && strings.EqualFold(words[1], "set") {
 		captures, err := s.resolveTargets(strings.Join(words[2:], " "))
 		if err != nil {
 			s.errorf("%v", err)
@@ -707,9 +779,12 @@ func (s *Shell) cmdSetMethod(rest string) {
 
 func (s *Shell) cmdHeader(rest string) {
 	words := shellWords(rest)
-	if len(words) > 0 && (strings.EqualFold(words[0], "set") || strings.EqualFold(words[0], "delete") || strings.EqualFold(words[0], "show")) {
-		s.cmdTargetHeader(words)
-		return
+	if len(words) > 0 {
+		switch strings.ToLower(words[0]) {
+		case "add", "remove", "set", "delete", "show":
+			s.cmdTargetHeader(words)
+			return
+		}
 	}
 	switch {
 	case rest == "":
@@ -759,6 +834,406 @@ func (s *Shell) cmdHeaderClear(rest string) {
 	} else {
 		s.printf("[CRL] %d en-tête(s) %q supprimé(s).\n", n, rest)
 	}
+}
+
+func (s *Shell) cmdCookie(rest string) {
+	words := shellWords(rest)
+	if len(words) == 0 {
+		if value := builderCookie(s.builder); value == "" {
+			s.printf("[CRL] Aucun cookie configuré.\n")
+		} else {
+			s.printf("[CRL] Cookie : %s\n", s.headerValue("Cookie", value))
+		}
+		return
+	}
+	if strings.EqualFold(words[0], "clear") {
+		target, tail := takeTargetSpec(words[1:])
+		if target == "" {
+			if len(tail) != 0 {
+				s.errorf("usage : crl.cookie clear [<cible>]")
+				return
+			}
+			s.builder.RemoveHeader("Cookie")
+			s.printf("[CRL] Cookies du constructeur supprimés.\n")
+			return
+		}
+		if len(tail) != 0 {
+			s.errorf("usage : crl.cookie clear <cible>")
+			return
+		}
+		captures, err := s.resolveTargets(target)
+		if err != nil {
+			s.errorf("%v", err)
+			return
+		}
+		s.applyCaptureChanges(captures, func(b *request.Builder) error {
+			b.RemoveHeader("Cookie")
+			return nil
+		})
+		return
+	}
+	if strings.EqualFold(words[0], "add") {
+		target, tail := takeTargetSpec(words[1:])
+		if target == "" || len(tail) == 0 {
+			s.errorf("usage : crl.cookie add <cible> <nom>=<valeur>")
+			return
+		}
+		captures, err := s.resolveTargets(target)
+		if err != nil {
+			s.errorf("%v", err)
+			return
+		}
+		name, value, err := parseCookieAssignment(strings.Join(tail, " "))
+		if err != nil {
+			s.errorf("%v", err)
+			return
+		}
+		s.applyCaptureChanges(captures, func(b *request.Builder) error { return setCookie(b, name, value) })
+		return
+	}
+	if strings.EqualFold(words[0], "remove") {
+		target, tail := takeTargetSpec(words[1:])
+		if target != "" {
+			if len(tail) != 1 {
+				s.errorf("usage : crl.cookie remove <cible> <nom>")
+				return
+			}
+			captures, err := s.resolveTargets(target)
+			if err != nil {
+				s.errorf("%v", err)
+				return
+			}
+			name := tail[0]
+			s.applyCaptureChanges(captures, func(b *request.Builder) error { return removeCookie(b, name) })
+			return
+		}
+		if len(tail) != 1 {
+			s.errorf("usage : crl.cookie remove <cible> <nom> | crl.cookie remove <nom>")
+			return
+		}
+		if err := removeCookie(s.builder, tail[0]); err != nil {
+			s.errorf("%v", err)
+			return
+		}
+		s.printf("[CRL] Cookie %q supprimé.\n", tail[0])
+		return
+	}
+	name, value, err := parseCookieAssignment(rest)
+	if err != nil {
+		s.errorf("%v", err)
+		return
+	}
+	if err := setCookie(s.builder, name, value); err != nil {
+		s.errorf("%v", err)
+		return
+	}
+	s.printf("[CRL] Cookie %q configuré.\n", name)
+}
+
+func parseCookieAssignment(raw string) (name, value string, err error) {
+	i := strings.IndexByte(raw, '=')
+	if i <= 0 {
+		return "", "", fmt.Errorf("format attendu : <nom>=<valeur>")
+	}
+	name = strings.TrimSpace(raw[:i])
+	if name == "" {
+		return "", "", fmt.Errorf("nom de cookie vide")
+	}
+	if strings.ContainsAny(name, ";= \t\r\n") {
+		return "", "", fmt.Errorf("nom de cookie invalide %q", name)
+	}
+	return name, strings.TrimSpace(raw[i+1:]), nil
+}
+
+func builderCookie(b *request.Builder) string {
+	for _, h := range b.Headers() {
+		if strings.EqualFold(h.Name, "Cookie") {
+			return h.Value
+		}
+	}
+	return ""
+}
+
+type cookiePair struct {
+	name string
+	raw  string
+}
+
+func parseCookiePairs(value string) []cookiePair {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	segments := strings.Split(value, ";")
+	pairs := make([]cookiePair, 0, len(segments))
+	for _, segment := range segments {
+		segment = strings.TrimSpace(segment)
+		if segment == "" {
+			continue
+		}
+		name := segment
+		if i := strings.IndexByte(segment, '='); i >= 0 {
+			name = strings.TrimSpace(segment[:i])
+		}
+		pairs = append(pairs, cookiePair{name: name, raw: segment})
+	}
+	return pairs
+}
+
+func joinCookiePairs(pairs []cookiePair) string {
+	raw := make([]string, 0, len(pairs))
+	for _, pair := range pairs {
+		raw = append(raw, pair.raw)
+	}
+	return strings.Join(raw, "; ")
+}
+
+func setCookie(b *request.Builder, name, value string) error {
+	pairs := parseCookiePairs(builderCookie(b))
+	replaced := false
+	for i, pair := range pairs {
+		if pair.name == name {
+			pairs[i] = cookiePair{name: name, raw: name + "=" + value}
+			replaced = true
+		}
+	}
+	if !replaced {
+		pairs = append(pairs, cookiePair{name: name, raw: name + "=" + value})
+	}
+	return b.SetHeader("Cookie", joinCookiePairs(pairs))
+}
+
+func removeCookie(b *request.Builder, name string) error {
+	pairs := parseCookiePairs(builderCookie(b))
+	out := pairs[:0]
+	removed := false
+	for _, pair := range pairs {
+		if pair.name == name {
+			removed = true
+			continue
+		}
+		out = append(out, pair)
+	}
+	if !removed {
+		return fmt.Errorf("cookie %q absent", name)
+	}
+	if len(out) == 0 {
+		b.RemoveHeader("Cookie")
+		return nil
+	}
+	return b.SetHeader("Cookie", joinCookiePairs(out))
+}
+
+func (s *Shell) cmdParam(rest string) {
+	words := shellWords(rest)
+	if len(words) == 0 {
+		raw := s.builder.URL()
+		q := ""
+		if i := strings.IndexByte(raw, '?'); i >= 0 {
+			q = raw[i+1:]
+			if h := strings.IndexByte(q, '#'); h >= 0 {
+				q = q[:h]
+			}
+		}
+		if q == "" {
+			s.printf("[CRL] Aucun paramètre d'URL configuré.\n")
+		} else {
+			s.printf("[CRL] Paramètres d'URL : %s\n", display.MaskURL("?"+q))
+		}
+		return
+	}
+	if strings.EqualFold(words[0], "clear") {
+		target, tail := takeTargetSpec(words[1:])
+		if target == "" {
+			if len(tail) != 0 {
+				s.errorf("usage : crl.param clear [<cible>]")
+				return
+			}
+			updated, err := clearURLParams(s.builder.URL())
+			if err != nil {
+				s.errorf("%v", err)
+				return
+			}
+			if err := s.builder.SetURL(updated); err != nil {
+				s.errorf("%v", err)
+				return
+			}
+			s.printf("[CRL] Paramètres d'URL du constructeur supprimés.\n")
+			return
+		}
+		if len(tail) != 0 {
+			s.errorf("usage : crl.param clear <cible>")
+			return
+		}
+		captures, err := s.resolveTargets(target)
+		if err != nil {
+			s.errorf("%v", err)
+			return
+		}
+		s.applyCaptureChanges(captures, func(b *request.Builder) error {
+			updated, err := clearURLParams(b.URL())
+			if err != nil {
+				return err
+			}
+			return b.SetURL(updated)
+		})
+		return
+	}
+	if strings.EqualFold(words[0], "add") {
+		target, tail := takeTargetSpec(words[1:])
+		if target == "" || len(tail) == 0 {
+			s.errorf("usage : crl.param add <cible> <nom>=<valeur>")
+			return
+		}
+		captures, err := s.resolveTargets(target)
+		if err != nil {
+			s.errorf("%v", err)
+			return
+		}
+		name, value, err := parseCookieAssignment(strings.Join(tail, " "))
+		if err != nil {
+			s.errorf("paramètre invalide : %v", err)
+			return
+		}
+		s.applyCaptureChanges(captures, func(b *request.Builder) error { return setURLParam(b, name, value) })
+		return
+	}
+	if strings.EqualFold(words[0], "remove") {
+		target, tail := takeTargetSpec(words[1:])
+		if target != "" {
+			if len(tail) != 1 {
+				s.errorf("usage : crl.param remove <cible> <nom>")
+				return
+			}
+			captures, err := s.resolveTargets(target)
+			if err != nil {
+				s.errorf("%v", err)
+				return
+			}
+			name := tail[0]
+			s.applyCaptureChanges(captures, func(b *request.Builder) error { return removeURLParam(b, name) })
+			return
+		}
+		if len(tail) != 1 {
+			s.errorf("usage : crl.param remove <cible> <nom> | crl.param remove <nom>")
+			return
+		}
+		if err := removeURLParam(s.builder, tail[0]); err != nil {
+			s.errorf("%v", err)
+			return
+		}
+		s.printf("[CRL] Paramètre %q supprimé.\n", tail[0])
+		return
+	}
+	name, value, err := parseCookieAssignment(rest)
+	if err != nil {
+		s.errorf("%v", err)
+		return
+	}
+	if err := setURLParam(s.builder, name, value); err != nil {
+		s.errorf("%v", err)
+		return
+	}
+	s.printf("[CRL] Paramètre %q configuré.\n", name)
+}
+
+func splitURLFragment(raw string) (base, fragment string) {
+	if i := strings.IndexByte(raw, '#'); i >= 0 {
+		return raw[:i], raw[i:]
+	}
+	return raw, ""
+}
+
+func setURLParam(b *request.Builder, name, value string) error {
+	raw := b.URL()
+	if raw == "" {
+		return fmt.Errorf("aucune URL configurée")
+	}
+	base, fragment := splitURLFragment(raw)
+	path := base
+	query := ""
+	if i := strings.IndexByte(base, '?'); i >= 0 {
+		path = base[:i]
+		query = base[i+1:]
+	}
+	var segments []string
+	if query != "" {
+		segments = strings.Split(query, "&")
+	}
+	encodedName := url.QueryEscape(name)
+	encodedValue := url.QueryEscape(value)
+	replaced := false
+	for i, segment := range segments {
+		key := segment
+		if j := strings.IndexByte(segment, '='); j >= 0 {
+			key = segment[:j]
+		}
+		decoded, err := url.QueryUnescape(key)
+		if err == nil && decoded == name {
+			segments[i] = encodedName + "=" + encodedValue
+			replaced = true
+		}
+	}
+	if !replaced {
+		segments = append(segments, encodedName+"="+encodedValue)
+	}
+	updated := path
+	if len(segments) > 0 {
+		updated += "?" + strings.Join(segments, "&")
+	}
+	updated += fragment
+	return b.SetURL(updated)
+}
+
+func removeURLParam(b *request.Builder, name string) error {
+	raw := b.URL()
+	if raw == "" {
+		return fmt.Errorf("aucune URL configurée")
+	}
+	base, fragment := splitURLFragment(raw)
+	path := base
+	query := ""
+	if i := strings.IndexByte(base, '?'); i >= 0 {
+		path = base[:i]
+		query = base[i+1:]
+	}
+	if query == "" {
+		return fmt.Errorf("paramètre %q absent", name)
+	}
+	segments := strings.Split(query, "&")
+	out := segments[:0]
+	removed := false
+	for _, segment := range segments {
+		key := segment
+		if j := strings.IndexByte(segment, '='); j >= 0 {
+			key = segment[:j]
+		}
+		decoded, err := url.QueryUnescape(key)
+		if err == nil && decoded == name {
+			removed = true
+			continue
+		}
+		out = append(out, segment)
+	}
+	if !removed {
+		return fmt.Errorf("paramètre %q absent", name)
+	}
+	updated := path
+	if len(out) > 0 {
+		updated += "?" + strings.Join(out, "&")
+	}
+	updated += fragment
+	return b.SetURL(updated)
+}
+
+func clearURLParams(raw string) (string, error) {
+	if raw == "" {
+		return "", fmt.Errorf("aucune URL configurée")
+	}
+	base, fragment := splitURLFragment(raw)
+	if i := strings.IndexByte(base, '?'); i >= 0 {
+		base = base[:i]
+	}
+	return base + fragment, nil
 }
 
 func (s *Shell) startJSONEditor() {
@@ -1182,12 +1657,197 @@ func (s *Shell) cmdJSONDelete(rest string) {
 	s.printf("[CRL] Champ JSON supprimé (%d octets).\n", s.builder.BodySize())
 }
 
+func (s *Shell) cmdJSONCommand(rest string) {
+	trim := strings.TrimSpace(rest)
+	if trim == "" {
+		s.showJSONState()
+		return
+	}
+	words := shellWords(trim)
+	if len(words) > 0 {
+		switch strings.ToLower(words[0]) {
+		case "add":
+			s.cmdTargetJSONAdd(trim)
+			return
+		case "remove":
+			s.cmdTargetJSONRemove(trim)
+			return
+		}
+	}
+	if len(words) > 1 {
+		switch strings.ToLower(words[1]) {
+		case "set", "delete", "edit", "clear":
+			s.cmdTargetJSON(trim)
+			return
+		}
+	}
+	if strings.EqualFold(trim, "clear") {
+		s.builder.ClearBody()
+		s.printf("[CRL] Corps supprimé.\n")
+		return
+	}
+	if strings.HasPrefix(trim, "set ") {
+		s.cmdJSONSet(trim)
+		return
+	}
+	if strings.HasPrefix(trim, "delete ") {
+		s.cmdJSONDelete(trim)
+		return
+	}
+	s.cmdJSON(trim)
+}
+
+func splitTargetAndPayload(raw, verb string) (target, payload string, ok bool) {
+	raw = strings.TrimSpace(raw)
+	if len(raw) < len(verb) || !strings.EqualFold(raw[:len(verb)], verb) {
+		return "", "", false
+	}
+	remainder := strings.TrimSpace(raw[len(verb):])
+	pos := 0
+	var parts []string
+	for {
+		for pos < len(remainder) && unicode.IsSpace(rune(remainder[pos])) {
+			pos++
+		}
+		if pos >= len(remainder) {
+			break
+		}
+		start := pos
+		for pos < len(remainder) && !unicode.IsSpace(rune(remainder[pos])) {
+			pos++
+		}
+		token := remainder[start:pos]
+		if !isIDListToken(token) && !strings.EqualFold(token, "selected") && !strings.EqualFold(token, "all") {
+			pos = start
+			break
+		}
+		parts = append(parts, token)
+	}
+	if len(parts) == 0 {
+		return "", "", false
+	}
+	return strings.Join(parts, " "), strings.TrimSpace(remainder[pos:]), true
+}
+
+func (s *Shell) cmdTargetJSONAdd(raw string) {
+	target, payload, ok := splitTargetAndPayload(raw, "add")
+	if !ok || payload == "" {
+		s.errorf("usage : crl.json add <cible> <JSON>")
+		return
+	}
+	captures, err := s.resolveTargets(target)
+	if err != nil {
+		s.errorf("%v", err)
+		return
+	}
+	if err := validateJSON([]byte(payload)); err != nil {
+		s.errorf("%v", err)
+		return
+	}
+	s.applyCaptureChanges(captures, func(b *request.Builder) error { return b.SetJSON(payload) })
+	for _, c := range captures {
+		s.requestBodyReplaced[c.ID] = true
+	}
+}
+
+func (s *Shell) cmdTargetJSONRemove(raw string) {
+	target, payload, ok := splitTargetAndPayload(raw, "remove")
+	if !ok || payload != "" {
+		s.errorf("usage : crl.json remove <cible>")
+		return
+	}
+	captures, err := s.resolveTargets(target)
+	if err != nil {
+		s.errorf("%v", err)
+		return
+	}
+	s.applyCaptureChanges(captures, func(b *request.Builder) error {
+		b.ClearBody()
+		return nil
+	})
+	for _, c := range captures {
+		s.requestBodyReplaced[c.ID] = true
+	}
+}
+
 func (s *Shell) cmdJSON(rest string) {
 	if err := s.builder.SetJSON(rest); err != nil {
 		s.errorf("%v", err)
 		return
 	}
 	s.printf("[CRL] Corps JSON configuré (%d octets).\n", s.builder.BodySize())
+}
+
+func (s *Shell) cmdBodyCommand(rest string) {
+	trim := strings.TrimSpace(rest)
+	if trim == "" {
+		s.showBodyState()
+		return
+	}
+	words := shellWords(trim)
+	if len(words) > 0 {
+		switch strings.ToLower(words[0]) {
+		case "add":
+			s.cmdTargetBodyAdd(trim)
+			return
+		case "remove":
+			s.cmdTargetBodyRemove(trim)
+			return
+		}
+	}
+	if len(words) > 1 {
+		switch strings.ToLower(words[1]) {
+		case "edit", "clear", "set":
+			s.cmdTargetBody(trim)
+			return
+		}
+	}
+	if strings.EqualFold(trim, "clear") {
+		s.builder.ClearBody()
+		s.printf("[CRL] Corps supprimé.\n")
+		return
+	}
+	s.cmdBody(trim)
+}
+
+func (s *Shell) cmdTargetBodyAdd(raw string) {
+	target, payload, ok := splitTargetAndPayload(raw, "add")
+	if !ok || payload == "" {
+		s.errorf("usage : crl.body add <cible> <texte>")
+		return
+	}
+	captures, err := s.resolveTargets(target)
+	if err != nil {
+		s.errorf("%v", err)
+		return
+	}
+	s.applyCaptureChanges(captures, func(b *request.Builder) error {
+		b.SetBodyText(payload)
+		return nil
+	})
+	for _, c := range captures {
+		s.requestBodyReplaced[c.ID] = true
+	}
+}
+
+func (s *Shell) cmdTargetBodyRemove(raw string) {
+	target, payload, ok := splitTargetAndPayload(raw, "remove")
+	if !ok || payload != "" {
+		s.errorf("usage : crl.body remove <cible>")
+		return
+	}
+	captures, err := s.resolveTargets(target)
+	if err != nil {
+		s.errorf("%v", err)
+		return
+	}
+	s.applyCaptureChanges(captures, func(b *request.Builder) error {
+		b.ClearBody()
+		return nil
+	})
+	for _, c := range captures {
+		s.requestBodyReplaced[c.ID] = true
+	}
 }
 
 func (s *Shell) cmdBody(rest string) {
@@ -1270,12 +1930,31 @@ func (s *Shell) cmdCA(rest string) {
 }
 
 func (s *Shell) cmdShow(rest string) {
-	if s.history != nil {
+	// Sans argument, le constructeur actif reste prioritaire dès qu'il est
+	// configuré : une sélection Mint ne doit jamais masquer son état.
+	if s.history != nil && (strings.TrimSpace(rest) != "" || s.builder.IsEmpty()) {
 		selected := s.history.SelectedMany()
 		if strings.TrimSpace(rest) != "" {
 			words := shellWords(rest)
 			if len(words) == 0 {
 				s.errorf("usage : crl.show [id [body [offset]]]")
+				return
+			}
+			if strings.EqualFold(words[0], "selected") {
+				if len(words) != 1 {
+					s.errorf("usage : crl.show selected")
+					return
+				}
+				if len(selected) == 0 {
+					s.printf("[CRL] Aucune capture sélectionnée.\n")
+					return
+				}
+				p := s.pal
+				s.printf("[CRL] Requêtes sélectionnées (%d) — détails\n", len(selected))
+				for _, c := range selected {
+					s.showCapture(c, 0)
+				}
+				s.printf("\n%s\n", p.Dim("crl.show <id> pour une requête · crl.launch / mint.replay pour envoyer"))
 				return
 			}
 			if strings.EqualFold(words[0], "body") {
@@ -1491,7 +2170,7 @@ func (s *Shell) showCapture(c mint.Capture, offset int) {
 			rendered, _ := display.RenderBody(page, 0)
 			bodyWidth := max(10, width-4)
 			for _, line := range strings.Split(rendered, "\n") {
-				for _, wline := range display.WrapText(line, bodyWidth) {
+				for _, wline := range display.WrapText(sanitizeTerminal(line), bodyWidth) {
 					s.printf("│   %s\n", wline)
 				}
 			}
@@ -1506,7 +2185,7 @@ func (s *Shell) showCapture(c mint.Capture, offset int) {
 		rendered, _ := display.RenderBody(displayBody, 0)
 		bodyWidth := max(10, width-4)
 		for _, line := range strings.Split(rendered, "\n") {
-			for _, wline := range display.WrapText(line, bodyWidth) {
+			for _, wline := range display.WrapText(sanitizeTerminal(line), bodyWidth) {
 				s.printf("│   %s\n", wline)
 			}
 		}
@@ -1515,7 +2194,9 @@ func (s *Shell) showCapture(c mint.Capture, offset int) {
 }
 
 func (s *Shell) cmdTable() {
-	if s.history != nil {
+	// Le constructeur actif est prioritaire ; la sélection ne sert de repli
+	// que lorsqu'aucune requête n'est en cours de préparation.
+	if s.history != nil && s.builder.IsEmpty() {
 		selected := s.history.SelectedMany()
 		if len(selected) > 0 {
 			p := s.pal
@@ -1609,11 +2290,19 @@ func (s *Shell) cmdOutput(rest string) {
 }
 
 func (s *Shell) cmdLaunch(rest string) {
-	if rest != "" && !strings.EqualFold(strings.TrimSpace(rest), "active") {
+	rest = strings.TrimSpace(rest)
+	// "all" est une cible explicite pour certaines commandes ciblées, mais
+	// jamais pour crl.launch : l'utilisateur doit d'abord construire la
+	// sélection avec mint.select afin qu'aucune capture ne parte par accident.
+	if strings.EqualFold(rest, "all") {
+		s.errorf(`"all" n'est pas une cible valide pour crl.launch. Utilisez "mint.select all", puis "crl.launch" pour rejouer les captures sélectionnées.`)
+		return
+	}
+	if rest != "" && !strings.EqualFold(rest, "active") {
 		s.cmdMintReplay(rest)
 		return
 	}
-	if strings.TrimSpace(rest) == "" && s.history != nil && len(s.history.SelectedMany()) > 0 {
+	if rest == "" && s.history != nil && len(s.history.SelectedMany()) > 0 {
 		s.cmdMintReplay("")
 		return
 	}
@@ -2392,6 +3081,37 @@ func (s *Shell) resolveTargets(spec string) ([]mint.Capture, error) {
 	return out, nil
 }
 
+// takeTargetSpec consomme les premiers mots qui désignent une ou plusieurs
+// captures. Il permet d'écrire « crl.head add 1 2 X-Test: oui » sans confondre
+// les identifiants avec le nom d'en-tête ou la valeur qui suit.
+func takeTargetSpec(words []string) (spec string, rest []string) {
+	if len(words) == 0 {
+		return "", nil
+	}
+	if strings.EqualFold(words[0], "selected") || strings.EqualFold(words[0], "all") {
+		return words[0], words[1:]
+	}
+	var parts []string
+	for len(words) > 0 && isIDListToken(words[0]) {
+		parts = append(parts, words[0])
+		words = words[1:]
+	}
+	return strings.Join(parts, " "), words
+}
+
+func isIDListToken(token string) bool {
+	parts := strings.Fields(strings.ReplaceAll(token, ",", " "))
+	if len(parts) == 0 {
+		return false
+	}
+	for _, part := range parts {
+		if _, err := parseID(part); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Shell) applyCaptureChanges(captures []mint.Capture, change func(*request.Builder) error) {
 	ok, failed := 0, 0
 	for _, c := range captures {
@@ -2411,17 +3131,21 @@ func (s *Shell) applyCaptureChanges(captures []mint.Capture, change func(*reques
 
 func (s *Shell) cmdTargetHeader(words []string) {
 	if len(words) < 2 {
-		s.errorf("usage : crl.head set <cible> <nom> <valeur> | delete <cible> <nom> | show <cible>")
+		s.errorf("usage : crl.head add|remove <cible> <nom>: <valeur> | show <cible>")
 		return
 	}
 	action := strings.ToLower(words[0])
-	targets := words[1]
+	target, rest := takeTargetSpec(words[1:])
+	if target == "" {
+		s.errorf("usage : crl.head add|remove <cible> <nom>: <valeur> | show <cible>")
+		return
+	}
 	if action == "show" {
-		if len(words) != 2 {
+		if len(rest) != 0 {
 			s.errorf("usage : crl.head show <cible>")
 			return
 		}
-		captures, err := s.resolveTargets(targets)
+		captures, err := s.resolveTargets(target)
 		if err != nil {
 			s.errorf("%v", err)
 			return
@@ -2439,35 +3163,89 @@ func (s *Shell) cmdTargetHeader(words []string) {
 		}
 		return
 	}
-	if len(words) < 3 {
-		s.errorf("usage : crl.head set <cible> <nom> <valeur> | delete <cible> <nom>")
+	if len(rest) == 0 {
+		s.errorf("usage : crl.head add|remove <cible> <nom>: <valeur>")
 		return
 	}
-	name := words[2]
-	captures, err := s.resolveTargets(targets)
+	name := rest[0]
+	value := ""
+	switch action {
+	case "add", "set":
+		var parseErr error
+		name, value, parseErr = parseTargetHeaderArgs(rest)
+		if parseErr != nil {
+			s.errorf("%v", parseErr)
+			return
+		}
+	case "remove", "delete":
+		if len(rest) != 1 {
+			s.errorf("usage : crl.head remove <cible> <nom>")
+			return
+		}
+		name = strings.TrimSuffix(strings.TrimSpace(name), ":")
+		if err := request.ValidateHeader(name, ""); err != nil {
+			s.errorf("%v", err)
+			return
+		}
+	default:
+		s.errorf("commande d'en-tête inconnue : %s", action)
+		return
+	}
+	captures, err := s.resolveTargets(target)
 	if err != nil {
 		s.errorf("%v", err)
 		return
 	}
-	if action == "set" {
-		if len(words) < 4 {
-			s.errorf("valeur d'en-tête manquante")
-			return
-		}
-		value := strings.Join(words[3:], " ")
+	if action == "add" || action == "set" {
 		s.applyCaptureChanges(captures, func(b *request.Builder) error { return b.SetHeader(name, value) })
 		return
 	}
-	if action == "delete" {
-		s.applyCaptureChanges(captures, func(b *request.Builder) error {
-			if b.RemoveHeader(name) == 0 {
-				return fmt.Errorf("en-tête %q absent", name)
-			}
-			return nil
-		})
-		return
+	s.applyCaptureChanges(captures, func(b *request.Builder) error {
+		if b.RemoveHeader(name) == 0 {
+			return fmt.Errorf("en-tête %q absent", name)
+		}
+		return nil
+	})
+}
+
+// parseTargetHeaderArgs accepte les deux formes documentées :
+// « Nom valeur » (compatibilité) et « Nom: valeur » (forme HTTP naturelle).
+// Le premier deux-points sépare le nom de la valeur ; les deux-points suivants
+// restent intacts dans la valeur. Les mots déjà découpés par shellWords
+// conservent les espaces des valeurs entre guillemets.
+func parseTargetHeaderArgs(args []string) (name, value string, err error) {
+	if len(args) == 0 {
+		return "", "", fmt.Errorf("nom d'en-tête manquant")
 	}
-	s.errorf("commande d'en-tête inconnue : %s", action)
+	head := args[0]
+	hasValue := len(args) > 1
+	if i := strings.IndexByte(head, ':'); i >= 0 {
+		name = strings.TrimSpace(head[:i])
+		value = strings.TrimSpace(head[i+1:])
+		if len(args) > 1 {
+			rest := strings.TrimSpace(strings.Join(args[1:], " "))
+			if value == "" {
+				value = rest
+			} else if rest != "" {
+				value += " " + rest
+			}
+		}
+	} else {
+		name = strings.TrimSpace(head)
+		if len(args) > 1 {
+			value = strings.TrimSpace(strings.Join(args[1:], " "))
+		}
+	}
+	if name == "" {
+		return "", "", fmt.Errorf("nom d'en-tête vide")
+	}
+	if !hasValue && value == "" {
+		return "", "", fmt.Errorf("valeur d'en-tête manquante")
+	}
+	if err := request.ValidateHeader(name, value); err != nil {
+		return "", "", err
+	}
+	return name, value, nil
 }
 
 // shellWords handles quoted command arguments without invoking a shell.
@@ -3160,66 +3938,300 @@ func processStateText(p palette, state mint.State) string {
 	}
 }
 
+// promptCell est une case indépendante de l'invite. La version plain sert au
+// calcul de largeur, la version styled au rendu terminal.
+type promptCell struct {
+	plain  string
+	styled string
+}
+
+type promptLevel int
+
+const (
+	promptFull promptLevel = iota
+	promptMedium
+	promptCompact
+	promptNarrow
+	promptTight
+	promptTiny
+	promptMinimal
+)
+
+// promptText construit une invite strictement monoligne. Les informations
+// sont regroupées en cases indépendantes, puis le niveau de détail le plus
+// riche qui tient dans la largeur du terminal est choisi. Aucune URL ni aucun
+// domaine n'est affiché.
 func (s *Shell) promptText() string {
-	status := s.manager.Status()
-	mintStateStr := "OFF"
-	if status.State == mint.StateRunning {
-		mintStateStr = "ON"
+	width := s.termWidth()
+	if width < 20 {
+		width = 20
 	}
+	for _, level := range []promptLevel{promptFull, promptMedium, promptCompact, promptNarrow, promptTight, promptTiny, promptMinimal} {
+		cells := s.promptCells(level)
+		if promptCellsWidth(cells) <= width {
+			return renderPromptCells(cells)
+		}
+	}
+	// Terminal extrêmement étroit : on conserve l'essentiel, sans jamais
+	// dépasser la ligne ni produire de retour à la ligne.
+	return s.pal.Cyan("crl") + "  " + s.pal.Magenta("$")
+}
+
+func (s *Shell) promptCells(level promptLevel) []promptCell {
+	p := s.pal
+	cells := []promptCell{{plain: "crl", styled: p.Cyan("crl")}}
+
+	mintPlain, mintStyled := s.promptMint(level == promptTight || level == promptTiny || level == promptMinimal)
+	cells = append(cells, promptCell{plain: mintPlain, styled: mintStyled})
+
+	if level != promptMinimal {
+		var selPlain, selStyled string
+		var ok bool
+		switch level {
+		case promptFull, promptMedium:
+			selPlain, selStyled, ok = s.promptSelection(true)
+		case promptCompact, promptNarrow, promptTight, promptTiny:
+			selPlain, selStyled, ok = s.promptSelectionList()
+			if !ok {
+				selPlain, selStyled, ok = s.promptSelection(false)
+			}
+		}
+		if ok {
+			cells = append(cells, promptCell{plain: selPlain, styled: selStyled})
+		}
+	}
+
+	builderPlain, builderStyled := s.promptBuilder(level == promptFull || level == promptMedium)
+	cells = append(cells, promptCell{plain: builderPlain, styled: builderStyled})
+
+	if level != promptMinimal && level != promptTiny {
+		if proxyPlain, proxyStyled, ok := s.promptProxy(level == promptNarrow || level == promptCompact || level == promptTight); ok {
+			cells = append(cells, promptCell{plain: proxyPlain, styled: proxyStyled})
+		}
+	}
+
+	suffix := "$"
+	suffixStyled := p.Magenta(suffix)
+	if s.lastFailed {
+		suffixStyled = p.BoldRed(suffix)
+	}
+	cells = append(cells, promptCell{plain: suffix, styled: suffixStyled})
+	return cells
+}
+
+func promptCellsWidth(cells []promptCell) int {
+	total := 0
+	for i, cell := range cells {
+		if i > 0 {
+			total++
+		}
+		total += utf8.RuneCountInString(cell.plain)
+	}
+	// Deux espaces avant le « $ » final, comme dans le dessin cible.
+	return total + 2
+}
+
+func renderPromptCells(cells []promptCell) string {
+	if len(cells) == 0 {
+		return "$"
+	}
+	parts := make([]string, 0, len(cells)-1)
+	for _, cell := range cells[:len(cells)-1] {
+		parts = append(parts, cell.styled)
+	}
+	if len(parts) == 0 {
+		return "  " + cells[len(cells)-1].styled
+	}
+	return strings.Join(parts, " ") + "  " + cells[len(cells)-1].styled
+}
+
+func (s *Shell) promptMint(short bool) (plain, styled string) {
+	p := s.pal
+	state := mint.State("")
+	if s.manager != nil {
+		state = s.manager.Status().State
+	}
+	label := "?"
+	style := p.Dim
+	switch state {
+	case mint.StateRunning:
+		label, style = "ON", p.BoldGreen
+	case mint.StateStarting:
+		label, style = "START", p.BoldYellow
+	case mint.StateStopping:
+		label, style = "STOP", p.BoldYellow
+	case mint.StateFailed:
+		label, style = "ERR", p.BoldRed
+	case mint.StateStopped:
+		label, style = "OFF", p.Dim
+	default:
+		label, style = "?", p.Dim
+	}
+	if short {
+		plain = "[M:" + label + "]"
+		return plain, style(plain)
+	}
+	plain = "[MINT " + label + "]"
+	return plain, style(plain)
+}
+
+func (s *Shell) promptSelection(detail bool) (plain, styled string, ok bool) {
+	if s.history == nil {
+		return "", "", false
+	}
+	selected := s.history.SelectedMany()
+	if len(selected) == 0 {
+		p := s.pal
+		return "[SEL 0]", p.Dim("[SEL 0]"), true
+	}
+	p := s.pal
+	counts := make(map[string]int)
+	order := make([]string, 0, len(selected))
+	for _, c := range selected {
+		method := strings.ToUpper(c.Request.Method)
+		if b := s.requestEdits[c.ID]; b != nil {
+			method = strings.ToUpper(b.Method())
+		}
+		if method == "" {
+			method = "GET"
+		}
+		if _, seen := counts[method]; !seen {
+			order = append(order, method)
+		}
+		counts[method]++
+	}
+	if detail {
+		sort.SliceStable(order, func(i, j int) bool {
+			if counts[order[i]] != counts[order[j]] {
+				return counts[order[i]] > counts[order[j]]
+			}
+			return order[i] < order[j]
+		})
+		times := "×"
+		if !unicodeTerminal() {
+			times = "x"
+		}
+		parts := make([]string, 0, len(order))
+		styledParts := make([]string, 0, len(order))
+		for _, method := range order {
+			parts = append(parts, fmt.Sprintf("%s%s%d", method, times, counts[method]))
+			styledParts = append(styledParts, p.Method(method)+p.Dim(times+strconv.Itoa(counts[method])))
+		}
+		plain = fmt.Sprintf("[SEL %d · %s]", len(selected), strings.Join(parts, " "))
+		styled = "[" + p.Blue(fmt.Sprintf("SEL %d", len(selected))) + " " + p.Dim("·") + " " + strings.Join(styledParts, " ") + "]"
+		return plain, styled, true
+	}
+	plain = fmt.Sprintf("[SEL %d]", len(selected))
+	styled = "[" + p.Blue(plain[1:len(plain)-1]) + "]"
+	return plain, styled, true
+}
+
+// promptSelectionList affiche le nombre de captures et la liste des méthodes
+// distinctes, sans ventilation par nombre. C'est le format compact utilisé
+// lorsque la ventilation complète ne tient pas sur la ligne.
+func (s *Shell) promptSelectionList() (plain, styled string, ok bool) {
+	if s.history == nil {
+		return "", "", false
+	}
+	selected := s.history.SelectedMany()
+	if len(selected) == 0 {
+		return "", "", false
+	}
+	p := s.pal
+	seen := make(map[string]bool)
+	methods := make([]string, 0, len(selected))
+	for _, c := range selected {
+		method := strings.ToUpper(c.Request.Method)
+		if b := s.requestEdits[c.ID]; b != nil {
+			method = strings.ToUpper(b.Method())
+		}
+		if method == "" {
+			method = "GET"
+		}
+		if !seen[method] {
+			seen[method] = true
+			methods = append(methods, method)
+		}
+	}
+	if len(methods) > 3 {
+		return "", "", false
+	}
+	sort.Strings(methods)
+	styledMethods := make([]string, 0, len(methods))
+	for _, method := range methods {
+		styledMethods = append(styledMethods, p.Method(method))
+	}
+	plain = fmt.Sprintf("[SEL %d · %s]", len(selected), strings.Join(methods, " "))
+	styled = "[" + p.Blue(fmt.Sprintf("SEL %d", len(selected))) + " " + p.Dim("·") + " " + strings.Join(styledMethods, " ") + "]"
+	return plain, styled, true
+}
+
+func (s *Shell) promptBuilder(detail bool) (plain, styled string) {
+	p := s.pal
 	method := s.builder.Method()
 	if method == "" {
 		method = "GET"
 	}
+	headerCount := len(s.builder.Headers())
+	hasBody := s.builder.BodySet()
+	if detail {
+		plain = "[CRL " + method + " · H" + strconv.Itoa(headerCount)
+		styled = "[" + p.BoldCyan("CRL") + " " + p.Method(method) + " " + p.Dim("·") + " " + p.BoldCyan("H"+strconv.Itoa(headerCount))
+		if hasBody {
+			plain += " · B"
+			styled += " " + p.Dim("·") + " " + p.BoldGreen("B")
+		}
+		return plain + "]", styled + "]"
+	}
+	plain = "[" + method + " H" + strconv.Itoa(headerCount)
+	styled = "[" + p.Method(method) + " " + p.Dim("H"+strconv.Itoa(headerCount))
+	if hasBody {
+		plain += " B"
+		styled += " " + p.BoldGreen("B")
+	}
+	return plain + "]", styled + "]"
+}
 
+func (s *Shell) promptProxy(short bool) (plain, styled string, ok bool) {
+	p := s.pal
 	selected := 0
 	if s.history != nil {
 		selected = len(s.history.SelectedMany())
 	}
-	if selected == 0 && s.history != nil {
-		if _, ok := s.history.Selected(); ok {
-			selected = 1
-		}
-	}
-	methodBadge := "[" + method + "]"
+	mintActive := s.manager != nil && s.manager.Status().State == mint.StateRunning
+
 	if selected > 0 {
-		methodBadge = "[Actif: " + method + "]"
+		// Le rejeu des captures est toujours direct : ne jamais laisser croire
+		// qu'elles passent par le proxy Mint ou par le proxy du constructeur.
+		if !mintActive {
+			return "", "", false
+		}
+		if short {
+			return "[DIR]", p.BoldYellow("[DIR]"), true
+		}
+		return "[REPLAY DIRECT]", p.BoldYellow("[REPLAY DIRECT]"), true
 	}
 
-	p := s.pal
-	if !p.Enabled {
-		prompt := fmt.Sprintf("crl %s [Mint: %s]", methodBadge, mintStateStr)
-		if selected > 0 {
-			prompt += fmt.Sprintf(" [Sel: %d]", selected)
+	switch s.builder.Proxy() {
+	case "none":
+		if short {
+			return "[P:OFF]", p.Yellow("[P:OFF]"), true
 		}
-		if s.lastBatchSet && s.lastBatchSent > 0 {
-			prompt += fmt.Sprintf(" [Envoyées: %d/%d]", s.lastBatchSuccess, s.lastBatchSent)
+		return "[PROXY OFF]", p.Yellow("[PROXY OFF]"), true
+	case "":
+		if mintActive {
+			if short {
+				return "[P:MINT]", p.BoldGreen("[P:MINT]"), true
+			}
+			return "[PROXY MINT]", p.BoldGreen("[PROXY MINT]"), true
 		}
-		prompt += " >"
-		return prompt
+		return "", "", false
+	default:
+		if short {
+			return "[P:EXPL]", p.Cyan("[P:EXPL]"), true
+		}
+		return "[PROXY EXPL]", p.Cyan("[PROXY EXPL]"), true
 	}
-
-	// Couleurs sobres : cyan, bleu, violet et vert
-	parts := []string{}
-	parts = append(parts, p.Cyan("crl"))
-	parts = append(parts, p.BoldCyan(methodBadge))
-	if mintStateStr == "ON" {
-		parts = append(parts, p.BoldGreen("[Mint: ON]"))
-	} else {
-		parts = append(parts, p.Dim("[Mint: OFF]"))
-	}
-	if selected > 0 {
-		parts = append(parts, p.Blue(fmt.Sprintf("[Sel: %d]", selected)))
-	}
-	if s.lastBatchSet && s.lastBatchSent > 0 {
-		parts = append(parts, p.Green(fmt.Sprintf("[Envoyées: %d/%d]", s.lastBatchSuccess, s.lastBatchSent)))
-	}
-	prompt := strings.Join(parts, " ")
-	if s.lastFailed {
-		prompt += p.BoldRed(" >")
-	} else {
-		prompt += p.Magenta(" >")
-	}
-	return prompt
 }
 
 func unicodeTerminal() bool {
@@ -3402,7 +4414,7 @@ func (s *Shell) printGeneralHelp() {
 	fmt.Fprintf(s.out, "%s\n", p.Bold("│  CRL-CLI — client HTTP en ligne de commande avec proxy de capture Mint"))
 	fmt.Fprintf(s.out, "%s\n", p.Cyan("╰─────────────────────────────────────────────────────────────────────────────"))
 	fmt.Fprintf(s.out, "\n%s\n", p.BoldBlue("PRÉSENTATION"))
-	fmt.Fprintf(s.out, "  %s\n", p.Dim("CRL  : construire et envoyer des requêtes HTTP (crl.host, crl.method, crl.head, crl.json, crl.body, crl.launch)."))
+	fmt.Fprintf(s.out, "  %s\n", p.Dim("CRL  : construire et envoyer des requêtes HTTP (crl.host, crl.method, crl.head, crl.cookie, crl.param, crl.json, crl.body, crl.launch)."))
 	fmt.Fprintf(s.out, "  %s\n", p.Dim("Mint : capturer le trafic HTTP via un proxy local, sélectionner et rejouer des requêtes (mint.proxy, mint.requests, mint.select, mint.replay)."))
 	fmt.Fprintf(s.out, "\n%s\n", p.BoldBlue("AIDE DÉTAILLÉE"))
 	fmt.Fprintf(s.out, "  %s  %s\n", p.Cyan("crl.help"), p.Dim("toutes les commandes CRL (construction, envoi, inspection)."))
@@ -3414,8 +4426,12 @@ func (s *Shell) printGeneralHelp() {
 	fmt.Fprintf(s.out, "  %s\n", p.Dim("4. crl.launch            — envoyer la requête"))
 	fmt.Fprintf(s.out, "  %s\n", p.Dim("   mint.proxy on          — démarrer le proxy de capture"))
 	fmt.Fprintf(s.out, "  %s\n", p.Dim("   mint.requests          — lister les captures"))
-	fmt.Fprintf(s.out, "  %s\n", p.Dim("   mint.select 1 2 3      — sélectionner des captures"))
-	fmt.Fprintf(s.out, "  %s\n", p.Dim("   crl.launch             — rejouer la sélection (ou crl.launch 5 pour une seule)"))
+	fmt.Fprintf(s.out, "  %s\n", p.Dim("   mint.select 1 2 3      — sélectionner les captures 1, 2 et 3"))
+	fmt.Fprintf(s.out, "  %s\n", p.Dim("   mint.select all        — sélectionner toutes les captures"))
+	fmt.Fprintf(s.out, "  %s\n", p.Dim("   crl.launch 2           — rejouer uniquement la capture 2"))
+	fmt.Fprintf(s.out, "  %s\n", p.Dim("   crl.launch             — rejouer la sélection, sinon envoyer le constructeur actif"))
+	fmt.Fprintf(s.out, "  %s\n", p.Dim("   crl.launch all         — refusé : utilisez mint.select all puis crl.launch"))
+	fmt.Fprintf(s.out, "  %s\n", p.Dim("   crl.host <url> & crl.method GET & crl.launch — enchaîner des commandes avec « & »"))
 	fmt.Fprintf(s.out, "\n%s\n", p.Dim("Utilisez crl.help ou mint.help pour la liste complète des commandes de chaque catégorie."))
 	fmt.Fprintf(s.out, "\n")
 	renderHelp(s.out, s.pal, "", unicodeTerminal(), s.helpWidth())
@@ -3423,15 +4439,20 @@ func (s *Shell) printGeneralHelp() {
 
 func (s *Shell) printMintHelp() {
 	renderHelp(s.out, s.pal, "mint", unicodeTerminal(), s.helpWidth())
-	s.printf("\n[Mint] Le rejeu est explicite : sélectionnez avec mint.select, puis lancez mint.replay.\n")
+	s.printf("\n[Mint] mint.replay sans cible rejoue la sélection ; mint.replay all cible explicitement tout l'historique.\n")
 	s.printf("[Mint] mint.use importe une capture dans le constructeur actif sans modifier la sélection ni envoyer la requête.\n")
 }
 
 func (s *Shell) printCrlHelp() {
 	renderHelp(s.out, s.pal, "crl", unicodeTerminal(), s.helpWidth())
-	s.printf("\n[CRL] crl.launch : sans argument, envoie le constructeur actif (ou rejoue la sélection Mint si une existe).\n")
+	s.printf("\n[CRL] Constructeur actif : commandes sans ID (crl.host <url>, crl.method GET, crl.head …).\n")
+	s.printf("[CRL] Captures Mint : commandes avec ID (crl.host add 1 <url>, crl.head remove 1 <Nom>) ; elles ne modifient jamais le constructeur.\n")
+	s.printf("[CRL] Une sélection Mint ne détourne pas les commandes du constructeur ; crl.show selected inspecte la sélection.\n")
+	s.printf("[CRL] crl.launch : sans argument, rejoue la sélection Mint si elle existe, sinon envoie le constructeur actif.\n")
 	s.printf("[CRL] crl.launch <id> : envoie uniquement la capture indiquée, sans modifier la sélection.\n")
 	s.printf("[CRL] crl.launch active : envoie le constructeur actif.\n")
+	s.printf("[CRL] crl.launch all est refusé : utilisez mint.select all, puis crl.launch pour rejouer toute la sélection.\n")
+	s.printf("[CRL] Enchaînement : crl.host <url> & crl.method GET & crl.launch (un échec interrompt la suite).\n")
 }
 
 func (s *Shell) printf(format string, args ...interface{}) {
@@ -3517,6 +4538,53 @@ func (s *Shell) printIndented(text, prefix string) {
 			fmt.Fprintf(s.out, "%s%s\n", prefix, wline)
 		}
 	}
+}
+
+// splitCommandChain découpe « cmd1 & cmd2 » sans casser les « & » d'une URL
+// ou d'une valeur entre guillemets. Un séparateur doit être un « & » isolé par
+// des espaces (ou des guillemets fermés) : « ?a=1&b=2 » reste intact.
+func splitCommandChain(line string) []string {
+	var parts []string
+	start := 0
+	quote := rune(0)
+	escaped := false
+	runes := []rune(line)
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if r == '\\' && quote != '\'' {
+			escaped = true
+			continue
+		}
+		if quote != 0 {
+			if r == quote {
+				quote = 0
+			}
+			continue
+		}
+		if r == '\'' || r == '"' {
+			quote = r
+			continue
+		}
+		if r != '&' {
+			continue
+		}
+		prevSpace := i == 0 || unicode.IsSpace(runes[i-1])
+		nextSpace := i+1 == len(runes) || unicode.IsSpace(runes[i+1])
+		if prevSpace && nextSpace {
+			if part := strings.TrimSpace(string(runes[start:i])); part != "" {
+				parts = append(parts, part)
+			}
+			start = i + 1
+		}
+	}
+	if part := strings.TrimSpace(string(runes[start:])); part != "" {
+		parts = append(parts, part)
+	}
+	return parts
 }
 
 func splitCommand(line string) (cmd, rest string) {

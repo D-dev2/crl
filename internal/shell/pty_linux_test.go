@@ -162,14 +162,14 @@ func TestInteractiveTypingOneKeyAtATime(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- sh.Run(ctx) }()
 
-	waitPTYLine(t, got, "crl [GET] [Mint: OFF] >", 3*time.Second)
+	waitPTYLine(t, got, testPrompt, 3*time.Second)
 
 	typed := "help"
 	for i := range typed {
 		if _, err := master.Write([]byte{typed[i]}); err != nil {
 			t.Fatalf("écriture PTY : %v", err)
 		}
-		waitPTYLine(t, got, "crl [GET] [Mint: OFF] >"+typed[:i+1], 3*time.Second)
+		waitPTYLine(t, got, testPrompt+typed[:i+1], 3*time.Second)
 	}
 	if _, err := master.Write([]byte("\r")); err != nil {
 		t.Fatal(err)
@@ -228,7 +228,8 @@ func TestInteractiveJSONEditorUsesArrowKeysAndReturnsToPrompt(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- sh.Run(ctx) }()
-	waitPTYLine(t, got, "crl [GET] [Mint: OFF] >", 3*time.Second)
+	jsonPrompt := "crl [MINT OFF] [SEL 0] [CRL GET · H1 · B]  $"
+	waitPTYLine(t, got, jsonPrompt, 3*time.Second)
 
 	// crl.json sans argument affiche l'état actuel, n'ouvre pas l'éditeur.
 	if _, err := master.Write([]byte("crl.json\r")); err != nil {
@@ -238,7 +239,7 @@ func TestInteractiveJSONEditorUsesArrowKeysAndReturnsToPrompt(t *testing.T) {
 	if !strings.Contains(got.String(), `{"role":"user"}`) {
 		t.Fatalf("JSON actuel non affiché:\n%s", got.String())
 	}
-	waitPTYLine(t, got, "crl [GET] [Mint: OFF] >", 3*time.Second)
+	waitPTYLine(t, got, jsonPrompt, 3*time.Second)
 
 	// crl.json avec un JSON sur une ligne configure le corps immédiatement.
 	if _, err := master.Write([]byte("crl.json {\"role\":\"admin\"}\r")); err != nil {
@@ -249,7 +250,7 @@ func TestInteractiveJSONEditorUsesArrowKeysAndReturnsToPrompt(t *testing.T) {
 		t.Fatalf("corps appliqué = %s, attendu %s", have, want)
 	}
 	// Aucun éditeur multiligne n'est ouvert : le prompt est immédiatement de retour.
-	waitPTYLine(t, got, "crl [GET] [Mint: OFF] >", 3*time.Second)
+	waitPTYLine(t, got, jsonPrompt, 3*time.Second)
 
 	if _, err := master.Write([]byte("exit\r")); err != nil {
 		t.Fatal(err)
@@ -309,15 +310,15 @@ func TestInteractiveMintNotificationPreservesTypedInput(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- sh.Run(ctx) }()
 
-	waitPTYLine(t, got, "crl [GET] [Mint: OFF] >", 3*time.Second)
+	waitPTYLine(t, got, testPrompt, 3*time.Second)
 	if _, err := master.Write([]byte("hel")); err != nil {
 		t.Fatalf("écriture PTY : %v", err)
 	}
-	waitPTYLine(t, got, "crl [GET] [Mint: OFF] >hel", 3*time.Second)
+	waitPTYLine(t, got, testPrompt+"hel", 3*time.Second)
 
 	notifs <- mint.Notification{Kind: "request", ID: 7, Method: "GET", URL: "http://example.test/api"}
 	waitPTYText(t, got, "[Mint] #7 GET http://example.test/api", 3*time.Second)
-	waitPTYLine(t, got, "crl [GET] [Mint: OFF] >hel", 3*time.Second)
+	waitPTYLine(t, got, testPrompt+"hel", 3*time.Second)
 
 	if _, err := master.Write([]byte("p\r")); err != nil {
 		t.Fatalf("écriture PTY : %v", err)
@@ -380,13 +381,13 @@ func TestInteractiveLongPasteShowsPromptOnce(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- sh.Run(ctx) }()
 
-	waitPTYLine(t, got, "crl [GET] [Mint: OFF] >", 3*time.Second)
+	waitPTYLine(t, got, testPrompt, 3*time.Second)
 	paste := strings.Repeat("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.", 30)
 	if _, err := master.Write([]byte(paste)); err != nil {
 		t.Fatalf("écriture PTY : %v", err)
 	}
 	waitPTYText(t, got, paste, 3*time.Second)
-	if count := strings.Count(got.String(), "crl [GET] [Mint: OFF] >"); count < 1 {
+	if count := strings.Count(got.String(), testPrompt); count < 1 {
 		t.Fatalf("le collage a produit %d prompts :\n%q", count, got.String())
 	}
 

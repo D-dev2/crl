@@ -51,11 +51,11 @@ func TestPaletteAndPromptColors(t *testing.T) {
 	sh, _, _, _, _ := newTestShell(t, "")
 	sh.pal.Enabled = true
 	sh.lastFailed = false
-	if got := sh.promptText(); !strings.Contains(got, "crl") || !strings.Contains(got, ">") {
+	if got := sh.promptText(); !strings.Contains(got, "crl") || !strings.Contains(got, "$") {
 		t.Fatalf("invite normale = %q", got)
 	}
 	sh.lastFailed = true
-	if got := sh.promptText(); !strings.Contains(got, "crl") || !strings.Contains(got, ">") {
+	if got := sh.promptText(); !strings.Contains(got, "crl") || !strings.Contains(got, "$") {
 		t.Fatalf("invite d'erreur = %q", got)
 	}
 

@@ -5,6 +5,7 @@ import (
 	"io"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -35,6 +36,7 @@ type textArea struct {
 	drawnRows    int
 	cursorOffset int
 	termHeight   int
+	newlines     int
 }
 
 type textAreaAction uint8
@@ -47,7 +49,13 @@ const (
 
 func newTextArea(out io.Writer, title, target string, initial []byte) *textArea {
 	buffer := []rune(string(initial))
-	a := &textArea{out: out, title: title, target: target, buf: buffer, cursor: len(buffer), rows: textAreaMinRows, width: 78, termHeight: 24}
+	newlines := 0
+	for _, r := range buffer {
+		if r == '\n' {
+			newlines++
+		}
+	}
+	a := &textArea{out: out, title: title, target: target, buf: buffer, cursor: len(buffer), rows: textAreaMinRows, width: 78, termHeight: 24, newlines: newlines}
 	return a
 }
 
@@ -85,7 +93,7 @@ func (a *textArea) SetSize(width, height int) {
 
 	// Un petit JSON n'a pas besoin de remplir tout le terminal. On garde au
 	// moins trois lignes d'édition, puis on s'arrête à la hauteur disponible.
-	desired := strings.Count(a.Text(), "\n") + 2
+	desired := a.newlines + 2
 	if desired < textAreaMinRows {
 		desired = textAreaMinRows
 	}
@@ -137,8 +145,8 @@ func (a *textArea) Draw(p palette, unicode bool) {
 		left, right, horiz, top, mid, bottom = "│", "│", "─", "╭", "├", "╰"
 	}
 	line := func(l, r, value string) {
-		value = truncateCells(value, a.width-2)
-		pad := a.width - 1 - visibleANSIRunes(value)
+		value = truncateDisplay(value, a.width-2)
+		pad := a.width - 1 - displayWidth(value)
 		if pad < 0 {
 			pad = 0
 		}
@@ -150,7 +158,6 @@ func (a *textArea) Draw(p palette, unicode bool) {
 	line(left, right, p.Dim("Cible : ")+p.Cyan(a.target))
 	fmt.Fprintf(a.out, "%s%s%s\r\n", mid, bar, mid)
 
-	lines := strings.Split(string(a.buf), "\n")
 	row, col := a.cursorPosition()
 	if row < a.top {
 		a.top = row
@@ -159,11 +166,12 @@ func (a *textArea) Draw(p palette, unicode bool) {
 		a.top = row - a.rows + 1
 	}
 	a.clampTop()
+	lines := a.visibleLines(a.top, a.rows)
 	for i := 0; i < a.rows; i++ {
 		idx := a.top + i
 		content := "~"
-		if idx < len(lines) {
-			content = a.horizontalLine(lines[idx], idx == row, col)
+		if i < len(lines) {
+			content = a.horizontalLine(lines[i], idx == row, col)
 		}
 		line(left, right, content)
 	}
@@ -235,38 +243,125 @@ func (a *textArea) horizontalStart(col int) (start, visibleCol int) {
 }
 
 func (a *textArea) horizontalLine(line string, cursorLine bool, col int) string {
-	r := []rune(line)
-	start := 0
-	if cursorLine {
-		start, _ = a.horizontalStart(col)
-	}
 	width := a.width - 4
 	if width < 1 {
 		width = 1
 	}
+	start := 0
+	if cursorLine {
+		start, _ = a.horizontalStart(col)
+	}
 	end := start + width
-	if end > len(r) {
-		end = len(r)
+	var b strings.Builder
+	cell := 0
+	for _, r := range line {
+		if r == '\t' {
+			next := nextTabStop(cell)
+			for cell < next {
+				if cell >= start && cell < end {
+					b.WriteByte(' ')
+				}
+				cell++
+			}
+			if cell >= end {
+				break
+			}
+			continue
+		}
+		w := textCellWidth(r)
+		if w == 0 {
+			// Les marques combinantes restent attachées au caractère précédent
+			// lorsqu'il est visible.
+			if cell > start && cell <= end {
+				b.WriteRune(r)
+			}
+			continue
+		}
+		if cell >= start && cell+w <= end {
+			b.WriteString(textCellRune(r))
+		}
+		cell += w
+		if cell >= end {
+			break
+		}
 	}
-	if start > len(r) {
-		start = len(r)
-	}
-	return string(r[start:end])
+	return b.String()
 }
 
 func (a *textArea) cursorPosition() (row, col int) {
-	for i, r := range a.buf {
-		if i >= a.cursor {
-			break
-		}
-		if r == '\n' {
+	for i := 0; i < a.cursor && i < len(a.buf); i++ {
+		r := a.buf[i]
+		switch r {
+		case '\n':
 			row++
 			col = 0
-		} else {
+		case '\r':
+			// Un CRLF d'origine ne doit pas ajouter une colonne fantôme :
+			// l'affichage masque ce CR et le contenu sauvegardé reste intact.
+			if i+1 < len(a.buf) && a.buf[i+1] == '\n' {
+				continue
+			}
 			col++
+		case '\t':
+			col = nextTabStop(col)
+		default:
+			col += textCellWidth(r)
 		}
 	}
 	return row, col
+}
+
+// visibleLines extrait uniquement la fenêtre demandée. Un corps volumineux
+// n'est donc jamais découpé en une tranche de chaînes pour chaque frappe.
+func (a *textArea) visibleLines(from, count int) []string {
+	if from < 0 {
+		from = 0
+	}
+	if count < 1 {
+		return nil
+	}
+	out := make([]string, 0, count)
+	row, start := 0, 0
+	for i := 0; i <= len(a.buf) && row < from+count; i++ {
+		atEnd := i == len(a.buf)
+		if !atEnd && a.buf[i] != '\n' {
+			continue
+		}
+		if row >= from {
+			end := i
+			if !atEnd && end > start && a.buf[end-1] == '\r' {
+				end--
+			}
+			out = append(out, string(a.buf[start:end]))
+		}
+		row++
+		start = i + 1
+	}
+	return out
+}
+
+// lineBounds retourne les bornes d'une ligne logique. Le saut de ligne final
+// n'est pas inclus ; hasNewline permet d'ignorer un CR uniquement lorsqu'il
+// forme une paire CRLF avec ce saut.
+func (a *textArea) lineBounds(target int) (start, end int, hasNewline bool) {
+	if target < 0 {
+		target = 0
+	}
+	row := 0
+	for i := 0; i <= len(a.buf); i++ {
+		if i == len(a.buf) {
+			return start, i, false
+		}
+		if a.buf[i] != '\n' {
+			continue
+		}
+		if row == target {
+			return start, i, true
+		}
+		row++
+		start = i + 1
+	}
+	return start, len(a.buf), false
 }
 
 func (a *textArea) Feed(data []byte) textAreaAction {
@@ -382,18 +477,29 @@ func (a *textArea) insert(r rune) {
 	copy(a.buf[a.cursor+1:], a.buf[a.cursor:])
 	a.buf[a.cursor] = r
 	a.cursor++
+	if r == '\n' {
+		a.newlines++
+	}
 	a.message = ""
 }
 func (a *textArea) backspace() {
 	if a.cursor > 0 {
+		removed := a.buf[a.cursor-1]
 		a.buf = append(a.buf[:a.cursor-1], a.buf[a.cursor:]...)
 		a.cursor--
+		if removed == '\n' {
+			a.newlines--
+		}
 		a.message = ""
 	}
 }
 func (a *textArea) delete() {
 	if a.cursor < len(a.buf) {
+		removed := a.buf[a.cursor]
 		a.buf = append(a.buf[:a.cursor], a.buf[a.cursor+1:]...)
+		if removed == '\n' {
+			a.newlines--
+		}
 		a.message = ""
 	}
 }
@@ -427,43 +533,168 @@ func (a *textArea) moveVertical(delta int) {
 	if target < 0 {
 		target = 0
 	}
-	lines := strings.Split(string(a.buf), "\n")
-	if target >= len(lines) {
-		target = len(lines) - 1
+	if lines := a.newlines + 1; target >= lines {
+		target = lines - 1
 	}
-	idx := 0
-	for i := 0; i < target; i++ {
-		idx += len([]rune(lines[i])) + 1
+	start, end, hasNewline := a.lineBounds(target)
+	if hasNewline && end > start && a.buf[end-1] == '\r' {
+		end--
 	}
-	lineLen := len([]rune(lines[target]))
-	if col > lineLen {
-		col = lineLen
-	}
-	a.cursor = idx + col
-}
-
-func truncateCells(s string, limit int) string {
-	r := []rune(s)
-	if len(r) > limit {
-		return string(r[:limit-1]) + "…"
-	}
-	return s
-}
-
-func visibleANSIRunes(s string) int {
-	visible, inEscape := 0, false
-	for _, r := range s {
-		if r == '\x1b' {
-			inEscape = true
-			continue
-		}
-		if inEscape {
-			if r == 'm' {
-				inEscape = false
+	// On conserve la colonne visuelle : les tabulations et les caractères
+	// larges ne décalent donc pas le curseur d'une ligne à l'autre.
+	idx := end
+	cell := 0
+	for i := start; i < end; i++ {
+		r := a.buf[i]
+		if r == '\t' {
+			next := nextTabStop(cell)
+			if next > col {
+				idx = i
+				break
 			}
+			cell = next
+			idx = i + 1
 			continue
 		}
-		visible++
+		w := textCellWidth(r)
+		if cell+w > col {
+			idx = i
+			break
+		}
+		cell += w
+		idx = i + 1
 	}
-	return visible
+	a.cursor = idx
+}
+
+const textAreaTabWidth = 8
+
+func nextTabStop(col int) int {
+	if col < 0 {
+		col = 0
+	}
+	return col + textAreaTabWidth - col%textAreaTabWidth
+}
+
+// textCellWidth donne la largeur d'affichage d'une rune. Les caractères de
+// contrôle sont rendus par un symbole d'une colonne ; les marques combinantes
+// n'occupent aucune colonne et les caractères larges en occupent deux.
+func textCellWidth(r rune) int {
+	if r == '\r' || r < 0x20 || r == 0x7f {
+		return 1
+	}
+	if unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Me, r) || unicode.Is(unicode.Cf, r) {
+		return 0
+	}
+	if isWideRune(r) {
+		return 2
+	}
+	return 1
+}
+
+func textCellRune(r rune) string {
+	switch {
+	case r == '\r':
+		return "␍"
+	case r < 0x20 || r == 0x7f:
+		return "·"
+	default:
+		return string(r)
+	}
+}
+
+func isWideRune(r rune) bool {
+	switch {
+	case r >= 0x1100 && r <= 0x115f,
+		r == 0x2329, r == 0x232a,
+		r >= 0x2e80 && r <= 0xa4cf && r != 0x303f,
+		r >= 0xac00 && r <= 0xd7a3,
+		r >= 0xf900 && r <= 0xfaff,
+		r >= 0xfe10 && r <= 0xfe19,
+		r >= 0xfe30 && r <= 0xfe6f,
+		r >= 0xff00 && r <= 0xff60,
+		r >= 0xffe0 && r <= 0xffe6,
+		r >= 0x1f000 && r <= 0x1faff,
+		r >= 0x20000 && r <= 0x3fffd:
+		return true
+	default:
+		return false
+	}
+}
+
+// displayWidth ignore les séquences ANSI et compte les colonnes du terminal.
+func displayWidth(s string) int {
+	width := 0
+	for i := 0; i < len(s); {
+		if s[i] == 0x1b {
+			i = ansiSequenceEnd(s, i)
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		i += size
+		if r == '\t' {
+			width = nextTabStop(width)
+			continue
+		}
+		width += textCellWidth(r)
+	}
+	return width
+}
+
+func ansiSequenceEnd(s string, i int) int {
+	if i+1 >= len(s) {
+		return len(s)
+	}
+	if s[i+1] == '[' {
+		j := i + 2
+		for j < len(s) && (s[j] < 0x40 || s[j] > 0x7e) {
+			j++
+		}
+		if j < len(s) {
+			j++
+		}
+		return j
+	}
+	if i+2 <= len(s) {
+		return i + 2
+	}
+	return len(s)
+}
+
+// truncateDisplay tronque sans casser une séquence ANSI ni un caractère large.
+func truncateDisplay(s string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if displayWidth(s) <= limit {
+		return s
+	}
+	var b strings.Builder
+	used := 0
+	hadANSI := false
+	for i := 0; i < len(s); {
+		if s[i] == 0x1b {
+			end := ansiSequenceEnd(s, i)
+			b.WriteString(s[i:end])
+			hadANSI = true
+			i = end
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		w := textCellWidth(r)
+		if r == '\t' {
+			w = nextTabStop(used) - used
+		}
+		if used+w > limit-1 {
+			break
+		}
+		b.WriteRune(r)
+		used += w
+		i += size
+	}
+	b.WriteString("…")
+	if hadANSI {
+		b.WriteString("\033[0m")
+	}
+	return b.String()
 }

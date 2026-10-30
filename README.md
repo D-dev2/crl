@@ -10,8 +10,8 @@ constructeur `crl.*` sans l'envoyer.
 - Rejeu fidèle via `curl`, sans passer les données par un shell.
 - Réponses HTTP présentées avec statut, durée, en-têtes et corps lisible.
 - Modes d'affichage `auto`, `raw` et `pretty`, sans modifier les octets reçus.
-- Prompt compact sur une ligne : `crl [GET] [Mint: ON] [Sel: N] >`, avec bilan du dernier rejeu multiple.
-- Éditeur JSON interactif intégré au terminal : flèches, insertion, suppression, défilement vertical et horizontal, `Ctrl+S` pour valider et `Esc` pour annuler. Modification ciblée avec `crl.json set <chemin> = <valeur JSON>` ou suppression avec `crl.json delete <chemin>`.
+- Prompt compact et adaptatif sur une seule ligne, par exemple `crl [MINT OFF] [SEL 0] [CRL GET · H0]  $`, avec cases indépendantes pour Mint, la sélection, le constructeur et le proxy réellement utilisé.
+- Éditeurs JSON et corps intégrés au terminal : flèches, insertion, suppression, défilement vertical et horizontal, `Ctrl+S` pour valider et `Esc` pour annuler. Modification ciblée avec `crl.json <id> edit` ou `crl.body <id> edit`.
 - Sélection de plusieurs captures Mint et rejeu concurrent avec `mint.replay`.
 - Proxy Mint démarré et arrêté par CRL-CLI, avec confirmation de disponibilité.
 - Capture en temps réel, historique, filtre, sélection et import.
@@ -198,9 +198,9 @@ crl.table
 crl.launch
 ```
 
-`crl.json` sans argument ouvre l’éditeur interactif intégré, prérempli avec le corps actuel. Utilisez les flèches pour déplacer le curseur, `Ctrl+S` pour valider et `Esc` pour annuler. Une erreur JSON garde le document dans l’éditeur pour correction. `crl.body` utilise le même éditeur sans validation JSON.
-`crl.json set <chemin> = <valeur JSON>` et `crl.json set user.role = "admin"` modifient un champ
-précis en préservant les autres propriétés. `crl.json delete <chemin>` supprime une propriété.
+`crl.json <JSON>` définit directement un corps JSON monoligne. `crl.body <texte>` définit directement un corps brut. Sans argument, `crl.json` et `crl.body` affichent l’état courant sans ouvrir d’éditeur.
+Pour éditer une capture précise, utilisez `crl.json <id> edit` ou `crl.body <id> edit` : les flèches déplacent le curseur, `Ctrl+S` valide et `Esc` annule. Une erreur JSON garde le document dans l’éditeur pour correction.
+`crl.json set <chemin> = <valeur JSON>` et `crl.json delete <chemin>` modifient le constructeur actif. Les formes `crl.json add <cible> <JSON>` et `crl.json remove <cible>` modifient les captures sans toucher au constructeur.
 `crl.json clear` et `crl.body.clear` effacent le corps sans toucher aux autres en-têtes.
 
 Pour rejouer simultanément plusieurs captures :
@@ -261,47 +261,76 @@ utilise automatiquement le proxy Mint. L'historique reste disponible après
 
 ## Commandes CRL
 
+Les commandes sans ID configurent le **constructeur actif**. Les commandes avec
+`add`/`remove` et une cible (`<id>`, `<ids>`, `selected`, `all`) modifient
+uniquement les captures ciblées et ne touchent jamais au constructeur.
+
 | Commande | Description |
 |---|---|
 | `crl.host <url>` | définit l'URL ; sans schéma, `http://` est ajouté ; l'encodage, les paramètres répétés et les valeurs vides sont conservés |
 | `crl.host` | affiche l'URL courante (masquée) |
+| `crl.host add <cible> <url>` | définit l'URL des captures ciblées |
+| `crl.host remove <cible>` | retire l'URL des captures ciblées |
 | `crl.method <méthode>` | définit la méthode du constructeur actif (normalisée en majuscules) |
-| `crl.method <méthode> set <cible>` | modifie la méthode des captures Mint ciblées (`1`, `1,2`, `selected`, `all`) |
-| `crl.head <Nom: valeur>` | ajoute ou remplace un en-tête (alias : `crl.header`) |
-| `crl.head` | liste les en-têtes avec leurs valeurs complètes |
+| `crl.method add <cible> <méthode>` | modifie la méthode des captures ciblées |
+| `crl.method remove <cible>` | remet la méthode des captures ciblées à `GET` |
+| `crl.head <Nom: valeur>` | ajoute ou remplace un en-tête du constructeur (alias : `crl.header`) |
+| `crl.head` | liste les en-têtes du constructeur avec leurs valeurs complètes |
 | `crl.head clear [Nom]` | supprime un en-tête nommé, ou tous sans argument |
-| `crl.head set <cible> <Nom> <valeur>` | ajoute/remplace l'en-tête des captures ciblées ; les valeurs entre guillemets gardent leurs espaces |
-| `crl.head delete <cible> <Nom>` | supprime l'en-tête des captures ciblées |
-| `crl.head show <cible>` | affiche les en-têtes masquant les valeurs sensibles |
-| `crl.head.clear [Nom]` | variante explicite de la commande précédente |
-| `crl.json <json>` | définit un corps JSON valide et `Content-Type: application/json` |
-| `crl.json` | ouvrir l’éditeur intégré (`Ctrl+S` applique, `Esc` annule) |
-| `crl.json set <chemin> = <valeur JSON>` | modifie un champ précis (objets imbriqués pris en charge) |
-| `crl.json delete <chemin>` | supprime une propriété précise |
-| `crl.json <cible> set <chemin> = <valeur JSON>` | applique le changement JSON aux captures ciblées sans toucher les originales |
-| `crl.json <id> edit` | édite le JSON de cette capture seulement ; `Ctrl+S` applique après validation |
-| `crl.json clear` | efface le corps sans modifier méthode ni en-têtes |
-| `crl.body <texte>` | définit un corps brut, sans modifier le `Content-Type` |
-| `crl.body` | ouvrir l’éditeur intégré, sans validation JSON |
+| `crl.head add <cible> <Nom>: <valeur>` | ajoute/remplace l'en-tête des captures ciblées ; les deux-points internes et les espaces cités sont conservés |
+| `crl.head remove <cible> <Nom>` | supprime l'en-tête des captures ciblées |
+| `crl.head show <cible>` | affiche les en-têtes des captures ciblées |
+| `crl.head.clear [Nom]` | variante explicite de `crl.head clear` |
+| `crl.cookie [<nom>=<valeur>\|clear]` | affiche, ajoute ou efface les cookies du constructeur |
+| `crl.cookie add <cible> <nom>=<valeur>` | ajoute ou remplace un cookie des captures ciblées |
+| `crl.cookie remove <cible> <nom>` | supprime un cookie des captures ciblées |
+| `crl.cookie clear <cible>` | supprime tous les cookies des captures ciblées |
+| `crl.param [<nom>=<valeur>\|clear]` | affiche, ajoute ou efface les paramètres d'URL du constructeur |
+| `crl.param add <cible> <nom>=<valeur>` | ajoute ou remplace un paramètre d'URL des captures ciblées |
+| `crl.param remove <cible> <nom>` | supprime un paramètre d'URL des captures ciblées |
+| `crl.param clear <cible>` | supprime tous les paramètres d'URL des captures ciblées |
+| `crl.json <JSON>` | définit directement un corps JSON valide et `Content-Type: application/json` |
+| `crl.json` | affiche l'état du corps JSON sans ouvrir d'éditeur |
+| `crl.json <id> edit` | édite le JSON de cette capture seulement ; `Ctrl+S` applique après validation, `Esc` annule |
+| `crl.json set <chemin> = <valeur JSON>` | modifie un champ précis du constructeur (objets imbriqués pris en charge) |
+| `crl.json delete <chemin>` | supprime une propriété précise du constructeur |
+| `crl.json add <cible> <JSON>` | définit le corps JSON des captures ciblées |
+| `crl.json remove <cible>` | efface le corps des captures ciblées |
+| `crl.json clear` | efface le corps du constructeur sans modifier méthode ni en-têtes |
+| `crl.body <texte>` | définit directement un corps brut, sans modifier le `Content-Type` |
+| `crl.body` | affiche l'état du corps brut sans ouvrir d'éditeur |
 | `crl.body <id> edit` | édite le corps brut d'une capture seulement |
-| `crl.body <cible> set <texte>` / `clear` | définit ou efface les corps des captures ciblées |
-| `crl.body.clear` | supprime le corps |
+| `crl.body add <cible> <texte>` | définit le corps brut des captures ciblées |
+| `crl.body remove <cible>` | efface le corps des captures ciblées |
+| `crl.body.clear` | supprime le corps du constructeur |
 | `crl.proxy <url\|none\|auto>` | proxy explicite ; `none` désactive tout proxy ; `auto`, `clear` ou `unset` réactive le proxy Mint automatique |
 | `crl.proxy` | affiche le proxy explicite et le proxy effectif |
 | `crl.ca <fichier\|off>` | utilise un fichier CA PEM pour curl, sans désactiver la vérification TLS ; `off`/`none`/`clear` revient au bundle système |
-| `crl.show` | détaille la requête active ou toutes les captures sélectionnées ; secrets masqués, corps volumineux paginés |
-| `crl.show <id> [body <offset>]` | détaille une capture et lit une page de son corps |
-| `crl.show active` | détaille le constructeur actif même lorsqu'une sélection Mint existe |
+| `crl.show [<id>\|active\|selected]` | détaille le constructeur, une capture ou la sélection ; corps volumineux paginés |
+| `crl.show <id> body [offset]` | lit une page du corps d'une capture |
+| `crl.show active body [offset]` | lit une page du corps actif |
 | `crl.show body [offset]` | lit une page du corps actif |
-| `crl.table` | affiche un tableau récapitulatif (URL masquée, noms d'en-têtes ; valeurs via `crl.show`) |
+| `crl.table` | affiche un tableau récapitulatif (URL masquée, noms d'en-têtes) |
 | `crl.output [auto\|raw\|pretty]` | choisit le format d'affichage du corps des réponses ; sans argument, affiche le mode courant |
-| `crl.launch` | envoie la sélection si elle existe, sinon le constructeur actif |
+| `crl.launch` | rejoue la sélection Mint si elle existe, sinon envoie le constructeur actif |
 | `crl.launch active` | envoie explicitement le constructeur actif |
-| `crl.launch <cible>` | envoie en parallèle des captures Mint ciblées (`1`, `1,2`, `selected`, `all`) |
+| `crl.launch <id>` | envoie uniquement cette capture, sans modifier la sélection |
+| `crl.launch <ids>\|selected` | rejoue les captures indiquées ou la sélection |
+| `crl.launch all` | refusé : utilisez `mint.select all`, puis `crl.launch` |
 | `reset` | réinitialise le constructeur |
 | `clear` | efface l'écran en mode interactif |
-| `help` ou `?` | affiche l'aide |
+| `help` ou `?` | affiche l'aide générale |
+| `crl.help` / `mint.help` | affiche l'aide détaillée d'une catégorie |
 | `exit` ou `quit` | quitte et arrête proprement le proxy Mint lancé par CRL-CLI |
+
+Plusieurs commandes peuvent être enchaînées avec ` & ` :
+
+```text
+crl.host http://127.0.0.1:5002/health & crl.method GET & crl.launch
+```
+
+Un échec interrompt l'enchaînement. Un `&` sans espaces autour reste un
+caractère d'URL ou de valeur (`?a=1&b=2`).
 
 Notes :
 
@@ -310,7 +339,7 @@ Notes :
 - Les en-têtes recalculés ou interdits par curl (`Content-Length`,
   `Transfer-Encoding`, `Connection`, `Proxy-Connection`, `Expect`) ne sont pas
   rejoués.
-- `crl.launch` n'accepte aucun argument.
+- `crl.launch` accepte `active`, un identifiant ou une liste d'identifiants ; `all` est volontairement refusé pour éviter un envoi massif accidentel.
 - Le corps est transmis à curl via stdin avec `--data-binary @-`.
 - Les en-têtes et le corps de réponse sont écrits dans un répertoire temporaire
   privé, puis lus pour l'affichage. Le formatage (JSON/HTML) ne s'applique qu'à
@@ -511,8 +540,7 @@ Les couleurs sont activées automatiquement quand la sortie standard est un
 terminal. Elles restent désactivées pour les redirections, les pipes et les
 tests, afin de ne jamais polluer une sortie machine.
 
-- l'invite `crl >` est cyan après une commande réussie et rouge après une
-  erreur ;
+- l'invite adaptative affiche les cases Mint, sélection, constructeur et proxy ; le `$` final est cyan après une commande réussie et rouge après une erreur ;
 - les méthodes HTTP, les statuts et les identifiants de capture utilisent des
   couleurs distinctes dans `mint.requests` et `mint.request.show` ;
 - les titres de section et les libellés sont également différenciés ;

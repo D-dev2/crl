@@ -413,15 +413,53 @@ func (e *editor) setBuf(text string) {
 }
 
 func sanitizeTerminal(s string) string {
-	return strings.Map(func(r rune) rune {
-		if r == '\n' || r == '\r' {
-			return ' '
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		if s[i] == 0x1b {
+			// Supprime la séquence ANSI complète, pas seulement l'octet ESC :
+			// sinon le corps afficherait « [31m » ou « ]0;titre » comme du texte.
+			if i+1 < len(s) && (s[i+1] == '[' || s[i+1] == 'O') {
+				j := i + 2
+				for j < len(s) && (s[j] < 0x40 || s[j] > 0x7e) {
+					j++
+				}
+				if j < len(s) {
+					j++
+				}
+				i = j
+				continue
+			}
+			if i+1 < len(s) && (s[i+1] == ']' || s[i+1] == 'P' || s[i+1] == '^' || s[i+1] == '_') {
+				j := i + 2
+				for j < len(s) {
+					if s[j] == 0x07 {
+						j++
+						break
+					}
+					if s[j] == 0x1b && j+1 < len(s) && s[j+1] == '\\' {
+						j += 2
+						break
+					}
+					j++
+				}
+				i = j
+				continue
+			}
+			i += 2
+			continue
 		}
-		if r < 0x20 || r == 0x7f {
-			return -1
+		r, size := utf8.DecodeRuneInString(s[i:])
+		switch {
+		case r == '\n' || r == '\r':
+			b.WriteByte(' ')
+		case r < 0x20 || r == 0x7f:
+			// caractère de contrôle ignoré
+		default:
+			b.WriteString(s[i : i+size])
 		}
-		return r
-	}, s)
+		i += size
+	}
+	return b.String()
 }
 
 // sanitizeTerminalKeepANSI nettoie du texte destiné au terminal tout en
@@ -444,6 +482,22 @@ func sanitizeTerminalKeepANSI(s string) string {
 					i = j + 1
 					continue
 				}
+			}
+			if i+1 < len(s) && (s[i+1] == ']' || s[i+1] == 'P' || s[i+1] == '^' || s[i+1] == '_') {
+				j := i + 2
+				for j < len(s) {
+					if s[j] == 0x07 {
+						j++
+						break
+					}
+					if s[j] == 0x1b && j+1 < len(s) && s[j+1] == '\\' {
+						j += 2
+						break
+					}
+					j++
+				}
+				i = j
+				continue
 			}
 			i++
 			continue
