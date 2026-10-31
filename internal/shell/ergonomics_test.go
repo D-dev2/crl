@@ -1,6 +1,7 @@
 package shell
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -122,15 +123,15 @@ func TestBuilderAndCaptureCommandsStayIndependent(t *testing.T) {
 		t.Fatal("la sélection a été modifiée par une commande du constructeur")
 	}
 
-	sh.Execute("crl.host add 1 https://capture.test/new?x=1")
-	sh.Execute("crl.method add 1 PATCH")
-	sh.Execute("crl.head add 1 sec-fetch-dest: iframe")
-	sh.Execute("crl.head add 1 X-Time: 12:30:45")
-	sh.Execute(`crl.head add 1 X-Note "two  words"`)
-	sh.Execute("crl.cookie add 1 session=nouveau")
-	sh.Execute("crl.cookie add 1 theme=dark")
-	sh.Execute("crl.param add 1 q=hello")
-	sh.Execute("crl.json add 1 {\"x\":1}")
+	sh.Execute("crl.host set 1 add https://capture.test/new?x=1")
+	sh.Execute("crl.method set 1 add PATCH")
+	sh.Execute("crl.head set 1 add sec-fetch-dest: iframe")
+	sh.Execute("crl.head set 1 add X-Time: 12:30:45")
+	sh.Execute("crl.head set 1 add X-Note: two  words")
+	sh.Execute("crl.cookie set 1 add session=nouveau")
+	sh.Execute("crl.cookie set 1 add theme=dark")
+	sh.Execute("crl.param set 1 add q=hello")
+	sh.Execute("crl.json set 1 add {\"x\":1}")
 
 	if builder.URL() != "https://builder.test/path" || builder.Method() != "POST" || builder.BodySize() != 0 {
 		t.Fatalf("une commande ciblée a modifié le constructeur : %s %s corps=%d", builder.Method(), builder.URL(), builder.BodySize())
@@ -164,16 +165,15 @@ func TestBuilderAndCaptureCommandsStayIndependent(t *testing.T) {
 		t.Fatalf("capture 2 modifiée : %s %s %q", b2.Method(), b2.URL(), b2.Body())
 	}
 
-	sh.Execute("crl.head remove 1 sec-fetch-dest")
-	sh.Execute("crl.head remove 1 X-Time")
-	sh.Execute("crl.head remove 1 X-Note")
-	sh.Execute("crl.cookie remove 1 session")
-	sh.Execute("crl.cookie clear 1")
-	sh.Execute("crl.param remove 1 q")
-	sh.Execute("crl.param clear 1")
-	sh.Execute("crl.body remove 1")
-	sh.Execute("crl.method remove 1")
-	sh.Execute("crl.host remove 1")
+	sh.Execute("crl.head set 1 remove sec-fetch-dest")
+	sh.Execute("crl.head set 1 remove X-Time")
+	sh.Execute("crl.head set 1 remove X-Note")
+	sh.Execute("crl.cookie set 1 remove session")
+	sh.Execute("crl.cookie set 1 remove theme")
+	sh.Execute("crl.param set 1 remove q")
+	sh.Execute("crl.body set 1 remove")
+	sh.Execute("crl.method set 1 remove")
+	sh.Execute("crl.host set 1 remove")
 
 	if got := headerValueOf(b1.Headers(), "sec-fetch-dest"); got != "" {
 		t.Fatalf("sec-fetch-dest toujours présent : %q", got)
@@ -391,8 +391,8 @@ func TestHelpDocumentsBuilderCapturesAndArguments(t *testing.T) {
 	sh.Execute("help")
 	text := out.String()
 	for _, want := range []string{
-		"REQUÊTES", "CAPTURES MINT", "CIBLES ET VALEURS", "crl.cookie", "crl.param",
-		"crl.host add <cible> <url>", "crl.launch all", "<cible>", "<id>", "<ids>",
+		"CONSTRUCTEUR ACTIF", "CAPTURES MINT", "CIBLES ET VALEURS", "crl.cookie", "crl.param",
+		"crl.host set <id> add|set <url>", "crl.launch all", "<cible>", "<id>", "<ids>",
 		"<nom>=<valeur>", "<JSON>", "selected", "mint.replay",
 	} {
 		if !strings.Contains(text, want) {
@@ -434,13 +434,13 @@ func TestTargetListsAndHeaderParsing(t *testing.T) {
 		Method: "GET", URL: "http://example.test/two",
 	})
 
-	sh.Execute(`crl.head add 1 2 X-Multi: un:deux`)
-	sh.Execute(`crl.head add 1,2 X-Spaces "deux  espaces"`)
-	sh.Execute(`crl.host add 1 2 https://multi.test/x?keep=1`)
-	sh.Execute(`crl.method add 1 2 PATCH`)
-	sh.Execute(`crl.cookie add 1 2 session=abc`)
-	sh.Execute(`crl.param add 1 2 q=hello world`)
-	sh.Execute(`crl.json add 1 2 {"a":1}`)
+	sh.Execute(`crl.head set 1 2 add X-Multi: un:deux`)
+	sh.Execute("crl.head set 1,2 add X-Spaces: deux  espaces")
+	sh.Execute(`crl.host set 1 2 add https://multi.test/x?keep=1`)
+	sh.Execute(`crl.method set 1 2 add PATCH`)
+	sh.Execute(`crl.cookie set 1 2 add session=abc`)
+	sh.Execute(`crl.param set 1 2 add q=hello world`)
+	sh.Execute(`crl.json set 1 2 add {"a":1}`)
 
 	for _, id := range []int{1, 2} {
 		b, err := sh.requestBuilderFor(mustCapture(t, hist, id))
@@ -483,5 +483,123 @@ func TestPromptKeepsSelectionMethodsAtFiftyColumns(t *testing.T) {
 	}
 	if w := display.VisibleWidth(got); w > 50 {
 		t.Fatalf("invite de %d colonnes : %q", w, got)
+	}
+}
+
+func TestCRLSetGrammar(t *testing.T) {
+	sh, out, _, hist, builder := newTestShell(t, "")
+	for i, path := range []string{"/one", "/two", "/three"} {
+		hist.AddRequest(mint.BridgeEvent{
+			Type:      "request",
+			FlowID:    fmt.Sprintf("f%d", i+1),
+			Timestamp: time.Now(),
+			Method:    "GET",
+			URL:       "http://example.test" + path,
+			Headers:   []mint.Header{{Name: "X-Keep", Value: "keep"}},
+		})
+	}
+	sh.Execute("mint.select 1 2 3")
+
+	// 1. crl.method set 1 add GET
+	sh.Execute("crl.method set 1 add GET")
+	out.Reset()
+	// 2. crl.method set 1 set POST
+	sh.Execute("crl.method set 1 set POST")
+	out.Reset()
+	// 3. crl.method set 1 remove (remise à GET)
+	sh.Execute("crl.method set 1 remove")
+	out.Reset()
+
+	// Le constructeur actif n'a pas été touché.
+	if builder.URL() != "" || builder.Method() != "GET" {
+		t.Fatalf("constructeur actif modifié : %s %s", builder.Method(), builder.URL())
+	}
+	b1, err := sh.requestBuilderFor(mustCapture(t, hist, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b1.Method() != "GET" {
+		t.Fatalf("méthode capture 1 = %q", b1.Method())
+	}
+	if len(sh.history.SelectedMany()) != 3 {
+		t.Fatal("la sélection a été modifiée par les commandes ciblées")
+	}
+
+	// 4. En-têtes : ajout, remplacement, suppression.
+	sh.Execute(`crl.head set 1 add X-Test: valeur`)
+	sh.Execute(`crl.head set 1 set X-Test: nouvelle`)
+	sh.Execute(`crl.head set 1 add X-Debug: étape: détail`)
+	out.Reset()
+	sh.Execute(`crl.head set 1 remove X-Debug`)
+	out.Reset()
+	b1, err = sh.requestBuilderFor(mustCapture(t, hist, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := headerValueOf(b1.Headers(), "X-Test"); got != "nouvelle" {
+		t.Fatalf("X-Test = %q", got)
+	}
+	if got := headerValueOf(b1.Headers(), "X-Debug"); got != "" {
+		t.Fatalf("X-Debug toujours présent : %q", got)
+	}
+	if got := headerValueOf(b1.Headers(), "X-Keep"); got != "keep" {
+		t.Fatalf("autre en-tête perdu : %q", got)
+	}
+
+	// 5. Paramètres : ajout et suppression.
+	sh.Execute(`crl.param set 1 add token abc123`)
+	sh.Execute(`crl.param set 1 set token xyz789`)
+	out.Reset()
+	sh.Execute(`crl.param set 1 remove token`)
+	out.Reset()
+	b1, err = sh.requestBuilderFor(mustCapture(t, hist, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := b1.URL()
+	if strings.Contains(u, "token") {
+		t.Fatalf("paramètre token encore présent : %s", u)
+	}
+
+	// 6. Une nouvelle requête peut être créée pendant qu'une sélection existe.
+	sh.Execute("crl.host https://nouveau.test/path")
+	sh.Execute("crl.method PUT")
+	if builder.URL() != "https://nouveau.test/path" || builder.Method() != "PUT" {
+		t.Fatalf("constructeur non configuré pendant sélection : %s %s", builder.Method(), builder.URL())
+	}
+	if len(sh.history.SelectedMany()) != 3 {
+		t.Fatal("la sélection a été détournée par le constructeur")
+	}
+
+	// 7. La sélection reste intacte après un rejeu individuel (sans curl, on vérifie l'état).
+	out.Reset()
+	sh.Execute("crl.launch 2")
+	if len(sh.history.SelectedMany()) != 3 {
+		t.Fatal("crl.launch 2 a modifié la sélection")
+	}
+
+	// 8. Le prompt reste compact et sur une seule ligne à plusieurs largeurs.
+	for _, width := range []int{50, 80, 120} {
+		t.Setenv("COLUMNS", strconv.Itoa(width))
+		got := sh.promptText()
+		if strings.ContainsAny(got, "\r\n") {
+			t.Fatalf("invite multiligne à %d : %q", width, got)
+		}
+		if !strings.HasSuffix(got, "$") {
+			t.Fatalf("invite sans $ final à %d : %q", width, got)
+		}
+		if w := display.VisibleWidth(got); w > width {
+			t.Fatalf("invite dépasse %d colonnes : %q", w, got)
+		}
+	}
+
+	// 9. Espacement entre commandes successives (chaîne &).
+	out.Reset()
+	sh.Execute("crl.host https://chain.test/x & crl.method POST & crl.head set 1 add X-Chain: oui")
+	if !strings.Contains(out.String(), "Modifications") {
+		t.Fatalf("chaîne & non traitée :\n%s", out.String())
+	}
+	if len(sh.history.SelectedMany()) != 3 {
+		t.Fatal("la sélection a été modifiée par la chaîne &")
 	}
 }

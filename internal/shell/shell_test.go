@@ -222,9 +222,9 @@ func TestSelectedRequestsShowAndEditIndependently(t *testing.T) {
 			t.Fatalf("crl.show missing %q:\n%s", want, text)
 		}
 	}
-	sh.Execute("crl.method PATCH set 1")
-	sh.Execute(`crl.head set 2 X-Note "two words"`)
-	sh.Execute(`crl.json 2 set role = "admin"`)
+	sh.Execute("crl.method set 1 add PATCH")
+	sh.Execute(`crl.head set 2 add X-Note: two words`)
+	sh.Execute(`crl.json set 2 set role = "admin"`)
 	if sh.requestEdits[1].Method() != "PATCH" {
 		t.Fatalf("method #1 = %q", sh.requestEdits[1].Method())
 	}
@@ -239,11 +239,11 @@ func TestSelectedRequestsShowAndEditIndependently(t *testing.T) {
 			t.Fatalf("quoted header value = %q", h.Value)
 		}
 	}
-	sh.Execute("crl.head show 2")
+	sh.Execute("crl.show 2")
 	if !strings.Contains(out.String(), "X-Note: two words") {
 		t.Fatalf("target header inspection failed:\n%s", out.String())
 	}
-	sh.Execute("crl.head delete 2 X-Note")
+	sh.Execute("crl.head set 2 remove X-Note")
 	for _, h := range sh.requestEdits[2].Headers() {
 		if h.Name == "X-Note" {
 			t.Fatal("target header delete failed")
@@ -253,18 +253,18 @@ func TestSelectedRequestsShowAndEditIndependently(t *testing.T) {
 		t.Fatalf("targeted JSON edit missing: %s", sh.requestEdits[2].Body())
 	}
 	beforeInvalid := string(sh.requestEdits[2].Body())
-	sh.Execute(`crl.json 2 set role = not-json`)
+	sh.Execute(`crl.json set 2 set role = not-json`)
 	if string(sh.requestEdits[2].Body()) != beforeInvalid {
 		t.Fatal("invalid JSON edit changed the working request")
 	}
 	if err := sh.requestEdits[3].SetJSON(`[ {"role":"user"} ]`); err != nil {
 		t.Fatal(err)
 	}
-	sh.Execute(`crl.json 3 set 0.role = "admin"`)
+	sh.Execute(`crl.json set 3 set 0.role = "admin"`)
 	if !strings.Contains(string(sh.requestEdits[3].Body()), `"role": "admin"`) {
 		t.Fatalf("array path update failed: %s", sh.requestEdits[3].Body())
 	}
-	sh.Execute("crl.head set selected Accept application/json")
+	sh.Execute("crl.head set selected add Accept: application/json")
 	for id := 1; id <= 3; id++ {
 		if sh.requestEdits[id] == nil {
 			t.Fatalf("collective header missing request #%d", id)
@@ -1810,12 +1810,12 @@ func TestTargetHeaderColonSyntaxReachesHTTPServer(t *testing.T) {
 	sh, out, _, hist, _ := newTestShell(t, "")
 	hist.AddRequest(mint.BridgeEvent{Type: "request", FlowID: "headers", Method: "GET", URL: srv.URL + "/headers", Timestamp: time.Now()})
 
-	sh.Execute("crl.head set 1 sec-fetch-dest: iframe")
-	sh.Execute("crl.head set 1 X-Debug: étape: détail")
-	sh.Execute(`crl.head set 1 X-Spaces: "valeur  avec   espaces"`)
-	sh.Execute("crl.head set 1 Content-Type: application/json; charset=utf-8")
-	sh.Execute("crl.head set 1 X-Remove: yes")
-	sh.Execute("crl.head delete 1 X-Remove:")
+	sh.Execute("crl.head set 1 add sec-fetch-dest: iframe")
+	sh.Execute("crl.head set 1 add X-Debug: étape: détail")
+	sh.Execute("crl.head set 1 add X-Spaces: valeur  avec   espaces")
+	sh.Execute("crl.head set 1 add Content-Type: application/json; charset=utf-8")
+	sh.Execute("crl.head set 1 add X-Remove: yes")
+	sh.Execute("crl.head set 1 remove X-Remove")
 
 	out.Reset()
 	sh.Execute(`crl.head set 1 "bad name": x`)

@@ -671,40 +671,8 @@ func (s *Shell) executeMint(cmd, rest string) {
 }
 
 func (s *Shell) cmdSetURL(rest string) {
-	words := shellWords(rest)
-	if len(words) > 0 && (strings.EqualFold(words[0], "add") || strings.EqualFold(words[0], "remove")) {
-		action := strings.ToLower(words[0])
-		target, tail := takeTargetSpec(words[1:])
-		if target == "" {
-			if action == "add" {
-				s.errorf("usage : crl.host add <cible> <url>")
-			} else {
-				s.errorf("usage : crl.host remove <cible>")
-			}
-			return
-		}
-		captures, err := s.resolveTargets(target)
-		if err != nil {
-			s.errorf("%v", err)
-			return
-		}
-		if action == "add" {
-			if len(tail) == 0 {
-				s.errorf("usage : crl.host add <cible> <url>")
-				return
-			}
-			rawURL := strings.Join(tail, " ")
-			s.applyCaptureChanges(captures, func(b *request.Builder) error { return b.SetURL(rawURL) })
-			return
-		}
-		if len(tail) != 0 {
-			s.errorf("usage : crl.host remove <cible>")
-			return
-		}
-		s.applyCaptureChanges(captures, func(b *request.Builder) error {
-			b.ClearURL()
-			return nil
-		})
+	if idSpec, op, value, ok := parseTargetOpSpec(rest); ok {
+		s.cmdHostTarget(idSpec, op, value)
 		return
 	}
 	if rest == "" {
@@ -722,52 +690,31 @@ func (s *Shell) cmdSetURL(rest string) {
 	s.printf("[CRL] URL configurée : %s\n", display.MaskURL(s.builder.URL()))
 }
 
+func (s *Shell) cmdHostTarget(id, op, value string) {
+	captures, err := s.resolveTargets(id)
+	if err != nil {
+		s.errorf("%v", err)
+		return
+	}
+	switch op {
+	case "add", "set":
+		if value == "" {
+			s.errorf("usage : crl.host set <id> add|set <url>")
+			return
+		}
+		s.applyCaptureChanges(captures, func(b *request.Builder) error { return b.SetURL(value) })
+	case "remove":
+		s.applyCaptureChanges(captures, func(b *request.Builder) error { b.ClearURL(); return nil })
+	}
+}
+
 func (s *Shell) cmdSetMethod(rest string) {
+	if idSpec, op, value, ok := parseTargetOpSpec(rest); ok {
+		s.cmdMethodTarget(idSpec, op, value)
+		return
+	}
 	if rest == "" {
 		s.printf("[CRL] Méthode : %s\n", s.builder.Method())
-		return
-	}
-	words := shellWords(rest)
-	if len(words) > 0 && (strings.EqualFold(words[0], "add") || strings.EqualFold(words[0], "remove")) {
-		action := strings.ToLower(words[0])
-		target, tail := takeTargetSpec(words[1:])
-		if target == "" {
-			if action == "add" {
-				s.errorf("usage : crl.method add <cible> <méthode>")
-			} else {
-				s.errorf("usage : crl.method remove <cible>")
-			}
-			return
-		}
-		captures, err := s.resolveTargets(target)
-		if err != nil {
-			s.errorf("%v", err)
-			return
-		}
-		if action == "add" {
-			if len(tail) != 1 {
-				s.errorf("usage : crl.method add <cible> <méthode>")
-				return
-			}
-			method := tail[0]
-			s.applyCaptureChanges(captures, func(b *request.Builder) error { return b.SetMethod(method) })
-			return
-		}
-		if len(tail) != 0 {
-			s.errorf("usage : crl.method remove <cible>")
-			return
-		}
-		s.applyCaptureChanges(captures, func(b *request.Builder) error { return b.SetMethod("GET") })
-		return
-	}
-	// Ancienne forme conservée : crl.method <méthode> set <cible>.
-	if len(words) >= 3 && strings.EqualFold(words[1], "set") {
-		captures, err := s.resolveTargets(strings.Join(words[2:], " "))
-		if err != nil {
-			s.errorf("%v", err)
-			return
-		}
-		s.applyCaptureChanges(captures, func(b *request.Builder) error { return b.SetMethod(words[0]) })
 		return
 	}
 	if err := s.builder.SetMethod(rest); err != nil {
@@ -777,14 +724,28 @@ func (s *Shell) cmdSetMethod(rest string) {
 	s.printf("[CRL] Méthode : %s\n", s.builder.Method())
 }
 
-func (s *Shell) cmdHeader(rest string) {
-	words := shellWords(rest)
-	if len(words) > 0 {
-		switch strings.ToLower(words[0]) {
-		case "add", "remove", "set", "delete", "show":
-			s.cmdTargetHeader(words)
+func (s *Shell) cmdMethodTarget(id, op, value string) {
+	captures, err := s.resolveTargets(id)
+	if err != nil {
+		s.errorf("%v", err)
+		return
+	}
+	switch op {
+	case "add", "set":
+		if value == "" {
+			s.errorf("usage : crl.method set <id> add|set <méthode>")
 			return
 		}
+		s.applyCaptureChanges(captures, func(b *request.Builder) error { return b.SetMethod(value) })
+	case "remove":
+		s.applyCaptureChanges(captures, func(b *request.Builder) error { return b.SetMethod("GET") })
+	}
+}
+
+func (s *Shell) cmdHeader(rest string) {
+	if idSpec, op, value, ok := parseTargetOpSpec(rest); ok {
+		s.cmdHeaderTarget(idSpec, op, value)
+		return
 	}
 	switch {
 	case rest == "":
@@ -822,112 +783,108 @@ func (s *Shell) cmdHeader(rest string) {
 	}
 }
 
+func (s *Shell) cmdHeaderTarget(id, op, value string) {
+	captures, err := s.resolveTargets(id)
+	if err != nil {
+		s.errorf("%v", err)
+		return
+	}
+	switch op {
+	case "add", "set":
+		if value == "" {
+			s.errorf("usage : crl.head set <id> add|set <Nom>: <valeur>")
+			return
+		}
+		name, val, err := request.ParseHeaderLine(value)
+		if err != nil {
+			s.errorf("%v", err)
+			return
+		}
+		s.applyCaptureChanges(captures, func(b *request.Builder) error { return b.SetHeader(name, val) })
+	case "remove":
+		if value == "" {
+			s.errorf("usage : crl.head set <id> remove <Nom>")
+			return
+		}
+		name := strings.TrimSuffix(strings.TrimSpace(value), ":")
+		s.applyCaptureChanges(captures, func(b *request.Builder) error {
+			if b.RemoveHeader(name) == 0 {
+				return fmt.Errorf("en-tête %q absent", name)
+			}
+			return nil
+		})
+	}
+}
+
 func (s *Shell) cmdHeaderClear(rest string) {
-	if rest == "" {
+	name := strings.TrimSpace(rest)
+	if name == "" {
 		s.builder.ClearHeaders()
 		s.printf("[CRL] Tous les en-têtes ont été supprimés.\n")
 		return
 	}
-	n := s.builder.RemoveHeader(rest)
+	n := s.builder.RemoveHeader(name)
 	if n == 0 {
-		s.printf("[CRL] En-tête %q absent.\n", rest)
+		s.printf("[CRL] En-tête %q absent.\n", name)
 	} else {
-		s.printf("[CRL] %d en-tête(s) %q supprimé(s).\n", n, rest)
+		s.printf("[CRL] %d en-tête(s) %q supprimé(s).\n", n, name)
 	}
 }
 
 func (s *Shell) cmdCookie(rest string) {
-	words := shellWords(rest)
-	if len(words) == 0 {
+	if idSpec, op, value, ok := parseTargetOpSpec(rest); ok {
+		s.cmdCookieTarget(idSpec, op, value)
+		return
+	}
+	switch {
+	case rest == "":
 		if value := builderCookie(s.builder); value == "" {
 			s.printf("[CRL] Aucun cookie configuré.\n")
 		} else {
 			s.printf("[CRL] Cookie : %s\n", s.headerValue("Cookie", value))
 		}
-		return
-	}
-	if strings.EqualFold(words[0], "clear") {
-		target, tail := takeTargetSpec(words[1:])
-		if target == "" {
-			if len(tail) != 0 {
-				s.errorf("usage : crl.cookie clear [<cible>]")
-				return
-			}
-			s.builder.RemoveHeader("Cookie")
-			s.printf("[CRL] Cookies du constructeur supprimés.\n")
-			return
-		}
-		if len(tail) != 0 {
-			s.errorf("usage : crl.cookie clear <cible>")
-			return
-		}
-		captures, err := s.resolveTargets(target)
+	case strings.EqualFold(rest, "clear"):
+		s.builder.RemoveHeader("Cookie")
+		s.printf("[CRL] Cookies du constructeur supprimés.\n")
+	default:
+		name, value, err := parseCookieAssignment(rest)
 		if err != nil {
 			s.errorf("%v", err)
 			return
 		}
-		s.applyCaptureChanges(captures, func(b *request.Builder) error {
-			b.RemoveHeader("Cookie")
-			return nil
-		})
-		return
-	}
-	if strings.EqualFold(words[0], "add") {
-		target, tail := takeTargetSpec(words[1:])
-		if target == "" || len(tail) == 0 {
-			s.errorf("usage : crl.cookie add <cible> <nom>=<valeur>")
-			return
-		}
-		captures, err := s.resolveTargets(target)
-		if err != nil {
+		if err := setCookie(s.builder, name, value); err != nil {
 			s.errorf("%v", err)
 			return
 		}
-		name, value, err := parseCookieAssignment(strings.Join(tail, " "))
-		if err != nil {
-			s.errorf("%v", err)
-			return
-		}
-		s.applyCaptureChanges(captures, func(b *request.Builder) error { return setCookie(b, name, value) })
-		return
+		s.printf("[CRL] Cookie %q configuré.\n", name)
 	}
-	if strings.EqualFold(words[0], "remove") {
-		target, tail := takeTargetSpec(words[1:])
-		if target != "" {
-			if len(tail) != 1 {
-				s.errorf("usage : crl.cookie remove <cible> <nom>")
-				return
-			}
-			captures, err := s.resolveTargets(target)
-			if err != nil {
-				s.errorf("%v", err)
-				return
-			}
-			name := tail[0]
-			s.applyCaptureChanges(captures, func(b *request.Builder) error { return removeCookie(b, name) })
-			return
-		}
-		if len(tail) != 1 {
-			s.errorf("usage : crl.cookie remove <cible> <nom> | crl.cookie remove <nom>")
-			return
-		}
-		if err := removeCookie(s.builder, tail[0]); err != nil {
-			s.errorf("%v", err)
-			return
-		}
-		s.printf("[CRL] Cookie %q supprimé.\n", tail[0])
-		return
-	}
-	name, value, err := parseCookieAssignment(rest)
+}
+
+func (s *Shell) cmdCookieTarget(id, op, value string) {
+	captures, err := s.resolveTargets(id)
 	if err != nil {
 		s.errorf("%v", err)
 		return
 	}
-	if err := setCookie(s.builder, name, value); err != nil {
-		s.errorf("%v", err)
-		return
+	switch op {
+	case "add", "set":
+		if value == "" {
+			s.errorf("usage : crl.cookie set <id> add|set <nom>=<valeur>")
+			return
+		}
+		name, val, err := parseCookieAssignment(value)
+		if err != nil {
+			s.errorf("%v", err)
+			return
+		}
+		s.applyCaptureChanges(captures, func(b *request.Builder) error { return setCookie(b, name, val) })
+	case "remove":
+		if value == "" {
+			s.errorf("usage : crl.cookie set <id> remove <nom>")
+			return
+		}
+		s.applyCaptureChanges(captures, func(b *request.Builder) error { return removeCookie(b, value) })
 	}
-	s.printf("[CRL] Cookie %q configuré.\n", name)
 }
 
 func parseCookieAssignment(raw string) (name, value string, err error) {
@@ -1024,8 +981,12 @@ func removeCookie(b *request.Builder, name string) error {
 }
 
 func (s *Shell) cmdParam(rest string) {
-	words := shellWords(rest)
-	if len(words) == 0 {
+	if idSpec, op, value, ok := parseTargetOpSpec(rest); ok {
+		s.cmdParamTarget(idSpec, op, value)
+		return
+	}
+	switch {
+	case rest == "":
 		raw := s.builder.URL()
 		q := ""
 		if i := strings.IndexByte(raw, '?'); i >= 0 {
@@ -1039,101 +1000,56 @@ func (s *Shell) cmdParam(rest string) {
 		} else {
 			s.printf("[CRL] Paramètres d'URL : %s\n", display.MaskURL("?"+q))
 		}
-		return
-	}
-	if strings.EqualFold(words[0], "clear") {
-		target, tail := takeTargetSpec(words[1:])
-		if target == "" {
-			if len(tail) != 0 {
-				s.errorf("usage : crl.param clear [<cible>]")
-				return
-			}
-			updated, err := clearURLParams(s.builder.URL())
-			if err != nil {
-				s.errorf("%v", err)
-				return
-			}
-			if err := s.builder.SetURL(updated); err != nil {
-				s.errorf("%v", err)
-				return
-			}
-			s.printf("[CRL] Paramètres d'URL du constructeur supprimés.\n")
-			return
-		}
-		if len(tail) != 0 {
-			s.errorf("usage : crl.param clear <cible>")
-			return
-		}
-		captures, err := s.resolveTargets(target)
+	case strings.EqualFold(rest, "clear"):
+		updated, err := clearURLParams(s.builder.URL())
 		if err != nil {
 			s.errorf("%v", err)
 			return
 		}
-		s.applyCaptureChanges(captures, func(b *request.Builder) error {
-			updated, err := clearURLParams(b.URL())
-			if err != nil {
-				return err
-			}
-			return b.SetURL(updated)
-		})
-		return
-	}
-	if strings.EqualFold(words[0], "add") {
-		target, tail := takeTargetSpec(words[1:])
-		if target == "" || len(tail) == 0 {
-			s.errorf("usage : crl.param add <cible> <nom>=<valeur>")
+		if err := s.builder.SetURL(updated); err != nil {
+			s.errorf("%v", err)
 			return
 		}
-		captures, err := s.resolveTargets(target)
+		s.printf("[CRL] Paramètres d'URL du constructeur supprimés.\n")
+	default:
+		name, value, err := parseCookieAssignment(rest)
 		if err != nil {
 			s.errorf("%v", err)
 			return
 		}
-		name, value, err := parseCookieAssignment(strings.Join(tail, " "))
-		if err != nil {
-			s.errorf("paramètre invalide : %v", err)
-			return
-		}
-		s.applyCaptureChanges(captures, func(b *request.Builder) error { return setURLParam(b, name, value) })
-		return
-	}
-	if strings.EqualFold(words[0], "remove") {
-		target, tail := takeTargetSpec(words[1:])
-		if target != "" {
-			if len(tail) != 1 {
-				s.errorf("usage : crl.param remove <cible> <nom>")
-				return
-			}
-			captures, err := s.resolveTargets(target)
-			if err != nil {
-				s.errorf("%v", err)
-				return
-			}
-			name := tail[0]
-			s.applyCaptureChanges(captures, func(b *request.Builder) error { return removeURLParam(b, name) })
-			return
-		}
-		if len(tail) != 1 {
-			s.errorf("usage : crl.param remove <cible> <nom> | crl.param remove <nom>")
-			return
-		}
-		if err := removeURLParam(s.builder, tail[0]); err != nil {
+		if err := setURLParam(s.builder, name, value); err != nil {
 			s.errorf("%v", err)
 			return
 		}
-		s.printf("[CRL] Paramètre %q supprimé.\n", tail[0])
-		return
+		s.printf("[CRL] Paramètre %q configuré.\n", name)
 	}
-	name, value, err := parseCookieAssignment(rest)
+}
+
+func (s *Shell) cmdParamTarget(id, op, value string) {
+	captures, err := s.resolveTargets(id)
 	if err != nil {
 		s.errorf("%v", err)
 		return
 	}
-	if err := setURLParam(s.builder, name, value); err != nil {
-		s.errorf("%v", err)
-		return
+	switch op {
+	case "add", "set":
+		if value == "" {
+			s.errorf("usage : crl.param set <id> add|set <nom>=<valeur>")
+			return
+		}
+		name, val, err := parseCookieAssignment(value)
+		if err != nil {
+			s.errorf("%v", err)
+			return
+		}
+		s.applyCaptureChanges(captures, func(b *request.Builder) error { return setURLParam(b, name, val) })
+	case "remove":
+		if value == "" {
+			s.errorf("usage : crl.param set <id> remove <nom>")
+			return
+		}
+		s.applyCaptureChanges(captures, func(b *request.Builder) error { return removeURLParam(b, value) })
 	}
-	s.printf("[CRL] Paramètre %q configuré.\n", name)
 }
 
 func splitURLFragment(raw string) (base, fragment string) {
@@ -1658,28 +1574,14 @@ func (s *Shell) cmdJSONDelete(rest string) {
 }
 
 func (s *Shell) cmdJSONCommand(rest string) {
+	if idSpec, op, value, ok := parseTargetOpSpec(rest); ok {
+		s.cmdJSONTarget(idSpec, op, value)
+		return
+	}
 	trim := strings.TrimSpace(rest)
 	if trim == "" {
 		s.showJSONState()
 		return
-	}
-	words := shellWords(trim)
-	if len(words) > 0 {
-		switch strings.ToLower(words[0]) {
-		case "add":
-			s.cmdTargetJSONAdd(trim)
-			return
-		case "remove":
-			s.cmdTargetJSONRemove(trim)
-			return
-		}
-	}
-	if len(words) > 1 {
-		switch strings.ToLower(words[1]) {
-		case "set", "delete", "edit", "clear":
-			s.cmdTargetJSON(trim)
-			return
-		}
 	}
 	if strings.EqualFold(trim, "clear") {
 		s.builder.ClearBody()
@@ -1690,81 +1592,42 @@ func (s *Shell) cmdJSONCommand(rest string) {
 		s.cmdJSONSet(trim)
 		return
 	}
-	if strings.HasPrefix(trim, "delete ") {
-		s.cmdJSONDelete(trim)
-		return
-	}
 	s.cmdJSON(trim)
 }
 
-func splitTargetAndPayload(raw, verb string) (target, payload string, ok bool) {
-	raw = strings.TrimSpace(raw)
-	if len(raw) < len(verb) || !strings.EqualFold(raw[:len(verb)], verb) {
-		return "", "", false
-	}
-	remainder := strings.TrimSpace(raw[len(verb):])
-	pos := 0
-	var parts []string
-	for {
-		for pos < len(remainder) && unicode.IsSpace(rune(remainder[pos])) {
-			pos++
-		}
-		if pos >= len(remainder) {
-			break
-		}
-		start := pos
-		for pos < len(remainder) && !unicode.IsSpace(rune(remainder[pos])) {
-			pos++
-		}
-		token := remainder[start:pos]
-		if !isIDListToken(token) && !strings.EqualFold(token, "selected") && !strings.EqualFold(token, "all") {
-			pos = start
-			break
-		}
-		parts = append(parts, token)
-	}
-	if len(parts) == 0 {
-		return "", "", false
-	}
-	return strings.Join(parts, " "), strings.TrimSpace(remainder[pos:]), true
-}
-
-func (s *Shell) cmdTargetJSONAdd(raw string) {
-	target, payload, ok := splitTargetAndPayload(raw, "add")
-	if !ok || payload == "" {
-		s.errorf("usage : crl.json add <cible> <JSON>")
-		return
-	}
-	captures, err := s.resolveTargets(target)
+func (s *Shell) cmdJSONTarget(id, op, expression string) {
+	captures, err := s.resolveTargets(id)
 	if err != nil {
 		s.errorf("%v", err)
 		return
 	}
-	if err := validateJSON([]byte(payload)); err != nil {
-		s.errorf("%v", err)
-		return
+	switch op {
+	case "add":
+		if expression == "" {
+			s.errorf("usage : crl.json set <id> add <JSON>")
+			return
+		}
+		if err := validateJSON([]byte(expression)); err != nil {
+			s.errorf("%v", err)
+			return
+		}
+		s.applyCaptureChanges(captures, func(b *request.Builder) error { return b.SetJSON(expression) })
+	case "set":
+		s.applyCaptureChanges(captures, func(b *request.Builder) error { return updateJSONBuilder(b, "set", expression) })
+	case "remove":
+		s.applyCaptureChanges(captures, func(b *request.Builder) error { return updateJSONBuilder(b, "delete", expression) })
+	case "edit":
+		if len(captures) != 1 {
+			s.errorf("l'édition JSON ciblée est individuelle ; choisissez un ID précis")
+			return
+		}
+		b, e := s.requestBuilderFor(captures[0])
+		if e != nil {
+			s.errorf("%v", e)
+			return
+		}
+		s.openTextArea("json", b, captures[0].ID, b.Body())
 	}
-	s.applyCaptureChanges(captures, func(b *request.Builder) error { return b.SetJSON(payload) })
-	for _, c := range captures {
-		s.requestBodyReplaced[c.ID] = true
-	}
-}
-
-func (s *Shell) cmdTargetJSONRemove(raw string) {
-	target, payload, ok := splitTargetAndPayload(raw, "remove")
-	if !ok || payload != "" {
-		s.errorf("usage : crl.json remove <cible>")
-		return
-	}
-	captures, err := s.resolveTargets(target)
-	if err != nil {
-		s.errorf("%v", err)
-		return
-	}
-	s.applyCaptureChanges(captures, func(b *request.Builder) error {
-		b.ClearBody()
-		return nil
-	})
 	for _, c := range captures {
 		s.requestBodyReplaced[c.ID] = true
 	}
@@ -1779,72 +1642,51 @@ func (s *Shell) cmdJSON(rest string) {
 }
 
 func (s *Shell) cmdBodyCommand(rest string) {
+	if idSpec, op, value, ok := parseTargetOpSpec(rest); ok {
+		s.cmdBodyTarget(idSpec, op, value)
+		return
+	}
 	trim := strings.TrimSpace(rest)
 	if trim == "" {
 		s.showBodyState()
 		return
-	}
-	words := shellWords(trim)
-	if len(words) > 0 {
-		switch strings.ToLower(words[0]) {
-		case "add":
-			s.cmdTargetBodyAdd(trim)
-			return
-		case "remove":
-			s.cmdTargetBodyRemove(trim)
-			return
-		}
-	}
-	if len(words) > 1 {
-		switch strings.ToLower(words[1]) {
-		case "edit", "clear", "set":
-			s.cmdTargetBody(trim)
-			return
-		}
 	}
 	if strings.EqualFold(trim, "clear") {
 		s.builder.ClearBody()
 		s.printf("[CRL] Corps supprimé.\n")
 		return
 	}
-	s.cmdBody(trim)
+	s.builder.SetBodyText(trim)
+	s.printf("[CRL] Corps brut configuré (%d octets).\n", s.builder.BodySize())
 }
 
-func (s *Shell) cmdTargetBodyAdd(raw string) {
-	target, payload, ok := splitTargetAndPayload(raw, "add")
-	if !ok || payload == "" {
-		s.errorf("usage : crl.body add <cible> <texte>")
-		return
-	}
-	captures, err := s.resolveTargets(target)
+func (s *Shell) cmdBodyTarget(id, op, value string) {
+	captures, err := s.resolveTargets(id)
 	if err != nil {
 		s.errorf("%v", err)
 		return
 	}
-	s.applyCaptureChanges(captures, func(b *request.Builder) error {
-		b.SetBodyText(payload)
-		return nil
-	})
-	for _, c := range captures {
-		s.requestBodyReplaced[c.ID] = true
+	switch op {
+	case "set":
+		if value == "" {
+			s.errorf("usage : crl.body set <id> set <texte>")
+			return
+		}
+		s.applyCaptureChanges(captures, func(b *request.Builder) error { b.SetBodyText(value); return nil })
+	case "remove":
+		s.applyCaptureChanges(captures, func(b *request.Builder) error { b.ClearBody(); return nil })
+	case "edit":
+		if len(captures) != 1 {
+			s.errorf("l'édition du corps ciblée est individuelle ; choisissez un ID précis")
+			return
+		}
+		b, e := s.requestBuilderFor(captures[0])
+		if e != nil {
+			s.errorf("%v", e)
+			return
+		}
+		s.openTextArea("body", b, captures[0].ID, b.Body())
 	}
-}
-
-func (s *Shell) cmdTargetBodyRemove(raw string) {
-	target, payload, ok := splitTargetAndPayload(raw, "remove")
-	if !ok || payload != "" {
-		s.errorf("usage : crl.body remove <cible>")
-		return
-	}
-	captures, err := s.resolveTargets(target)
-	if err != nil {
-		s.errorf("%v", err)
-		return
-	}
-	s.applyCaptureChanges(captures, func(b *request.Builder) error {
-		b.ClearBody()
-		return nil
-	})
 	for _, c := range captures {
 		s.requestBodyReplaced[c.ID] = true
 	}
@@ -3112,6 +2954,43 @@ func isIDListToken(token string) bool {
 	return true
 }
 
+// parseTargetOpSpec analyse « set <id…|selected|all> <op> <valeur… » sur la
+// chaîne brute (les guillemets et espaces de la valeur sont préservés).
+func parseTargetOpSpec(rest string) (idSpec string, op string, value string, ok bool) {
+	raw := strings.TrimSpace(rest)
+	if !strings.HasPrefix(strings.ToLower(raw), "set ") {
+		return "", "", "", false
+	}
+	raw = strings.TrimSpace(raw[4:])
+	var ids []string
+	for raw != "" {
+		tokEnd := 0
+		for tokEnd < len(raw) && !unicode.IsSpace(rune(raw[tokEnd])) {
+			tokEnd++
+		}
+		tok := raw[:tokEnd]
+		if !(isIDListToken(tok) || strings.EqualFold(tok, "selected") || strings.EqualFold(tok, "all")) {
+			break
+		}
+		ids = append(ids, tok)
+		raw = strings.TrimSpace(raw[tokEnd:])
+	}
+	if len(ids) == 0 || raw == "" {
+		return "", "", "", false
+	}
+	tokEnd := 0
+	for tokEnd < len(raw) && !unicode.IsSpace(rune(raw[tokEnd])) {
+		tokEnd++
+	}
+	opTok := raw[:tokEnd]
+	op = strings.ToLower(opTok)
+	if op != "add" && op != "remove" && op != "set" && op != "edit" {
+		return "", "", "", false
+	}
+	value = strings.TrimSpace(raw[tokEnd:])
+	return strings.Join(ids, " "), op, value, true
+}
+
 func (s *Shell) applyCaptureChanges(captures []mint.Capture, change func(*request.Builder) error) {
 	ok, failed := 0, 0
 	for _, c := range captures {
@@ -3129,124 +3008,8 @@ func (s *Shell) applyCaptureChanges(captures []mint.Capture, change func(*reques
 	s.printf("[CRL] Modifications : %d requête(s) réussie(s), %d échec(s).\n", ok, failed)
 }
 
-func (s *Shell) cmdTargetHeader(words []string) {
-	if len(words) < 2 {
-		s.errorf("usage : crl.head add|remove <cible> <nom>: <valeur> | show <cible>")
-		return
-	}
-	action := strings.ToLower(words[0])
-	target, rest := takeTargetSpec(words[1:])
-	if target == "" {
-		s.errorf("usage : crl.head add|remove <cible> <nom>: <valeur> | show <cible>")
-		return
-	}
-	if action == "show" {
-		if len(rest) != 0 {
-			s.errorf("usage : crl.head show <cible>")
-			return
-		}
-		captures, err := s.resolveTargets(target)
-		if err != nil {
-			s.errorf("%v", err)
-			return
-		}
-		for _, c := range captures {
-			b, e := s.requestBuilderFor(c)
-			if e != nil {
-				s.errorf("requête #%d : %v", c.ID, e)
-				continue
-			}
-			s.printf("[CRL] En-têtes de #%d (%d) :\n", c.ID, len(b.Headers()))
-			for _, h := range b.Headers() {
-				s.printf("%s\n", s.headerLine(h.Name, h.Value, "  "))
-			}
-		}
-		return
-	}
-	if len(rest) == 0 {
-		s.errorf("usage : crl.head add|remove <cible> <nom>: <valeur>")
-		return
-	}
-	name := rest[0]
-	value := ""
-	switch action {
-	case "add", "set":
-		var parseErr error
-		name, value, parseErr = parseTargetHeaderArgs(rest)
-		if parseErr != nil {
-			s.errorf("%v", parseErr)
-			return
-		}
-	case "remove", "delete":
-		if len(rest) != 1 {
-			s.errorf("usage : crl.head remove <cible> <nom>")
-			return
-		}
-		name = strings.TrimSuffix(strings.TrimSpace(name), ":")
-		if err := request.ValidateHeader(name, ""); err != nil {
-			s.errorf("%v", err)
-			return
-		}
-	default:
-		s.errorf("commande d'en-tête inconnue : %s", action)
-		return
-	}
-	captures, err := s.resolveTargets(target)
-	if err != nil {
-		s.errorf("%v", err)
-		return
-	}
-	if action == "add" || action == "set" {
-		s.applyCaptureChanges(captures, func(b *request.Builder) error { return b.SetHeader(name, value) })
-		return
-	}
-	s.applyCaptureChanges(captures, func(b *request.Builder) error {
-		if b.RemoveHeader(name) == 0 {
-			return fmt.Errorf("en-tête %q absent", name)
-		}
-		return nil
-	})
-}
-
-// parseTargetHeaderArgs accepte les deux formes documentées :
-// « Nom valeur » (compatibilité) et « Nom: valeur » (forme HTTP naturelle).
-// Le premier deux-points sépare le nom de la valeur ; les deux-points suivants
-// restent intacts dans la valeur. Les mots déjà découpés par shellWords
-// conservent les espaces des valeurs entre guillemets.
-func parseTargetHeaderArgs(args []string) (name, value string, err error) {
-	if len(args) == 0 {
-		return "", "", fmt.Errorf("nom d'en-tête manquant")
-	}
-	head := args[0]
-	hasValue := len(args) > 1
-	if i := strings.IndexByte(head, ':'); i >= 0 {
-		name = strings.TrimSpace(head[:i])
-		value = strings.TrimSpace(head[i+1:])
-		if len(args) > 1 {
-			rest := strings.TrimSpace(strings.Join(args[1:], " "))
-			if value == "" {
-				value = rest
-			} else if rest != "" {
-				value += " " + rest
-			}
-		}
-	} else {
-		name = strings.TrimSpace(head)
-		if len(args) > 1 {
-			value = strings.TrimSpace(strings.Join(args[1:], " "))
-		}
-	}
-	if name == "" {
-		return "", "", fmt.Errorf("nom d'en-tête vide")
-	}
-	if !hasValue && value == "" {
-		return "", "", fmt.Errorf("valeur d'en-tête manquante")
-	}
-	if err := request.ValidateHeader(name, value); err != nil {
-		return "", "", err
-	}
-	return name, value, nil
-}
+// La logique d'en-têtes ciblés se trouve désormais dans cmdHeaderTarget
+// (add/remove/set via « crl.head set <id> … »).
 
 // shellWords handles quoted command arguments without invoking a shell.
 func shellWords(input string) []string {
@@ -4027,8 +3790,8 @@ func promptCellsWidth(cells []promptCell) int {
 		}
 		total += utf8.RuneCountInString(cell.plain)
 	}
-	// Deux espaces avant le « $ » final, comme dans le dessin cible.
-	return total + 2
+	// Un espace entre les cellules et un seul espace avant le « $ » final.
+	return total + 1
 }
 
 func renderPromptCells(cells []promptCell) string {
@@ -4040,9 +3803,9 @@ func renderPromptCells(cells []promptCell) string {
 		parts = append(parts, cell.styled)
 	}
 	if len(parts) == 0 {
-		return "  " + cells[len(cells)-1].styled
+		return " " + cells[len(cells)-1].styled
 	}
-	return strings.Join(parts, " ") + "  " + cells[len(cells)-1].styled
+	return strings.Join(parts, " ") + " " + cells[len(cells)-1].styled
 }
 
 func (s *Shell) promptMint(short bool) (plain, styled string) {
@@ -4650,4 +4413,43 @@ func truncate(s string, max int) string {
 		return string(runes[:max])
 	}
 	return string(runes[:max-1]) + "…"
+}
+
+// parseTargetHeaderArgs accepte les deux formes documentées :
+// « Nom valeur » (compatibilité) et « Nom: valeur » (forme HTTP naturelle).
+// Le premier deux-points sépare le nom de la valeur ; les deux-points suivants
+// restent intacts dans la valeur.
+func parseTargetHeaderArgs(args []string) (name, value string, err error) {
+	if len(args) == 0 {
+		return "", "", fmt.Errorf("nom d'en-tête manquant")
+	}
+	head := args[0]
+	hasValue := len(args) > 1
+	if i := strings.IndexByte(head, ':'); i >= 0 {
+		name = strings.TrimSpace(head[:i])
+		value = strings.TrimSpace(head[i+1:])
+		if len(args) > 1 {
+			rest := strings.TrimSpace(strings.Join(args[1:], " "))
+			if value == "" {
+				value = rest
+			} else if rest != "" {
+				value += " " + rest
+			}
+		}
+	} else {
+		name = strings.TrimSpace(head)
+		if len(args) > 1 {
+			value = strings.TrimSpace(strings.Join(args[1:], " "))
+		}
+	}
+	if name == "" {
+		return "", "", fmt.Errorf("nom d'en-tête vide")
+	}
+	if !hasValue && value == "" {
+		return "", "", fmt.Errorf("valeur d'en-tête manquante")
+	}
+	if err := request.ValidateHeader(name, value); err != nil {
+		return "", "", err
+	}
+	return name, value, nil
 }

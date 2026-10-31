@@ -287,7 +287,7 @@ func TestPTYJSONEditorKeepsOneCompactFrameAndRestoresPrompt(t *testing.T) {
 	go func() { done <- sh.Run(ctx) }()
 	waitPTYLine(t, got, testPrompt, 3*time.Second)
 
-	if _, err := master.Write([]byte("crl.json 1 edit\r")); err != nil {
+	if _, err := master.Write([]byte("crl.json set 1 edit\r")); err != nil {
 		t.Fatal(err)
 	}
 	waitPTYText(t, got, "CRL JSON EDITOR", 3*time.Second)
@@ -354,7 +354,7 @@ func TestPTYJSONEditorKeepsOneCompactFrameAndRestoresPrompt(t *testing.T) {
 
 	// Esc doit restaurer le corps précédent et laisser le terminal propre.
 	mark := len(got.String())
-	if _, err := master.Write([]byte("crl.json 1 edit\r")); err != nil {
+	if _, err := master.Write([]byte("crl.json set 1 edit\r")); err != nil {
 		t.Fatal(err)
 	}
 	waitPTYTextSince(t, got, mark, "CRL JSON EDITOR", 3*time.Second)

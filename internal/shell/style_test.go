@@ -71,7 +71,7 @@ func TestCommandHelpIsAlignedFilteredAndColorControlled(t *testing.T) {
 	sh, out, _, _, _ := newTestShell(t, "")
 	sh.Execute("?")
 	text := out.String()
-	for _, want := range []string{"Commandes CRL-CLI", "REQUÊTES", "INSPECTION ET ENVOI", "MINT", "crl.host", "mint.replay", "help [commande]"} {
+	for _, want := range []string{"Commandes CRL-CLI", "CONSTRUCTEUR ACTIF", "INSPECTION ET ENVOI", "CAPTURES MINT", "crl.host", "mint.replay", "help [commande]"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("aide générale sans %q:\n%s", want, text)
 		}
@@ -81,7 +81,7 @@ func TestCommandHelpIsAlignedFilteredAndColorControlled(t *testing.T) {
 	}
 	out.Reset()
 	sh.Execute("help crl.json")
-	if !strings.Contains(out.String(), "crl.json <id> edit") || strings.Contains(out.String(), "mint.proxy") {
+	if !strings.Contains(out.String(), "crl.json set <id> edit") || strings.Contains(out.String(), "mint.proxy") {
 		t.Fatalf("aide filtrée incorrecte:\n%s", out.String())
 	}
 	out.Reset()

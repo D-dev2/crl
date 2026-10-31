@@ -106,7 +106,7 @@ func TestPTYBodyEditorLongCRLFRendersOneStableFrameAndPreservesBytes(t *testing.
 	go func() { done <- sh.Run(ctx) }()
 	waitPTYLine(t, got, testPrompt, 3*time.Second)
 
-	if _, err := master.Write([]byte("crl.body 1 edit\r")); err != nil {
+	if _, err := master.Write([]byte("crl.body set 1 edit\r")); err != nil {
 		t.Fatal(err)
 	}
 	waitPTYText(t, got, "CRL BODY EDITOR", 3*time.Second)
@@ -151,7 +151,7 @@ func TestPTYBodyEditorLongCRLFRendersOneStableFrameAndPreservesBytes(t *testing.
 	// Une validation sans modification doit sauvegarder exactement les mêmes
 	// octets, sans retour chariot ni caractère de contrôle ajouté par le rendu.
 	mark := len(got.String())
-	if _, err := master.Write([]byte("crl.body 1 edit\r")); err != nil {
+	if _, err := master.Write([]byte("crl.body set 1 edit\r")); err != nil {
 		t.Fatal(err)
 	}
 	waitPTYTextSince(t, got, mark, "CRL BODY EDITOR", 3*time.Second)
@@ -169,7 +169,7 @@ func TestPTYBodyEditorLongCRLFRendersOneStableFrameAndPreservesBytes(t *testing.
 	// les CRLF existants ni ajouter de caractère de rendu.
 	waitPTYLine(t, got, testPrompt, 3*time.Second)
 	mark = len(got.String())
-	if _, err := master.Write([]byte("crl.body 1 edit\r")); err != nil {
+	if _, err := master.Write([]byte("crl.body set 1 edit\r")); err != nil {
 		t.Fatal(err)
 	}
 	waitPTYTextSince(t, got, mark, "CRL BODY EDITOR", 3*time.Second)
@@ -246,7 +246,7 @@ func TestPTYJSONEditorLongContentScrollsAndSavesExactly(t *testing.T) {
 	go func() { done <- sh.Run(ctx) }()
 	waitPTYLine(t, got, testPrompt, 3*time.Second)
 
-	if _, err := master.Write([]byte("crl.json 1 edit\r")); err != nil {
+	if _, err := master.Write([]byte("crl.json set 1 edit\r")); err != nil {
 		t.Fatal(err)
 	}
 	waitPTYText(t, got, "CRL JSON EDITOR", 3*time.Second)

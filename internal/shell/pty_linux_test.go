@@ -228,7 +228,7 @@ func TestInteractiveJSONEditorUsesArrowKeysAndReturnsToPrompt(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- sh.Run(ctx) }()
-	jsonPrompt := "crl [MINT OFF] [SEL 0] [CRL GET · H1 · B]  $"
+	jsonPrompt := "crl [MINT OFF] [SEL 0] [CRL GET · H1 · B] $"
 	waitPTYLine(t, got, jsonPrompt, 3*time.Second)
 
 	// crl.json sans argument affiche l'état actuel, n'ouvre pas l'éditeur.
