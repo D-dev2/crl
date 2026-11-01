@@ -138,19 +138,22 @@ func TestMintRequestsFilterAndHistory(t *testing.T) {
 	}
 }
 
-func TestMintShowMasksSecrets(t *testing.T) {
+func TestMintShowDisplaysFullSecrets(t *testing.T) {
 	sh, out, _, hist, _ := newTestShell(t, "")
 	addCapture(t, hist)
 	sh.Execute("mint.request.show 1")
 	text := out.String()
-	for _, want := range []string{"Capture #1", "Bearer ***", "Cookie: ***", "Set-Cookie: ***", "token=***", "200 OK", "24ms", "/users/v1/login"} {
+	for _, want := range []string{"Capture #1", "Bearer supersecret", "Cookie: session=abc", "Set-Cookie: session=abc", "token=supersecret", "200 OK", "24ms", "/users/v1/login"} {
 		if !strings.Contains(text, want) {
-			t.Fatalf("show missing %q:\n%s", want, text)
+			t.Fatalf("show missing full value %q:\n%s", want, text)
 		}
+	}
+	if strings.Contains(text, "***") {
+		t.Fatalf("la vue détaillée masque encore une valeur :\n%s", text)
 	}
 }
 
-func TestMintShowMasksProxyAndCustomHeaderValues(t *testing.T) {
+func TestMintShowDisplaysProxyAndCustomHeaderValues(t *testing.T) {
 	sh, out, _, hist, _ := newTestShell(t, "")
 	hist.AddRequest(mint.BridgeEvent{
 		Type: "request", FlowID: "custom-headers", Timestamp: time.Now(),
@@ -162,10 +165,13 @@ func TestMintShowMasksProxyAndCustomHeaderValues(t *testing.T) {
 	})
 	sh.Execute("mint.request.show 1")
 	text := out.String()
-	for _, want := range []string{"Proxy-Authorization: Basic ***", "X-Custom-Token: ***"} {
+	for _, want := range []string{"Proxy-Authorization: Basic proxy-value", "X-Custom-Token: custom-value"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("valeur complète %q absente :\n%s", want, text)
 		}
+	}
+	if strings.Contains(text, "***") {
+		t.Fatalf("la vue détaillée masque encore une valeur :\n%s", text)
 	}
 }
 
@@ -203,8 +209,11 @@ func TestMintSelectAndUse(t *testing.T) {
 	}
 	out.Reset()
 	sh.Execute("crl.show")
-	if !strings.Contains(out.String(), "Bearer ***") || !strings.Contains(out.String(), "Cookie: ***") {
-		t.Fatalf("crl.show did not mask secret headers:\n%s", out.String())
+	if !strings.Contains(out.String(), "Bearer supersecret") || !strings.Contains(out.String(), "Cookie: session=abc") {
+		t.Fatalf("crl.show n'affiche pas les en-têtes complets :\n%s", out.String())
+	}
+	if strings.Contains(out.String(), "***") {
+		t.Fatalf("crl.show masque encore une valeur :\n%s", out.String())
 	}
 }
 
@@ -217,7 +226,7 @@ func TestSelectedRequestsShowAndEditIndependently(t *testing.T) {
 	out.Reset()
 	sh.Execute("crl.show")
 	text := out.String()
-	for _, want := range []string{"REQUEST #1", "REQUEST #2", "REQUEST #3", "Authorization: Bearer ***", "\"role\": \"user\"", "token=***"} {
+	for _, want := range []string{"REQUEST #1", "REQUEST #2", "REQUEST #3", "Authorization: Bearer private", "\"role\": \"user\"", "token=private"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("crl.show missing %q:\n%s", want, text)
 		}
@@ -563,7 +572,7 @@ func TestProxyPriorityInShow(t *testing.T) {
 	}
 }
 
-func TestCRLCommandsMaskSecrets(t *testing.T) {
+func TestCRLCommandsDisplayFullDetails(t *testing.T) {
 	sh, out, _, _, builder := newTestShell(t, "")
 	sh.Execute("crl.host http://127.0.0.1:5002/a%2Fb?x=1&x=2&empty=&token=abc")
 	sh.Execute("crl.method PUT")
@@ -573,10 +582,13 @@ func TestCRLCommandsMaskSecrets(t *testing.T) {
 	sh.Execute("crl.json {\"a\":1}")
 	sh.Execute("crl.show")
 	text := out.String()
-	for _, want := range []string{"Bearer ***", "Basic ***", "***", "token=***"} {
+	for _, want := range []string{"Bearer verysecret", "Basic proxysecret", "customsecret", "token=abc"} {
 		if !strings.Contains(text, want) {
-			t.Fatalf("full header or URL value %q missing:\n%s", want, text)
+			t.Fatalf("valeur complète %q absente :\n%s", want, text)
 		}
+	}
+	if strings.Contains(text, "***") {
+		t.Fatalf("crl.show masque encore une valeur :\n%s", text)
 	}
 	if builder.URL() != "http://127.0.0.1:5002/a%2Fb?x=1&x=2&empty=&token=abc" {
 		t.Fatalf("URL changed: %q", builder.URL())
@@ -870,10 +882,13 @@ func TestMintAuthHeadersSurviveSelectionImportAndReplay(t *testing.T) {
 	out.Reset()
 	sh.Execute("mint.request.show 1")
 	detail := out.String()
-	for _, want := range []string{"Bearer ***", "***"} {
+	for _, want := range []string{"Bearer auth-secret", "session=abc", "api-secret", "proxy-secret"} {
 		if !strings.Contains(detail, want) {
-			t.Fatalf("valeur masquée %q absente de la capture :\n%s", want, detail)
+			t.Fatalf("valeur complète %q absente de la capture :\n%s", want, detail)
 		}
+	}
+	if strings.Contains(detail, "***") {
+		t.Fatalf("la capture détaillée masque encore une valeur :\n%s", detail)
 	}
 
 	out.Reset()
@@ -897,8 +912,8 @@ func TestMintAuthHeadersSurviveSelectionImportAndReplay(t *testing.T) {
 
 	out.Reset()
 	sh.Execute("crl.show")
-	if !strings.Contains(out.String(), "Bearer ***") {
-		t.Fatalf("crl.show ne masque pas l'authentification :\n%s", out.String())
+	if !strings.Contains(out.String(), "Bearer auth-secret") {
+		t.Fatalf("crl.show n'affiche pas l'authentification complète :\n%s", out.String())
 	}
 
 	out.Reset()
@@ -971,8 +986,8 @@ func TestLaunchHTTPResponseLayoutAndPrettyJSON(t *testing.T) {
 	if strings.Contains(text, `{"b":2`) {
 		t.Fatalf("JSON not pretty-printed:\n%s", text)
 	}
-	if !strings.Contains(text, "Set-Cookie: ***") {
-		t.Fatalf("masked response header missing:\n%s", text)
+	if !strings.Contains(text, "Set-Cookie: session=secret") {
+		t.Fatalf("response header full value missing:\n%s", text)
 	}
 	if strings.Contains(text, "\033[") {
 		t.Fatalf("launch emitted ANSI on a non-terminal buffer:\n%s", text)
@@ -1263,8 +1278,8 @@ func TestRealMintAutoProxyInShell(t *testing.T) {
 	if !strings.Contains(launchText, cfg.ListenHost+":"+strconv.Itoa(cfg.Port)) {
 		t.Fatalf("proxy Mint automatique non annoncé :\n%s", launchText)
 	}
-	if !strings.Contains(launchText, "token=***") {
-		t.Fatalf("URL masquée absente de crl.launch :\n%s", launchText)
+	if !strings.Contains(launchText, "token=secret") {
+		t.Fatalf("URL complète absente de crl.launch :\n%s", launchText)
 	}
 
 	var capture mint.Capture

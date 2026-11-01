@@ -267,6 +267,24 @@ func (b *Builder) Reset() {
 	*b = Builder{method: "GET"}
 }
 
+// Clone retourne une copie indépendante du constructeur. Les en-têtes, y
+// compris les doublons et les valeurs exactes, et le corps sont dupliqués.
+func (b *Builder) Clone() *Builder {
+	if b == nil {
+		return nil
+	}
+	clone := &Builder{
+		method:  b.method,
+		rawURL:  b.rawURL,
+		bodySet: b.bodySet,
+		proxy:   b.proxy,
+		caFile:  b.caFile,
+	}
+	clone.headers = append([]Header(nil), b.headers...)
+	clone.body = append([]byte(nil), b.body...)
+	return clone
+}
+
 // Import remplit le constructeur depuis une capture. Aucune requête n'est
 // envoyée. Les en-têtes, le corps et l'URL sont copiés à l'identique.
 func (b *Builder) Import(c CapturedRequest) error {
@@ -418,15 +436,8 @@ func normalizeMethod(method string) (string, error) {
 	return m, nil
 }
 
-// MaskProxyCredentials masque un éventuel mot de passe dans une URL de proxy.
+// MaskProxyCredentials retourne l'URL de proxy intacte. L'affichage local ne
+// masque plus les identifiants ; le nom est conservé pour compatibilité.
 func MaskProxyCredentials(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil || u.User == nil {
-		return raw
-	}
-	if _, hasPassword := u.User.Password(); !hasPassword {
-		return raw
-	}
-	u.User = url.UserPassword(u.User.Username(), "***")
-	return u.String()
+	return raw
 }

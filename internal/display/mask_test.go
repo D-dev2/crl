@@ -5,57 +5,65 @@ import (
 	"testing"
 )
 
-func TestHeaderMasking(t *testing.T) {
+func TestDetailedHeaderDisplayIsNotMasked(t *testing.T) {
 	cases := []struct {
 		name  string
 		value string
-		want  string
 	}{
-		{"Authorization", "Bearer abc.def.ghi", "Bearer ***"},
-		{"authorization", "Basic dXNlcjpwYXNz", "Basic ***"},
-		{"Cookie", "session=secret", "***"},
-		{"Set-Cookie", "session=secret; HttpOnly", "***"},
-		{"X-Api-Key", "k-123", "***"},
-		{"X-Test", "demo", "demo"},
-		{"Content-Type", "application/json", "application/json"},
-		{"X-Session-Id", "abc", "***"},
-		{"WWW-Authenticate", "Bearer realm=x", "Bearer realm=x"},
+		{"Authorization", "Bearer abc.def.ghi"},
+		{"authorization", "Basic dXNlcjpwYXNz"},
+		{"Proxy-Authorization", "Basic cHJveHk6c2VjcmV0"},
+		{"Cookie", "session=secret"},
+		{"Set-Cookie", "session=secret; HttpOnly"},
+		{"X-Api-Key", "k-123"},
+		{"X-Test", "demo"},
+		{"Content-Type", "application/json"},
+		{"X-Session-Id", "abc"},
+		{"WWW-Authenticate", "Bearer realm=x"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := MaskHeaderValue(tc.name, tc.value); got != tc.want {
-				t.Fatalf("MaskHeaderValue(%q) = %q, want %q", tc.name, got, tc.want)
+			if got := MaskHeaderValue(tc.name, tc.value); got != tc.value {
+				t.Fatalf("MaskHeaderValue(%q) = %q, want full %q", tc.name, got, tc.value)
+			}
+			if got := HeaderLine(tc.name, tc.value); got != tc.name+": "+tc.value {
+				t.Fatalf("HeaderLine(%q) = %q", tc.name, got)
 			}
 		})
 	}
 }
 
-func TestMaskURLPreservesStructure(t *testing.T) {
+func TestDetailedURLDisplayIsNotMasked(t *testing.T) {
 	raw := "http://127.0.0.1:5002/a%2Fb/c?x=1&token=abc&x=&empty&api_key=k&frag=ok#section"
-	got := MaskURL(raw)
+	if got := MaskURL(raw); got != raw {
+		t.Fatalf("MaskURL = %q, want full %q", got, raw)
+	}
+}
+
+func TestSummaryURLMasksSensitiveValues(t *testing.T) {
+	raw := "http://127.0.0.1:5002/a%2Fb/c?x=1&token=abc&x=&empty&api_key=k&frag=ok#section"
+	got := SummaryURL(raw)
 	want := "http://127.0.0.1:5002/a%2Fb/c?x=1&token=***&x=&empty&api_key=***&frag=ok#section"
 	if got != want {
-		t.Fatalf("MaskURL = %q, want %q", got, want)
+		t.Fatalf("SummaryURL = %q, want %q", got, want)
 	}
 }
 
-func TestMaskURLWithoutQuery(t *testing.T) {
+func TestSummaryURLWithoutQuery(t *testing.T) {
 	raw := "http://127.0.0.1:5002/users/v1/hacker"
-	if got := MaskURL(raw); got != raw {
-		t.Fatalf("MaskURL = %q, want unchanged", got)
+	if got := SummaryURL(raw); got != raw {
+		t.Fatalf("SummaryURL = %q, want unchanged", got)
 	}
 }
 
-func TestMaskBodyMasksNestedCredentialsWithoutMutatingInput(t *testing.T) {
+func TestMaskBodyPreservesNestedCredentialsWithoutMutatingInput(t *testing.T) {
 	body := []byte(`{"profile":{"role":"admin","password":"secret"},"items":[{"access_token":"abc"}]}`)
-	masked := string(MaskBody(body))
-	for _, secret := range []string{"secret", "abc"} {
-		if strings.Contains(masked, secret) {
-			t.Fatalf("secret %q non masqué : %s", secret, masked)
-		}
+	visible := string(MaskBody(body))
+	if visible != string(body) {
+		t.Fatalf("MaskBody = %s, want intact %s", visible, body)
 	}
-	if !strings.Contains(masked, `"role": "admin"`) || !strings.Contains(masked, `"password": "***"`) || !strings.Contains(masked, `"access_token": "***"`) {
-		t.Fatalf("masquage JSON incomplet : %s", masked)
+	if !strings.Contains(visible, `"password":"secret"`) || !strings.Contains(visible, `"access_token":"abc"`) {
+		t.Fatalf("les secrets doivent rester visibles : %s", visible)
 	}
 	if string(body) != `{"profile":{"role":"admin","password":"secret"},"items":[{"access_token":"abc"}]}` {
 		t.Fatalf("input body mutated: %s", body)

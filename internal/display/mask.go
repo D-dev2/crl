@@ -1,5 +1,10 @@
 // Package display centralise les règles d'affichage de CRL-CLI :
-// masquage des secrets, rendu des URL et des corps HTTP.
+// rendu des URL et des corps HTTP, et vues récapitulatives.
+//
+// Les vues détaillées de CRL-CLI affichent les données telles qu'elles ont été
+// préparées, capturées ou reçues. Aucune valeur d'en-tête, de cookie, d'URL ou
+// de corps JSON n'y est masquée. Les fonctions *Summary* ne servent qu'aux
+// tableaux compacts, jamais aux vues détaillées.
 //
 // Ces fonctions ne modifient jamais les données utilisées pour rejouer une
 // requête : elles ne travaillent que sur des copies destinées au terminal.
@@ -15,7 +20,7 @@ import (
 )
 
 // sensitiveHeaderFragments contient les fragments de noms d'en-tête qui
-// déclenchent un masquage. La comparaison est insensible à la casse.
+// déclenchent un résumé masqué. La comparaison est insensible à la casse.
 var sensitiveHeaderFragments = []string{
 	"authorization",
 	"cookie",
@@ -33,7 +38,7 @@ var sensitiveHeaderFragments = []string{
 }
 
 // sensitiveQueryKeys contient les noms de paramètres dont la valeur est
-// masquée dans les affichages. Les clés sont comparées en minuscules.
+// résumée dans les tableaux compacts. Les clés sont comparées en minuscules.
 var sensitiveQueryKeys = map[string]struct{}{
 	"access_token":         {},
 	"access-token":         {},
@@ -65,7 +70,9 @@ var sensitiveQueryKeys = map[string]struct{}{
 	"x-amz-security-token": {},
 }
 
-// HeaderSensitive indique si la valeur d'un en-tête doit être masquée.
+// HeaderSensitive indique si un nom d'en-tête est habituellement porteur d'un
+// secret. Cette classification ne sert qu'aux résumés, jamais à masquer une vue
+// détaillée.
 func HeaderSensitive(name string) bool {
 	lname := strings.ToLower(strings.TrimSpace(name))
 	if lname == "" {
@@ -79,31 +86,20 @@ func HeaderSensitive(name string) bool {
 	return false
 }
 
-// MaskHeaderValue masque une valeur d'en-tête sensible. Le nom du schéma
-// d'authentification (Bearer, Basic, ...) est conservé : il aide à
-// comprendre la requête sans révéler le secret.
+// MaskHeaderValue retourne la valeur intacte. Le nom est conservé dans la
+// signature pour les appelants historiques ; les vues détaillées ne masquent
+// plus aucune valeur.
 func MaskHeaderValue(name, value string) string {
-	if !HeaderSensitive(name) || strings.TrimSpace(value) == "" {
-		return value
-	}
-	// Les schémas d'authentification (Bearer, Basic, Digest…) restent
-	// visibles : ils indiquent le mécanisme sans révéler le secret.
-	if i := strings.IndexByte(value, ' '); i > 0 {
-		switch strings.ToLower(value[:i]) {
-		case "bearer", "basic", "digest", "negotiate", "ntlm", "token", "apikey", "api-key":
-			return value[:i] + " ***"
-		}
-	}
-	return "***"
+	return value
 }
 
-// HeaderLine rend une ligne d'en-tête prête pour l'affichage, valeur
-// masquée si nécessaire.
+// HeaderLine rend une ligne d'en-tête complète, sans masquage.
 func HeaderLine(name, value string) string {
 	return name + ": " + MaskHeaderValue(name, value)
 }
 
-// QuerySensitive indique si un nom de paramètre de requête est sensible.
+// QuerySensitive indique si un nom de paramètre de requête est habituellement
+// porteur d'un secret. Cette classification ne sert qu'aux tableaux compacts.
 func QuerySensitive(name string) bool {
 	lname := strings.ToLower(strings.TrimSpace(name))
 	if lname == "" {
@@ -120,10 +116,16 @@ func QuerySensitive(name string) bool {
 	return false
 }
 
-// MaskURL masque uniquement les valeurs des paramètres sensibles d'une URL.
-// La structure brute de l'URL (encodage, paramètres répétés, valeurs vides,
-// ordre) est préservée ; seul le texte affiché est modifié.
+// MaskURL retourne l'URL intacte. Les vues détaillées ne masquent plus les
+// paramètres sensibles ; SummaryURL reste disponible pour les tableaux.
 func MaskURL(raw string) string {
+	return raw
+}
+
+// SummaryURL masque uniquement les valeurs des paramètres sensibles d'une URL
+// pour un tableau récapitulatif. La structure brute de l'URL (encodage,
+// paramètres répétés, valeurs vides, ordre) est préservée.
+func SummaryURL(raw string) string {
 	q := strings.IndexByte(raw, '?')
 	if q < 0 {
 		return raw
@@ -177,55 +179,10 @@ func RenderBody(body []byte, limit int) (string, bool) {
 	return string(body), false
 }
 
-// MaskBody returns a display-only copy of a JSON body with common credential
-// fields obscured. The bytes held by a request are never modified.
+// MaskBody retourne une copie intacte du corps. Le nom est conservé pour les
+// appelants historiques : l'affichage local doit montrer les données réelles.
 func MaskBody(body []byte) []byte {
-	copied := append([]byte(nil), body...)
-	decoder := json.NewDecoder(bytes.NewReader(copied))
-	decoder.UseNumber()
-	var root any
-	if err := decoder.Decode(&root); err != nil {
-		return copied
-	}
-	masked, changed := maskJSONValue(root)
-	if !changed {
-		return copied
-	}
-	encoded, err := json.MarshalIndent(masked, "", "  ")
-	if err != nil {
-		return copied
-	}
-	return encoded
-}
-
-// maskJSONValue masque les valeurs des propriétés dont le nom est sensible.
-// Le booléen indique si au moins une valeur a été remplacée.
-func maskJSONValue(value any) (any, bool) {
-	switch node := value.(type) {
-	case map[string]any:
-		changed := false
-		for key, child := range node {
-			if QuerySensitive(key) {
-				node[key] = "***"
-				changed = true
-				continue
-			}
-			updated, childChanged := maskJSONValue(child)
-			node[key] = updated
-			changed = changed || childChanged
-		}
-		return node, changed
-	case []any:
-		changed := false
-		for i, child := range node {
-			updated, childChanged := maskJSONValue(child)
-			node[i] = updated
-			changed = changed || childChanged
-		}
-		return node, changed
-	default:
-		return value, false
-	}
+	return append([]byte(nil), body...)
 }
 
 func hasBinaryControl(body []byte) bool {

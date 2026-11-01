@@ -75,11 +75,13 @@ type Shell struct {
 	pal        palette
 	lastFailed bool
 
-	outputMode      response.Mode
-	lastResponseDir string
-	mintWatch       bool
-	pendingEvents   []mint.Notification
-	pendingDropped  int
+	outputMode          response.Mode
+	lastResponseDir     string
+	followRedirects     bool
+	redirectCredentials bool
+	mintWatch           bool
+	pendingEvents       []mint.Notification
+	pendingDropped      int
 
 	lastBatchSent    int
 	lastBatchSuccess int
@@ -229,6 +231,8 @@ func New(opts Options) (*Shell, error) {
 		scanner:             bufio.NewScanner(opts.In),
 		pal:                 termstyle.New(opts.Out),
 		outputMode:          response.ModeAuto,
+		followRedirects:     true,
+		redirectCredentials: false,
 	}
 	s.scanner.Buffer(make([]byte, 64<<10), 2<<20)
 	if f, ok := opts.In.(*os.File); ok && termstyle.IsTerminal(f.Fd()) {
@@ -595,6 +599,10 @@ func (s *Shell) executeOne(line string) bool {
 		s.cmdLaunch(rest)
 	case "crl.output":
 		s.cmdOutput(rest)
+	case "crl.redirect":
+		s.cmdRedirect(rest)
+	case "crl.redirect.credentials":
+		s.cmdRedirectCredentials(rest)
 	case "mint", "mint.help":
 		s.printMintHelp()
 	case "crl.help":
@@ -2046,7 +2054,7 @@ func (s *Shell) cmdTable() {
 				c := selected[0]
 				s.printf("%s\n", p.BoldGreen(fmt.Sprintf("[CRL] Tableau de la requête sélectionnée #%d", c.ID)))
 				s.field("MÉTHODE", p.Method(c.Request.Method))
-				s.field("URL", p.Cyan(display.MaskURL(c.Request.URL)))
+				s.field("URL", p.Cyan(display.SummaryURL(c.Request.URL)))
 				s.field("EN-TÊTES", p.Bold(fmt.Sprintf("%d", len(c.Request.Headers))))
 				s.field("CORPS", p.Bold(fmt.Sprintf("%d octets", len(c.Request.Body))))
 				if len(c.Request.Headers) > 0 {
@@ -2066,7 +2074,7 @@ func (s *Shell) cmdTable() {
 			s.printf("%s\n", p.BoldGreen(fmt.Sprintf("[CRL] Tableau des requêtes sélectionnées (%d)", len(selected))))
 			s.rule(s.termWidth())
 			for _, c := range selected {
-				urlStr := display.MaskURL(c.Request.URL)
+				urlStr := display.SummaryURL(c.Request.URL)
 				urlLines := display.WrapText(urlStr, max(20, s.termWidth()-10))
 				s.printf("  #%d %s %s\n", c.ID, p.Method(c.Request.Method), p.Cyan(urlLines[0]))
 				for _, cont := range urlLines[1:] {
@@ -2087,7 +2095,7 @@ func (s *Shell) cmdTable() {
 	res := s.proxyResolution()
 	s.printf("%s\n", p.BoldGreen("[CRL] Tableau de la requête"))
 	s.field("MÉTHODE", p.Method(s.builder.Method()))
-	s.field("URL", p.Cyan(display.MaskURL(s.builder.URL())))
+	s.field("URL", p.Cyan(display.SummaryURL(s.builder.URL())))
 	s.field("EN-TÊTES", p.Bold(fmt.Sprintf("%d", len(s.builder.Headers()))))
 	s.field("CORPS", p.Bold(fmt.Sprintf("%d octets", s.builder.BodySize())))
 	s.field("PROXY", s.proxyValue(res))
@@ -2131,6 +2139,58 @@ func (s *Shell) cmdOutput(rest string) {
 	s.printf("  %s\n", p.Dim(mode.Label()))
 }
 
+func (s *Shell) cmdRedirect(rest string) {
+	p := s.pal
+	switch strings.ToLower(strings.TrimSpace(rest)) {
+	case "", "status":
+		state := "désactivé"
+		if s.followRedirects {
+			state = fmt.Sprintf("activé (maximum %d)", request.DefaultMaxRedirects)
+		}
+		s.printf("[CRL] Suivi des redirections : %s\n", p.BoldCyan(state))
+		s.printf("  %s\n", p.Dim("Statuts suivis : 301, 302, 303, 307, 308."))
+		s.printf("  %s\n", p.Dim("usage : crl.redirect on|off"))
+		credState := "désactivé"
+		if s.redirectCredentials {
+			credState = "activé"
+		}
+		s.printf("  %s\n", p.Dim(fmt.Sprintf("Transfert des identifiants vers une autre origine : crl.redirect.credentials on|off (actuel : %s)", credState)))
+		return
+	case "on", "oui", "true", "1", "auto":
+		s.followRedirects = true
+		s.printf("[CRL] Suivi des redirections : %s\n", p.BoldGreen(fmt.Sprintf("activé (maximum %d)", request.DefaultMaxRedirects)))
+	case "off", "non", "false", "0", "none":
+		s.followRedirects = false
+		s.printf("[CRL] Suivi des redirections : %s\n", p.BoldYellow("désactivé"))
+		s.printf("  %s\n", p.Dim("crl.launch et mint.replay afficheront uniquement la réponse 3xx."))
+	default:
+		s.errorf("usage : crl.redirect on|off")
+	}
+}
+
+func (s *Shell) cmdRedirectCredentials(rest string) {
+	p := s.pal
+	switch strings.ToLower(strings.TrimSpace(rest)) {
+	case "", "status":
+		state := "désactivé"
+		if s.redirectCredentials {
+			state = "activé"
+		}
+		s.printf("[CRL] Transfert des identifiants lors des redirections : %s\n", p.BoldCyan(state))
+		s.printf("  %s\n", p.Dim("Par défaut, les identifiants ne sont pas transmis vers une autre origine."))
+		s.printf("  %s\n", p.Dim("usage : crl.redirect.credentials on|off"))
+		return
+	case "on", "oui", "true", "1":
+		s.redirectCredentials = true
+		s.printf("[CRL] Transfert des identifiants lors des redirections : %s\n", p.BoldGreen("activé"))
+	case "off", "non", "false", "0":
+		s.redirectCredentials = false
+		s.printf("[CRL] Transfert des identifiants lors des redirections : %s\n", p.BoldYellow("désactivé"))
+	default:
+		s.errorf("usage : crl.redirect.credentials on|off")
+	}
+}
+
 func (s *Shell) cmdLaunch(rest string) {
 	rest = strings.TrimSpace(rest)
 	// "all" est une cible explicite pour certaines commandes ciblées, mais
@@ -2157,15 +2217,14 @@ func (s *Shell) cmdLaunch(rest string) {
 		return
 	}
 	res := s.proxyResolution()
-	args, err := s.builder.CurlArgs(res)
-	if err != nil {
+	if _, err := s.builder.CurlArgs(res); err != nil {
 		s.errorf("%v", err)
 		return
 	}
-	s.launchWithBuilder(s.builder, args, res)
+	s.launchWithBuilder(s.builder, res)
 }
 
-func (s *Shell) launchWithBuilder(b *request.Builder, args []string, res request.ProxyResolution) {
+func (s *Shell) launchWithBuilder(b *request.Builder, res request.ProxyResolution) {
 
 	s.clearLastResponse()
 	dir, err := os.MkdirTemp("", "crl-response-*")
@@ -2183,75 +2242,98 @@ func (s *Shell) launchWithBuilder(b *request.Builder, args []string, res request
 			return
 		}
 	}
-	args = append(args, "--dump-header", headerPath, "--output", bodyPath, "--write-out", response.WriteOutFormat)
 
 	p := s.pal
 	s.printf("%s\n", p.BoldGreen("[CRL] Requête envoyée"))
 	s.rule(s.termWidth())
 	s.field("Méthode", p.Method(b.Method()))
-	s.field("URL", p.Cyan(display.MaskURL(sanitizeTerminal(b.URL()))))
+	s.field("URL initiale", p.Cyan(sanitizeTerminal(b.URL())))
 	s.field("Proxy", s.proxyValue(res))
 	s.field("Sortie", p.Cyan(s.outputMode.ShortLabel()))
+	redirectState := fmt.Sprintf("suivi automatique (max %d)", request.DefaultMaxRedirects)
+	if !s.followRedirects {
+		redirectState = "désactivé (crl.redirect on pour activer)"
+	}
+	credState := ""
+	if s.followRedirects {
+		if s.redirectCredentials {
+			credState = " · identifiants cross-origin autorisés"
+		} else {
+			credState = " · identifiants cross-origin retirés"
+		}
+	}
+	s.field("Redirections", p.Cyan(redirectState+credState))
 	s.field("Requête", fmt.Sprintf("%d en-tête(s), corps %s", len(b.Headers()), display.FormatBytes(int64(b.BodySize()))))
 
 	ctx := s.ctx
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	cmd := exec.CommandContext(ctx, "curl", args...)
-	if b.BodySet() {
-		cmd.Stdin = b.BodyReader()
-	}
-	var metaOut, stderr bytes.Buffer
-	cmd.Stdout = &metaOut
-	cmd.Stderr = &stderr
 	started := time.Now()
-	runErr := cmd.Run()
-	elapsed := time.Since(started)
-	if s.launchUsesMintProxy(res) {
-		s.reportMintCapture(started)
-	}
+	exchange := s.runHTTPWithRedirects(ctx, b, res, dir)
 	s.lastResponseDir = dir
 	_ = os.Chmod(headerPath, 0o600)
 	_ = os.Chmod(bodyPath, 0o600)
 
-	headerData, _ := os.ReadFile(headerPath)
-	status, headers := response.ParseHeaderDump(headerData)
-	meta := response.ParseCurlMeta(metaOut.Bytes())
-	if meta.Duration <= 0 {
-		meta.Duration = elapsed
+	if s.launchUsesMintProxy(res) {
+		finalBuilder := b
+		if final, ok := exchange.final(); ok && final.request != nil {
+			finalBuilder = final.request
+		}
+		s.reportMintCaptureFor(started, finalBuilder)
 	}
-	var total int64
-	if info, statErr := os.Stat(bodyPath); statErr == nil {
-		total = info.Size()
-	}
-	bodyPreview := readFilePrefix(bodyPath, launchBodyLimit)
 
-	if runErr != nil {
-		s.lastFailed = true
-		failure := response.ClassifyCurlFailure(curlExitCode(runErr), stderr.String())
-		if ctx.Err() != nil {
-			failure.Label = "interrompu"
-		}
-		if status.Code > 0 {
-			s.printf("\n%s\n", p.BoldYellow(fmt.Sprintf("[CRL] Transport : %s (curl %d) — un statut HTTP a tout de même été reçu.", failure.Label, failure.Code)))
-			s.printHTTPResponseWithBuilder(b, status, headers, meta, bodyPreview, total, bodyPath)
-			return
-		}
-		s.printTransportFailure(failure)
-		if total > 0 {
-			s.printResponseBody(bodyPreview, total, bodyPath, headers.ContentType())
-		} else {
-			s.clearLastResponse()
-		}
-		return
-	}
-	if status.Code == 0 {
-		s.errorf("curl n'a renvoyé aucune ligne de statut HTTP exploitable")
+	if len(exchange.hops) == 0 {
+		s.errorf("aucune réponse HTTP n'a été produite")
 		s.clearLastResponse()
 		return
 	}
-	s.printHTTPResponseWithBuilder(b, status, headers, meta, bodyPreview, total, bodyPath)
+	for i, hop := range exchange.hops[:len(exchange.hops)-1] {
+		s.printRedirectHop(i+1, hop)
+		s.printRedirectArrow()
+	}
+
+	for i, hop := range exchange.hops[:len(exchange.hops)-1] {
+		s.printRedirectHop(i+1, hop)
+		s.printRedirectArrow()
+	}
+
+	final, _ := exchange.final()
+	if final.err != nil {
+		s.lastFailed = true
+		s.errorf("%v", final.err)
+		s.clearLastResponse()
+		return
+	}
+	if final.failure != nil {
+		s.lastFailed = true
+		if final.status.Code > 0 {
+			s.printf("\n%s\n", p.BoldYellow(fmt.Sprintf("[CRL] Transport : %s (curl %d) — un statut HTTP a tout de même été reçu.", final.failure.Label, final.failure.Code)))
+			if len(exchange.hops) > 1 {
+				s.printFinalHop(final)
+			} else {
+				s.printHTTPResponseWithBuilder(final.request, final.status, final.headers, final.meta, final.body, final.total, final.bodyPath, "")
+			}
+		} else {
+			s.printTransportFailure(*final.failure)
+			if final.total > 0 {
+				s.printResponseBody(final.body, final.total, final.bodyPath, final.headers.ContentType())
+			} else {
+				s.clearLastResponse()
+			}
+		}
+	} else {
+		if len(exchange.hops) > 1 {
+			s.printFinalHop(final)
+		} else {
+			s.printHTTPResponseWithBuilder(final.request, final.status, final.headers, final.meta, final.body, final.total, final.bodyPath, "")
+		}
+	}
+	s.printRedirectChain(exchange)
+	if exchange.redirectErr != nil {
+		s.lastFailed = true
+		s.errorf("%v", exchange.redirectErr)
+	}
 }
 
 // launchUsesMintProxy reconnaît le proxy Mint qu'il soit choisi
@@ -2268,13 +2350,17 @@ func (s *Shell) launchUsesMintProxy(res request.ProxyResolution) bool {
 // URL. En présence de trafic concurrent, l'absence de correspondance est
 // signalée au lieu d'attribuer arbitrairement une capture à crl.launch.
 func (s *Shell) reportMintCapture(started time.Time) {
+	s.reportMintCaptureFor(started, s.builder)
+}
+
+func (s *Shell) reportMintCaptureFor(started time.Time, b *request.Builder) {
 	// Le pont Mint est asynchrone : la capture de requête peut arriver juste
 	// après la fin de curl. On lui laisse une courte fenêtre, sans bloquer
 	// longtemps si le proxy n'a effectivement rien capturé.
 	deadline := time.Now().Add(250 * time.Millisecond)
 	for {
-		if c, ok := s.findRecentMintCapture(started); ok {
-			s.reportMintCaptureDiff(c)
+		if c, ok := s.findRecentMintCaptureFor(started, b); ok {
+			s.reportMintCaptureDiffFor(c, b)
 			return
 		}
 		if time.Now().After(deadline) {
@@ -2286,13 +2372,17 @@ func (s *Shell) reportMintCapture(started time.Time) {
 }
 
 func (s *Shell) findRecentMintCapture(started time.Time) (mint.Capture, bool) {
+	return s.findRecentMintCaptureFor(started, s.builder)
+}
+
+func (s *Shell) findRecentMintCaptureFor(started time.Time, b *request.Builder) (mint.Capture, bool) {
 	captures := s.history.List()
 	for i := len(captures) - 1; i >= 0; i-- {
 		c := captures[i]
 		if c.StartedAt.Before(started.Add(-time.Second)) || !c.Request.Received {
 			continue
 		}
-		if c.Request.Method != s.builder.Method() || c.Request.URL != s.builder.URL() {
+		if c.Request.Method != b.Method() || c.Request.URL != b.URL() {
 			continue
 		}
 		return c, true
@@ -2301,9 +2391,13 @@ func (s *Shell) findRecentMintCapture(started time.Time) (mint.Capture, bool) {
 }
 
 func (s *Shell) reportMintCaptureDiff(c mint.Capture) {
-	s.printf("\n[Mint] Capture récente de même méthode et URL : #%d (%s %s). La corrélation n'est pas garantie en cas de trafic concurrent ; comparez les en-têtes avec crl.show, détail : mint.request.show %d.\n", c.ID, sanitizeTerminal(c.Request.Method), display.MaskURL(sanitizeTerminal(c.Request.URL)), c.ID)
+	s.reportMintCaptureDiffFor(c, s.builder)
+}
+
+func (s *Shell) reportMintCaptureDiffFor(c mint.Capture, b *request.Builder) {
+	s.printf("\n[Mint] Capture récente de même méthode et URL : #%d (%s %s). La corrélation n'est pas garantie en cas de trafic concurrent ; comparez les en-têtes avec crl.show, détail : mint.request.show %d.\n", c.ID, sanitizeTerminal(c.Request.Method), sanitizeTerminal(c.Request.URL), c.ID)
 	matched := make([]bool, len(c.Request.Headers))
-	for _, expected := range s.builder.Headers() {
+	for _, expected := range b.Headers() {
 		found := false
 		for i, actual := range c.Request.Headers {
 			if !matched[i] && strings.EqualFold(expected.Name, actual.Name) && expected.Value == actual.Value {
@@ -2363,16 +2457,19 @@ func (s *Shell) printTransportFailure(failure response.CurlFailure) {
 }
 
 func (s *Shell) printHTTPResponse(status response.Status, headers response.Headers, meta response.CurlMeta, body []byte, total int64, bodyPath string) {
-	s.printHTTPResponseWithBuilder(s.builder, status, headers, meta, body, total, bodyPath)
+	s.printHTTPResponseWithBuilder(s.builder, status, headers, meta, body, total, bodyPath, "")
 }
 
-func (s *Shell) printHTTPResponseWithBuilder(b *request.Builder, status response.Status, headers response.Headers, meta response.CurlMeta, body []byte, total int64, bodyPath string) {
+func (s *Shell) printHTTPResponseWithBuilder(b *request.Builder, status response.Status, headers response.Headers, meta response.CurlMeta, body []byte, total int64, bodyPath, heading string) {
 	p := s.pal
-	s.printf("\n%s\n", p.BoldGreen("[CRL] Réponse HTTP"))
+	if heading == "" {
+		heading = "[CRL] Réponse HTTP"
+	}
+	s.printf("\n%s\n", p.BoldGreen(heading))
 	s.rule(s.termWidth())
 	s.field("Statut", p.StatusCode(status.Code, sanitizeTerminal(status.Label())))
 	s.field("Méthode", p.Method(b.Method()))
-	s.field("URL demandée", p.Cyan(display.MaskURL(sanitizeTerminal(b.URL()))))
+	s.field("URL demandée", p.Cyan(sanitizeTerminal(b.URL())))
 	s.field("Durée", p.Cyan(durationLabel(meta.Duration)))
 	s.field("Taille", p.Bold(display.FormatBytes(total)))
 	if contentType := headers.ContentType(); contentType != "" {
@@ -2382,7 +2479,7 @@ func (s *Shell) printHTTPResponseWithBuilder(b *request.Builder, status response
 		s.field("HTTP", p.Dim(sanitizeTerminal(status.Proto)))
 	}
 	if meta.EffectiveURL != "" {
-		s.field("URL finale", p.Cyan(display.MaskURL(sanitizeTerminal(meta.EffectiveURL))))
+		s.field("URL finale", p.Cyan(sanitizeTerminal(meta.EffectiveURL)))
 	}
 
 	s.printf("\n  %s\n", p.BoldBlue(fmt.Sprintf("En-têtes de réponse (%d)", len(headers))))
@@ -2409,7 +2506,11 @@ func (s *Shell) printHTTPResponseWithBuilder(b *request.Builder, status response
 			s.printf("  %s\n", p.Dim(fmt.Sprintf("404 : vérifiez le chemin, les paramètres et la méthode %s ; ce statut ne prouve pas à lui seul que la ressource n'existe pas.", b.Method())))
 		}
 	} else if status.Code >= 300 && status.Code < 400 {
-		s.printf("  %s\n", p.Cyan("Redirection reçue ; curl ne la suit pas automatiquement."))
+		if s.followRedirects {
+			s.printf("  %s\n", p.Cyan("Redirection reçue ; aucune destination suivie (Location absente, vide ou statut hors 301/302/303/307/308)."))
+		} else {
+			s.printf("  %s\n", p.Cyan("Redirection reçue ; le suivi automatique est désactivé (crl.redirect on pour l'activer)."))
+		}
 	}
 }
 
@@ -2663,7 +2764,7 @@ func (s *Shell) cmdMintRequests(all bool) {
 		if host == "" {
 			host = "-"
 		}
-		path := display.MaskURL(c.PathAndQuery())
+		path := display.SummaryURL(c.PathAndQuery())
 		idCell := padCell(strconv.Itoa(c.ID), idWidth)
 		methodCell := padCell(truncate(c.Request.Method, methodWidth), methodWidth)
 		hostCell := padCell(truncate(host, hostWidth), hostWidth)
@@ -2828,7 +2929,7 @@ func (s *Shell) printSelected(captures []mint.Capture) {
 	p := s.pal
 	s.printf("[Mint] Sélection persistante (%d) — aucune requête envoyée :\n", len(captures))
 	for _, c := range captures {
-		urlStr := display.MaskURL(c.PathAndQuery())
+		urlStr := display.SummaryURL(c.PathAndQuery())
 		urlLines := display.WrapText(urlStr, max(20, s.termWidth()-20))
 		s.printf("  #%d %s %s%s\n", c.ID, p.Method(c.Request.Method), c.Request.Host, p.Cyan(urlLines[0]))
 		for _, cont := range urlLines[1:] {
@@ -3065,17 +3166,20 @@ func shellWords(input string) []string {
 }
 
 type replayResult struct {
-	id       int
-	method   string
-	url      string
-	status   response.Status
-	duration string
-	headers  response.Headers
-	body     []byte
-	total    int64
-	bodyPath string
-	err      error
-	network  bool
+	id          int
+	method      string
+	url         string
+	finalMethod string
+	finalURL    string
+	redirects   []replayRedirect
+	status      response.Status
+	duration    string
+	headers     response.Headers
+	body        []byte
+	total       int64
+	bodyPath    string
+	err         error
+	network     bool
 }
 
 // cmdMintReplay démarre chaque capture sélectionnée en parallèle, conserve son
@@ -3187,7 +3291,7 @@ func (s *Shell) printReplaySummary(results []replayResult, completed, successHTT
 	s.printf("  %s\n", p.Dim(header))
 	for _, r := range results {
 		status := strconv.Itoa(r.status.Code)
-		detail := display.MaskURL(sanitizeTerminal(r.url))
+		detail := display.SummaryURL(sanitizeTerminal(r.url))
 		if r.err != nil {
 			status = "ERREUR"
 			detail = sanitizeTerminal(r.err.Error())
@@ -3202,6 +3306,7 @@ func (s *Shell) printReplaySummary(results []replayResult, completed, successHTT
 
 	for _, r := range results {
 		s.printf("\n")
+		s.printReplayRedirects(r)
 		s.printReplayResponse(r)
 	}
 }
@@ -3233,7 +3338,13 @@ func (s *Shell) printReplayResponse(r replayResult) {
 
 	s.replayField("Statut", p.StatusCode(r.status.Code, r.status.Label()), width)
 	s.replayField("Méthode", p.Method(r.method), width)
+	if r.finalMethod != "" && r.finalMethod != r.method {
+		s.replayField("Méthode finale", p.Method(r.finalMethod), width)
+	}
 	s.replayField("URL", p.Cyan(display.MaskURL(sanitizeTerminal(r.url))), width)
+	if r.finalURL != "" && r.finalURL != r.url {
+		s.replayField("URL finale", p.Cyan(display.MaskURL(sanitizeTerminal(r.finalURL))), width)
+	}
 	s.replayField("Durée", p.Cyan(r.duration), width)
 	s.replayField("Taille", p.Bold(display.FormatBytes(r.total)), width)
 
@@ -3321,8 +3432,7 @@ func (s *Shell) replayCapture(ctx context.Context, c mint.Capture) replayResult 
 		return r
 	}
 	res := b.ResolveProxy("", false)
-	args, err := b.CurlArgs(res)
-	if err != nil {
+	if _, err := b.CurlArgs(res); err != nil {
 		r.err = err
 		return r
 	}
@@ -3336,62 +3446,49 @@ func (s *Shell) replayCapture(ctx context.Context, c mint.Capture) replayResult 
 			_ = os.RemoveAll(dir)
 		}
 	}()
-	headersPath, bodyPath := filepath.Join(dir, "headers"), filepath.Join(dir, "body")
-	cmd := exec.CommandContext(ctx, "curl", append(args, "--dump-header", headersPath, "--output", bodyPath, "-w", "%{http_code} %{time_total}")...)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if b.BodySet() {
-		cmd.Stdin = b.BodyReader()
+	exchange := s.runHTTPWithRedirects(ctx, b, res, dir)
+	final, ok := exchange.final()
+	if !ok {
+		return fail(fmt.Errorf("aucune réponse HTTP exploitable"))
 	}
-	out, err := cmd.Output()
-	if err != nil {
-		message := strings.TrimSpace(stderr.String())
-		// Une connexion refusée (code curl 7) est une erreur réseau précise.
-		// Elle doit rester visible même si le contexte vient d'expirer, plutôt
-		// que d'être écrasée par un "deadline exceeded" générique.
-		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 7 {
-			if message != "" {
-				return fail(fmt.Errorf("curl: %s", truncate(sanitizeTerminal(message), 600)))
-			}
-			return fail(err)
-		}
-		if ctx.Err() != nil {
-			return fail(ctx.Err())
-		}
+	if exchange.redirectErr != nil {
+		r.err = exchange.redirectErr
+		r.network = false
+		return r
+	}
+	if final.err != nil {
+		r.err = final.err
+		r.network = false
+		return r
+	}
+	if final.failure != nil {
+		message := strings.TrimSpace(final.failure.Detail)
 		if message != "" {
 			return fail(fmt.Errorf("curl: %s", truncate(sanitizeTerminal(message), 600)))
 		}
-		return fail(err)
+		return fail(fmt.Errorf("curl %d : %s", final.failure.Code, final.failure.Label))
 	}
-	parts := strings.Fields(string(out))
-	if len(parts) < 2 {
-		return fail(fmt.Errorf("réponse curl illisible"))
-	}
-	d, _ := strconv.ParseFloat(parts[1], 64)
-	r.duration = (time.Duration(d * float64(time.Second))).String()
-	headerData, _ := os.ReadFile(headersPath)
-	httpStatus, parsedHeaders := response.ParseHeaderDump(headerData)
-	code, _ := strconv.Atoi(parts[0])
-	if httpStatus.Code == 0 {
-		httpStatus.Code = code
-	}
-	if httpStatus.Code == 0 {
+	if final.status.Code == 0 {
 		return fail(fmt.Errorf("aucun statut HTTP exploitable"))
 	}
-	r.status = httpStatus
-	r.headers = parsedHeaders
-	if info, statErr := os.Stat(bodyPath); statErr == nil {
-		r.total = info.Size()
-	}
-	r.body = readFilePrefix(bodyPath, launchBodyLimit)
+	r.status = final.status
+	r.headers = final.headers
+	r.total = final.total
+	r.body = readFilePrefix(final.bodyPath, launchBodyLimit)
 	if r.total <= 16<<20 {
-		if complete, readErr := os.ReadFile(bodyPath); readErr == nil {
-			r.body = display.MaskBody(complete)
+		if complete, readErr := os.ReadFile(final.bodyPath); readErr == nil {
+			r.body = complete
 		}
 	} else {
-		r.body = []byte("[corps volumineux : aperçu masqué ; utilisez mint.replay.body pour consulter une page]")
+		r.body = []byte("[corps volumineux : aperçu limité ; utilisez mint.replay.body pour consulter une page]")
 	}
-	r.bodyPath = bodyPath
+	r.bodyPath = final.bodyPath
+	if final.meta.Duration > 0 {
+		r.duration = final.meta.Duration.String()
+	}
+	r.finalMethod = final.request.Method()
+	r.finalURL = final.request.URL()
+	r.redirects = replayRedirects(exchange)
 	keepDir = true
 	return r
 }
@@ -3482,7 +3579,7 @@ func (s *Shell) cmdMintSelected() {
 	}
 	p := s.pal
 	s.printf("%s %s\n", p.BoldMagenta("[Mint]"), p.BoldCyan(fmt.Sprintf("Capture sélectionnée : #%d", c.ID)))
-	s.printf("  %s %s%s\n", p.Method(c.Request.Method), c.Request.Host, p.Cyan(display.MaskURL(c.PathAndQuery())))
+	s.printf("  %s %s%s\n", p.Method(c.Request.Method), c.Request.Host, p.Cyan(display.SummaryURL(c.PathAndQuery())))
 	s.printf("  %s %s, %s %s\n", p.Dim("Statut :"), captureStatus(p, c, c.StatusLabelText()), p.Dim("durée :"), p.Dim(c.DurationLabel()))
 	s.printf("%s %s\n", p.BoldMagenta("[Mint]"), fmt.Sprintf("mint.use %d pour l'importer dans CRL-CLI.", c.ID))
 }
@@ -4303,51 +4400,73 @@ func (s *Shell) printIndented(text, prefix string) {
 	}
 }
 
-// splitCommandChain découpe « cmd1 & cmd2 » sans casser les « & » d'une URL
-// ou d'une valeur entre guillemets. Un séparateur doit être un « & » isolé par
-// des espaces (ou des guillemets fermés) : « ?a=1&b=2 » reste intact.
+// splitCommandChain découpe une ligne en commandes séparées par « & » ou
+// « && ». Les séparateurs ne sont reconnus que hors guillemets et lorsqu'ils
+// forment un jeton isolé par des espaces : « ?a=1&b=2 », « ?a=1&&b=2 » et les
+// chaînes JSON contenant « & » restent donc intactes. Les échappements avec
+// barre oblique inverse sont respectés ; les guillemets simples et doubles
+// protègent leur contenu.
 func splitCommandChain(line string) []string {
 	var parts []string
 	start := 0
-	quote := rune(0)
+	quote := byte(0)
 	escaped := false
-	runes := []rune(line)
-	for i := 0; i < len(runes); i++ {
-		r := runes[i]
+	for i := 0; i < len(line); i++ {
+		c := line[i]
 		if escaped {
 			escaped = false
 			continue
 		}
-		if r == '\\' && quote != '\'' {
+		if c == '\\' && quote != '\'' {
 			escaped = true
 			continue
 		}
 		if quote != 0 {
-			if r == quote {
+			if c == quote {
 				quote = 0
 			}
 			continue
 		}
-		if r == '\'' || r == '"' {
-			quote = r
+		if c == '\'' || c == '"' {
+			quote = c
 			continue
 		}
-		if r != '&' {
+		if c != '&' {
 			continue
 		}
-		prevSpace := i == 0 || unicode.IsSpace(runes[i-1])
-		nextSpace := i+1 == len(runes) || unicode.IsSpace(runes[i+1])
-		if prevSpace && nextSpace {
-			if part := strings.TrimSpace(string(runes[start:i])); part != "" {
-				parts = append(parts, part)
-			}
-			start = i + 1
+		sepLen := 1
+		if i+1 < len(line) && line[i+1] == '&' {
+			sepLen = 2
 		}
+		if !spaceBefore(line, i) || !spaceAfter(line, i+sepLen) {
+			continue
+		}
+		if part := strings.TrimSpace(line[start:i]); part != "" {
+			parts = append(parts, part)
+		}
+		i += sepLen - 1
+		start = i + 1
 	}
-	if part := strings.TrimSpace(string(runes[start:])); part != "" {
+	if part := strings.TrimSpace(line[start:]); part != "" {
 		parts = append(parts, part)
 	}
 	return parts
+}
+
+func spaceBefore(s string, i int) bool {
+	if i <= 0 {
+		return true
+	}
+	r, _ := utf8.DecodeLastRuneInString(s[:i])
+	return unicode.IsSpace(r)
+}
+
+func spaceAfter(s string, i int) bool {
+	if i >= len(s) {
+		return true
+	}
+	r, _ := utf8.DecodeRuneInString(s[i:])
+	return unicode.IsSpace(r)
 }
 
 func splitCommand(line string) (cmd, rest string) {

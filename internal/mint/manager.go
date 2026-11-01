@@ -522,7 +522,7 @@ func (m *Manager) applyEvent(s *session, ev BridgeEvent) {
 			Level:  "info",
 			ID:     capture.ID,
 			Method: capture.Request.Method,
-			URL:    display.MaskURL(capture.Request.URL),
+			URL:    display.SummaryURL(capture.Request.URL),
 		})
 	case "response":
 		capture := m.hist.AddResponse(ev)
