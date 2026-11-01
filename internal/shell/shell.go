@@ -22,6 +22,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"crl-cli/internal/crlhistory"
 	"crl-cli/internal/display"
 	"crl-cli/internal/mint"
 	"crl-cli/internal/request"
@@ -37,21 +38,46 @@ const (
 
 // Options configure le shell.
 type Options struct {
-	In      io.Reader
-	Out     io.Writer
+	In  io.Reader
+	Out io.Writer
+	// ErrOut reçoit les diagnostics en mode script (stderr par défaut).
+	ErrOut  io.Writer
 	Builder *request.Builder
 	Manager *mint.Manager
+	History *crlhistory.Store
+	// ScriptMode désactive les invites et la confirmation bloquante.
+	ScriptMode bool
+	// JSONMode produit un tableau JSON structuré sur la sortie standard.
+	JSONMode bool
 	// Notifications est le canal alimenté par le gestionnaire Mint.
 	Notifications <-chan mint.Notification
+}
+
+// scriptResult décrit le résultat structuré d'une exécution crl.launch en
+// mode script.
+type scriptResult struct {
+	ID           int    `json:"id,omitempty"`
+	Command      string `json:"command"`
+	OK           bool   `json:"ok"`
+	Error        string `json:"error,omitempty"`
+	Method       string `json:"method,omitempty"`
+	URL          string `json:"url,omitempty"`
+	StatusCode   int    `json:"status_code,omitempty"`
+	DurationMs   int64  `json:"duration_ms,omitempty"`
+	BodySize     int64  `json:"body_size,omitempty"`
+	NetworkError bool   `json:"network_error,omitempty"`
+	HTTPError    bool   `json:"http_error,omitempty"`
 }
 
 // Shell regroupe l'état du shell interactif.
 type Shell struct {
 	in      io.Reader
 	out     *trackingWriter
+	errOut  io.Writer
 	builder *request.Builder
 	manager *mint.Manager
 	history *mint.History
+	crlHist *crlhistory.Store
 	// requestEdits holds independent working copies of captured requests.
 	requestEdits        map[int]*request.Builder
 	requestBodyReplaced map[int]bool
@@ -61,6 +87,8 @@ type Shell struct {
 	notifs              <-chan mint.Notification
 
 	interactive bool
+	scriptMode  bool
+	jsonMode    bool
 	editor      *editor
 	textArea    *textArea
 	textKind    string
@@ -74,6 +102,7 @@ type Shell struct {
 
 	pal        palette
 	lastFailed bool
+	lastExit   int
 
 	outputMode          response.Mode
 	lastResponseDir     string
@@ -87,6 +116,8 @@ type Shell struct {
 	lastBatchSuccess int
 	lastBatchFail    int
 	lastBatchSet     bool
+
+	scriptResults []scriptResult
 }
 
 type trackingWriter struct {
@@ -216,13 +247,25 @@ func New(opts Options) (*Shell, error) {
 		opts.Builder = request.New()
 	}
 
-	tw := &trackingWriter{w: opts.Out}
+	outDest := opts.Out
+	if opts.JSONMode {
+		outDest = io.Discard
+	}
+	tw := &trackingWriter{w: outDest}
+	errOut := opts.ErrOut
+	if errOut == nil {
+		errOut = os.Stderr
+	}
 	s := &Shell{
 		in:                  opts.In,
 		out:                 tw,
+		errOut:              errOut,
 		builder:             opts.Builder,
 		manager:             opts.Manager,
 		history:             opts.Manager.History(),
+		crlHist:             opts.History,
+		scriptMode:          opts.ScriptMode,
+		jsonMode:            opts.JSONMode,
 		requestEdits:        make(map[int]*request.Builder),
 		requestBodyReplaced: make(map[int]bool),
 		replayBodies:        make(map[int]string),
@@ -244,17 +287,17 @@ func New(opts Options) (*Shell, error) {
 // Run démarre la boucle du shell.
 func (s *Shell) Run(ctx context.Context) error {
 	s.ctx = ctx
-	defer s.clearLastResponse()
+	defer s.clearReplayArtifacts()
 	if s.interactive {
 		return s.runInteractive(ctx)
 	}
 	return s.runBatch(ctx)
 }
 
-// Close libère les fichiers temporaires de la dernière réponse. Il est sûr de
-// l'appeler plusieurs fois.
+// Close libère les artefacts de rejeu. Les fichiers de la dernière réponse
+// sont conservés : les données importantes sont déjà persistées par
+// crl.history et ne doivent pas disparaître à la fermeture de la session.
 func (s *Shell) Close() {
-	s.clearLastResponse()
 	s.clearReplayArtifacts()
 }
 
@@ -594,7 +637,9 @@ func (s *Shell) executeOne(line string) bool {
 	case "crl.show":
 		s.cmdShow(rest)
 	case "crl.table":
-		s.cmdTable()
+		s.cmdCrlTable(rest)
+	case "crl.history":
+		s.cmdCrlHistory(rest)
 	case "crl.launch":
 		s.cmdLaunch(rest)
 	case "crl.output":
@@ -683,6 +728,7 @@ func (s *Shell) cmdSetURL(rest string) {
 		s.cmdHostTarget(idSpec, op, value)
 		return
 	}
+	rest = stripQuotes(strings.TrimSpace(rest))
 	if rest == "" {
 		if s.builder.URL() == "" {
 			s.errorf("aucune URL configurée. usage : crl.host <url>")
@@ -706,6 +752,7 @@ func (s *Shell) cmdHostTarget(id, op, value string) {
 	}
 	switch op {
 	case "add", "set":
+		value = stripQuotes(strings.TrimSpace(value))
 		if value == "" {
 			s.errorf("usage : crl.host set <id> add|set <url>")
 			return
@@ -721,6 +768,7 @@ func (s *Shell) cmdSetMethod(rest string) {
 		s.cmdMethodTarget(idSpec, op, value)
 		return
 	}
+	rest = stripQuotes(strings.TrimSpace(rest))
 	if rest == "" {
 		s.printf("[CRL] Méthode : %s\n", s.builder.Method())
 		return
@@ -730,6 +778,10 @@ func (s *Shell) cmdSetMethod(rest string) {
 		return
 	}
 	s.printf("[CRL] Méthode : %s\n", s.builder.Method())
+	if (s.builder.Method() == "GET" || s.builder.Method() == "HEAD") && s.builder.BodySet() && s.builder.BodyMethod() != s.builder.Method() {
+		s.printf("  %s\n", s.pal.BoldYellow("Attention : un corps est configuré et ne sera pas envoyé avec "+
+			s.builder.Method()+". Utilisez crl.body.clear pour le retirer ou crl.body <texte> pour le réconfigurer."))
+	}
 }
 
 func (s *Shell) cmdMethodTarget(id, op, value string) {
@@ -740,6 +792,7 @@ func (s *Shell) cmdMethodTarget(id, op, value string) {
 	}
 	switch op {
 	case "add", "set":
+		value = stripQuotes(strings.TrimSpace(value))
 		if value == "" {
 			s.errorf("usage : crl.method set <id> add|set <méthode>")
 			return
@@ -1642,6 +1695,14 @@ func (s *Shell) cmdJSONTarget(id, op, expression string) {
 }
 
 func (s *Shell) cmdJSON(rest string) {
+	rest = stripQuotes(strings.TrimSpace(rest))
+	if strings.HasPrefix(strings.ToLower(rest), "raw ") {
+		// crl.json raw <texte> envoie volontairement un corps brut, y compris
+		// un JSON mal formé, sans validation ni modification du Content-Type.
+		s.builder.SetBodyText(strings.TrimSpace(rest[4:]))
+		s.printf("[CRL] Corps brut configuré (%d octets).\n", s.builder.BodySize())
+		return
+	}
 	if err := s.builder.SetJSON(rest); err != nil {
 		s.errorf("%v", err)
 		return
@@ -1654,7 +1715,7 @@ func (s *Shell) cmdBodyCommand(rest string) {
 		s.cmdBodyTarget(idSpec, op, value)
 		return
 	}
-	trim := strings.TrimSpace(rest)
+	trim := stripQuotes(strings.TrimSpace(rest))
 	if trim == "" {
 		s.showBodyState()
 		return
@@ -2043,7 +2104,23 @@ func (s *Shell) showCapture(c mint.Capture, offset int) {
 	s.printf("%s\n", bottom)
 }
 
-func (s *Shell) cmdTable() {
+func (s *Shell) cmdCrlTable(rest string) {
+	rest = strings.TrimSpace(rest)
+	// Un ID explicite consulte le résumé d'une capture précise.
+	if rest != "" {
+		id, err := parseID(rest)
+		if err != nil {
+			s.errorf("%v", err)
+			return
+		}
+		c, ok := s.history.Get(id)
+		if !ok {
+			s.errorf("requête #%d introuvable", id)
+			return
+		}
+		s.printCaptureTable(c)
+		return
+	}
 	// Le constructeur actif est prioritaire ; la sélection ne sert de repli
 	// que lorsqu'aucune requête n'est en cours de préparation.
 	if s.history != nil && s.builder.IsEmpty() {
@@ -2116,6 +2193,242 @@ func (s *Shell) cmdTable() {
 		}
 		s.printf("  %s\n", p.Dim("crl.show affiche le détail complet des valeurs."))
 	}
+}
+
+// printCaptureTable affiche le résumé d'une capture Mint précise.
+func (s *Shell) printCaptureTable(c mint.Capture) {
+	p := s.pal
+	s.printf("%s\n", p.BoldGreen(fmt.Sprintf("[CRL] Tableau de la requête #%d", c.ID)))
+	s.rule(s.termWidth())
+	s.field("MÉTHODE", p.Method(c.Request.Method))
+	s.field("URL", p.Cyan(display.SummaryURL(c.Request.URL)))
+	s.field("EN-TÊTES", p.Bold(fmt.Sprintf("%d", len(c.Request.Headers))))
+	s.field("CORPS", p.Bold(fmt.Sprintf("%d octet(s)", len(c.Request.Body))))
+	if c.Response != nil {
+		s.field("STATUT", p.StatusCode(c.Response.StatusCode, c.StatusLabelText()))
+		s.field("RÉPONSE EN-TÊTES", p.Bold(fmt.Sprintf("%d", len(c.Response.Headers))))
+		s.field("RÉPONSE CORPS", p.Bold(fmt.Sprintf("%d octet(s)", len(c.Response.Body))))
+	} else {
+		s.field("STATUT", p.Dim("en attente"))
+	}
+	s.field("CAPTURÉE", c.StartedAt.Local().Format("2006-01-02 15:04:05.000"))
+	if len(c.Request.Headers) > 0 {
+		names := make([]string, 0, len(c.Request.Headers))
+		for _, h := range c.Request.Headers {
+			names = append(names, sanitizeTerminal(h.Name))
+		}
+		s.printf("\n  %s\n", p.BoldCyan(fmt.Sprintf("En-têtes (%d)", len(c.Request.Headers))))
+		namesStr := strings.Join(names, ", ")
+		for _, line := range display.WrapText(namesStr, s.termWidth()-4) {
+			s.printf("  %s\n", p.Dim(line))
+		}
+		s.printf("  %s\n", p.Dim("crl.show <id> affiche le détail complet des valeurs."))
+	}
+	s.rule(s.termWidth())
+	s.printf("%s\n", p.Dim(fmt.Sprintf("crl.show %d pour le détail · crl.launch %d / mint.replay %d pour exécuter", c.ID, c.ID, c.ID)))
+}
+
+func (s *Shell) cmdCrlHistory(rest string) {
+	words := strings.Fields(rest)
+	if len(words) == 0 {
+		s.printCrlHistoryList()
+		return
+	}
+	switch strings.ToLower(words[0]) {
+	case "replay":
+		if len(words) != 2 {
+			s.errorf("usage : crl.history replay <id>")
+			return
+		}
+		id, err := parseID(words[1])
+		if err != nil {
+			s.errorf("%v", err)
+			return
+		}
+		ex, ok := s.crlHist.Get(id)
+		if !ok {
+			s.errorf("exécution #%d introuvable", id)
+			return
+		}
+		s.replayHistoryExecution(ex)
+	case "export":
+		if len(words) != 2 {
+			s.errorf("usage : crl.history export <id>")
+			return
+		}
+		id, err := parseID(words[1])
+		if err != nil {
+			s.errorf("%v", err)
+			return
+		}
+		path, err := s.crlHist.Export(id)
+		if err != nil {
+			s.errorf("%v", err)
+			return
+		}
+		s.printf("[CRL] Exécution #%d exportée vers %s\n", id, path)
+	case "show", "view":
+		if len(words) != 2 {
+			s.errorf("usage : crl.history show <id>")
+			return
+		}
+		id, err := parseID(words[1])
+		if err != nil {
+			s.errorf("%v", err)
+			return
+		}
+		s.showHistoryExecution(id)
+	default:
+		id, err := parseID(words[0])
+		if err != nil {
+			s.errorf("usage : crl.history [id|show <id>|replay <id>|export <id>]")
+			return
+		}
+		s.showHistoryExecution(id)
+	}
+}
+
+func (s *Shell) printCrlHistoryList() {
+	p := s.pal
+	if s.crlHist == nil {
+		s.printf("[CRL] Historique des exécutions indisponible.\n")
+		return
+	}
+	list := s.crlHist.List()
+	if len(list) == 0 {
+		s.printf("[CRL] Aucune exécution CRL enregistrée.\n")
+		s.printf("  %s\n", p.Dim("Les exécutions de crl.launch sont consignées automatiquement avec un identifiant stable."))
+		return
+	}
+	s.printf("%s\n", p.BoldGreen(fmt.Sprintf("[CRL] Historique des exécutions (%d)", len(list))))
+	s.rule(s.termWidth())
+	header := fmt.Sprintf("%s  %s  %s  %s  %s  %s",
+		padCell("ID", 4),
+		padCell("DÉBUT", 16),
+		padCell("MÉTHODE", 7),
+		padCell("STATUT", 7),
+		padCell("DURÉE", 9),
+		"URL")
+	s.printf("%s\n", p.Bold(header))
+	s.rule(s.termWidth())
+	for _, ex := range list {
+		status := "-"
+		if ex.StatusCode > 0 {
+			status = strconv.Itoa(ex.StatusCode)
+		}
+		dur := durationLabel(ex.Duration)
+		var statusCell string
+		if ex.Err != "" {
+			statusCell = p.BoldRed("ERR")
+		} else if ex.StatusCode > 0 {
+			statusCell = p.StatusCode(ex.StatusCode, status)
+		} else {
+			statusCell = p.Dim(status)
+		}
+		started := ex.StartedAt.Local().Format("2006-01-02 15:04:05")
+		idCell := padCell(strconv.Itoa(ex.ID), 4)
+		s.printf("%s  %s  %s  %s  %s  %s\n",
+			p.BoldCyan(idCell),
+			p.Dim(started),
+			p.Method(ex.Request.Method),
+			statusCell,
+			p.Dim(dur),
+			sanitizeTerminal(ex.Request.URL))
+	}
+	s.rule(s.termWidth())
+	s.printf("%s\n", p.Dim("crl.history <id> pour le détail · crl.history replay <id> pour rejouer · crl.history export <id> pour archiver"))
+	s.printf("%s\n", p.Dim("Les identifiants CRL sont distincts des identifiants de captures Mint."))
+}
+
+func (s *Shell) showHistoryExecution(id int) {
+	ex, ok := s.crlHist.Get(id)
+	if !ok {
+		s.errorf("exécution #%d introuvable", id)
+		return
+	}
+	s.printHistoryExecution(ex)
+}
+
+func (s *Shell) printHistoryExecution(ex *crlhistory.Execution) {
+	p := s.pal
+	width := s.termWidth()
+	title := fmt.Sprintf(" EXÉCUTION CRL #%d ", ex.ID)
+	top := "╭─" + title + strings.Repeat("─", max(0, width-display.VisibleWidth("╭─"+title)))
+	bottom := "╰" + strings.Repeat("─", max(0, width-1))
+	s.printf("%s\n", p.BoldCyan(top))
+	s.replayField("ID", p.BoldCyan(strconv.Itoa(ex.ID)), width)
+	s.replayField("Début", p.Dim(ex.StartedAt.Local().Format("2006-01-02 15:04:05.000")), width)
+	s.replayField("Durée", p.Cyan(durationLabel(ex.Duration)), width)
+	if ex.Err != "" {
+		s.replayField("Erreur", p.Red(truncate(sanitizeTerminal(ex.Err), 1200)), width)
+	} else {
+		s.replayField("Statut", p.StatusCode(ex.StatusCode, strconv.Itoa(ex.StatusCode)), width)
+	}
+	s.replayField("Méthode", p.Method(ex.Request.Method), width)
+	s.replayField("URL", p.Cyan(sanitizeTerminal(ex.Request.URL)), width)
+	s.replayField("Proto", p.Dim(ex.Request.Proto), width)
+
+	s.printf("│\n│ %s\n", p.BoldBlue(fmt.Sprintf("REQUÊTE — en-têtes (%d)", len(ex.Request.Headers))))
+	for _, h := range ex.Request.Headers {
+		s.printf("%s\n", s.headerLine(h.Name, h.Value, "│   "))
+	}
+	body := ex.Request.Body
+	s.printf("│\n│ %s\n", p.BoldBlue(fmt.Sprintf("REQUÊTE — corps (%s)", display.FormatBytes(int64(len(body))))))
+	rendered, _ := display.RenderBody(display.MaskBody(body), 0)
+	for _, line := range strings.Split(rendered, "\n") {
+		for _, wline := range display.WrapText(sanitizeTerminal(line), max(10, width-4)) {
+			s.printf("│   %s\n", wline)
+		}
+	}
+
+	if ex.Response != nil {
+		s.printf("│\n│ %s\n", p.BoldBlue(fmt.Sprintf("RÉPONSE — statut %s", p.StatusCode(ex.StatusCode, strconv.Itoa(ex.StatusCode)))))
+		s.replayField("Méthode", p.Method(ex.Response.Method), width)
+		s.replayField("URL", p.Cyan(sanitizeTerminal(ex.Response.URL)), width)
+		s.replayField("Proto", p.Dim(ex.Response.Proto), width)
+		s.printf("│\n│ %s\n", p.BoldBlue(fmt.Sprintf("RÉPONSE — en-têtes (%d)", len(ex.Response.Headers))))
+		for _, h := range ex.Response.Headers {
+			s.printf("%s\n", s.headerLine(h.Name, h.Value, "│   "))
+		}
+		rbody := ex.Response.Body
+		s.printf("│\n│ %s\n", p.BoldBlue(fmt.Sprintf("RÉPONSE — corps (%s)", display.FormatBytes(int64(len(rbody))))))
+		rendered, _ = display.RenderBody(display.MaskBody(rbody), 0)
+		for _, line := range strings.Split(rendered, "\n") {
+			for _, wline := range display.WrapText(sanitizeTerminal(line), max(10, width-4)) {
+				s.printf("│   %s\n", wline)
+			}
+		}
+	} else {
+		s.printf("│\n│ %s\n", p.BoldYellow("Aucune réponse reçue (erreur de transport)."))
+	}
+	s.printf("%s\n", p.BoldCyan(bottom))
+	s.printf("%s\n", p.Dim(fmt.Sprintf("crl.history replay %d pour rejouer cette requête · IDs CRL distincts des captures Mint", ex.ID)))
+}
+
+func (s *Shell) replayHistoryExecution(ex *crlhistory.Execution) {
+	// Reconstruire un constructeur depuis l'exécution enregistrée et l'envoyer
+	// directement (sans passer par le proxy Mint, comme un rejeu Mint).
+	b := request.New()
+	captured := request.CapturedRequest{
+		URL:         ex.Request.URL,
+		Method:      ex.Request.Method,
+		Headers:     make([]request.Header, 0, len(ex.Request.Headers)),
+		Body:        ex.Request.Body,
+		BodyPresent: len(ex.Request.Body) > 0,
+	}
+	for _, h := range ex.Request.Headers {
+		captured.Headers = append(captured.Headers, request.Header{Name: h.Name, Value: h.Value})
+	}
+	if err := b.Import(captured); err != nil {
+		s.errorf("%v", err)
+		return
+	}
+	if err := b.SetProxy("none"); err != nil {
+		s.errorf("%v", err)
+		return
+	}
+	res := b.ResolveProxy("", false)
+	s.launchWithBuilder(b, res)
 }
 
 func (s *Shell) cmdOutput(rest string) {
@@ -2243,11 +2556,25 @@ func (s *Shell) launchWithBuilder(b *request.Builder, res request.ProxyResolutio
 		}
 	}
 
+	// Un corps configuré ne doit jamais être envoyé accidentellement avec une
+	// requête GET ou HEAD. Un corps configuré volontairement pour la méthode
+	// GET/HEAD courante est conservé ; seul un corps résiduel d'une méthode
+	// antérieure (ex. un corps POST après un passage à GET) est ignoré.
+	// Le constructeur actif est conservé tel quel ; seul l'exemplaire utilisé
+	// pour l'envoi en est privé.
+	launchBuilder := b
+	bodyIgnored := false
+	if (b.Method() == "GET" || b.Method() == "HEAD") && b.BodySet() && b.BodyMethod() != b.Method() {
+		launchBuilder = b.Clone()
+		launchBuilder.ClearBody()
+		bodyIgnored = true
+	}
+
 	p := s.pal
 	s.printf("%s\n", p.BoldGreen("[CRL] Requête envoyée"))
 	s.rule(s.termWidth())
-	s.field("Méthode", p.Method(b.Method()))
-	s.field("URL initiale", p.Cyan(sanitizeTerminal(b.URL())))
+	s.field("Méthode", p.Method(launchBuilder.Method()))
+	s.field("URL initiale", p.Cyan(sanitizeTerminal(launchBuilder.URL())))
 	s.field("Proxy", s.proxyValue(res))
 	s.field("Sortie", p.Cyan(s.outputMode.ShortLabel()))
 	redirectState := fmt.Sprintf("suivi automatique (max %d)", request.DefaultMaxRedirects)
@@ -2263,14 +2590,20 @@ func (s *Shell) launchWithBuilder(b *request.Builder, res request.ProxyResolutio
 		}
 	}
 	s.field("Redirections", p.Cyan(redirectState+credState))
-	s.field("Requête", fmt.Sprintf("%d en-tête(s), corps %s", len(b.Headers()), display.FormatBytes(int64(b.BodySize()))))
+	s.field("Requête", fmt.Sprintf("%d en-tête(s), corps %s", len(launchBuilder.Headers()), display.FormatBytes(int64(launchBuilder.BodySize()))))
+	if bodyIgnored {
+		s.printf("  %s\n", p.BoldYellow("Attention : un corps configuré a été ignoré pour cette requête "+
+			"GET/HEAD et n'a pas été envoyé. Le constructeur actif est inchangé ; "+
+			"utilisez crl.body.clear pour le retirer ou crl.body <texte> pour le réconfigurer."))
+	}
 
 	ctx := s.ctx
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	started := time.Now()
-	exchange := s.runHTTPWithRedirects(ctx, b, res, dir)
+	exchange := s.runHTTPWithRedirects(ctx, launchBuilder, res, dir)
+	s.recordLaunch(started, launchBuilder, exchange)
 	s.lastResponseDir = dir
 	_ = os.Chmod(headerPath, 0o600)
 	_ = os.Chmod(bodyPath, 0o600)
@@ -2335,6 +2668,95 @@ func (s *Shell) launchWithBuilder(b *request.Builder, res request.ProxyResolutio
 		s.errorf("%v", exchange.redirectErr)
 	}
 }
+
+// recordLaunch consigne l'exécution CRL dans l'historique persistant, quel que
+// soit son succès ou son échec. L'ID attribué est distinct des captures Mint.
+func (s *Shell) recordLaunch(started time.Time, b *request.Builder, exchange httpExchange) {
+	if s.crlHist == nil {
+		return
+	}
+	ex := crlhistory.Execution{
+		StartedAt: started,
+		Request:   crlhistory.FromBuilderRequest(b),
+	}
+	if final, ok := exchange.final(); ok {
+		ex.StatusCode = final.status.Code
+		ex.Duration = final.meta.Duration
+		switch {
+		case final.err != nil:
+			ex.Err = final.err.Error()
+		case final.failure != nil:
+			ex.Err = final.failure.Detail
+			if ex.Err == "" {
+				ex.Err = fmt.Sprintf("curl %d : %s", final.failure.Code, final.failure.Label)
+			}
+		}
+		headers := make([]crlhistory.Header, 0, len(final.headers))
+		for _, h := range final.headers {
+			headers = append(headers, crlhistory.Header{Name: h.Name, Value: h.Value})
+		}
+		ex.Response = &crlhistory.Message{
+			Method:  final.request.Method(),
+			URL:     final.request.URL(),
+			Proto:   final.status.Proto,
+			Headers: headers,
+		}
+		if final.bodyPath != "" {
+			if data, err := os.ReadFile(final.bodyPath); err == nil {
+				ex.Response.Body = data
+			}
+		}
+	} else if exchange.redirectErr != nil {
+		ex.Err = exchange.redirectErr.Error()
+	}
+	if _, err := s.crlHist.Add(ex); err != nil {
+		s.printf("[CRL] Historique : échec de l'enregistrement : %v\n", err)
+	}
+	if s.jsonMode {
+		result := scriptResult{
+			Command:    b.Method() + " " + b.URL(),
+			OK:         ex.Err == "" && (exchange.redirectErr == nil),
+			Error:      ex.Err,
+			Method:     ex.Request.Method,
+			URL:        ex.Request.URL,
+			StatusCode: ex.StatusCode,
+			DurationMs: ex.Duration.Milliseconds(),
+		}
+		if ex.Response != nil {
+			result.BodySize = int64(len(ex.Response.Body))
+		}
+		if ex.Err != "" {
+			result.NetworkError = true
+			s.lastExit = 2
+		} else if ex.StatusCode >= 400 {
+			result.HTTPError = true
+		}
+		if exchange.redirectErr != nil {
+			result.NetworkError = true
+			result.Error = exchange.redirectErr.Error()
+			s.lastExit = 2
+		}
+		s.scriptResults = append(s.scriptResults, result)
+	}
+}
+
+// ScriptResults retourne les résultats structurés des exécutions en mode JSON.
+func (s *Shell) ScriptResults() []scriptResult {
+	out := make([]scriptResult, len(s.scriptResults))
+	copy(out, s.scriptResults)
+	return out
+}
+
+// ScriptExitCode retourne le code de sortie à utiliser en mode script.
+func (s *Shell) ScriptExitCode() int {
+	return s.lastExit
+}
+
+// SetScriptMode active le mode script (pas d'invites ni de confirmation bloquante).
+func (s *Shell) SetScriptMode(v bool) { s.scriptMode = v }
+
+// SetJSONMode active la sortie JSON structurée sur la sortie standard.
+func (s *Shell) SetJSONMode(v bool) { s.jsonMode = v }
 
 // launchUsesMintProxy reconnaît le proxy Mint qu'il soit choisi
 // automatiquement ou fourni explicitement avec la même URL.
@@ -3679,6 +4101,14 @@ func (s *Shell) cmdMintUse(rest string) {
 		return
 	}
 	if !s.builder.IsEmpty() && !force {
+		if !s.interactive {
+			// En mode non interactif, aucune lecture supplémentaire n'est faite
+			// sur stdin : la commande suivante ne doit jamais être consommée
+			// comme une réponse de confirmation. L'utilisateur doit utiliser
+			// --force pour importer explicitement.
+			s.errorf("importation refusée : la configuration CRL-CLI est non vide ; utilisez mint.use %d --force pour remplacer explicitement", c.ID)
+			return
+		}
 		question := fmt.Sprintf("[Mint] La configuration CRL-CLI actuelle sera remplacée par la capture #%d. Continuer ?", c.ID)
 		if !s.confirm(question) {
 			s.printf("[Mint] Importation annulée. La configuration CRL-CLI est inchangée.\n")
@@ -4366,6 +4796,12 @@ func containsAny(text string, fragments ...string) bool {
 
 func (s *Shell) errorf(format string, args ...interface{}) {
 	s.lastFailed = true
+	if s.scriptMode || s.jsonMode {
+		s.lastExit = 1
+		msg := fmt.Sprintf(format, args...)
+		fmt.Fprintf(s.errOut, "%s %s\n", s.pal.BoldRed("[CRL] Erreur :"), s.pal.Red(msg))
+		return
+	}
 	if s.out.needsNewline() {
 		fmt.Fprint(s.out, "\n")
 	}
@@ -4476,6 +4912,23 @@ func splitCommand(line string) (cmd, rest string) {
 		return line, ""
 	}
 	return line[:i], strings.TrimSpace(line[i+1:])
+}
+
+// stripQuotes retire les guillemets syntaxiques entourant un argument entier.
+// Une valeur n'est déguillottée que si elle est entièrement enveloppée par une
+// paire de guillemets identiques (' ou ") ; les guillemets à l'intérieur ou les
+// valeurs non entourées sont préservés tels quels, afin de ne pas altérer les
+// URLs ni les corps contenant des caractères spéciaux.
+func stripQuotes(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) < 2 {
+		return s
+	}
+	first, last := s[0], s[len(s)-1]
+	if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+		return s[1 : len(s)-1]
+	}
+	return s
 }
 
 func parseID(raw string) (int, error) {

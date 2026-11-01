@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"crl-cli/internal/crlhistory"
 	"crl-cli/internal/mint"
 	"crl-cli/internal/request"
 )
@@ -471,20 +472,31 @@ func TestMintUseAsksBeforeReplacing(t *testing.T) {
 	addCapture(t, hist)
 	_ = builder.SetURL("http://previous.test/")
 
-	sh.Execute("mint.use 1")
-	if !strings.Contains(out.String(), "annulée") {
-		t.Fatalf("expected cancellation:\n%s", out.String())
-	}
-	if builder.URL() != "http://previous.test/" {
-		t.Fatalf("builder changed despite cancellation: %q", builder.URL())
-	}
-
+	// En mode non interactif, mint.use ne lit pas stdin pour confirmer : sans
+	// --force, l'importation est refusée sans consommer la commande suivante.
 	out.Reset()
 	sh.Execute("mint.use 1")
-	// Le scanner a déjà consommé "n" ; une deuxième exécution sans nouvelle
-	// entrée annule également, ce qui est le comportement sûr.
+	if !strings.Contains(out.String(), "utilisez mint.use 1 --force") {
+		t.Fatalf("importation non forcée devrait être refusée sans lire stdin:\n%s", out.String())
+	}
 	if builder.URL() != "http://previous.test/" {
-		t.Fatalf("builder changed without confirmation: %q", builder.URL())
+		t.Fatalf("builder modifié sans confirmation: %q", builder.URL())
+	}
+	// L'entrée "n" fournie au shell doit être intacte : aucune lecture parasite.
+	out.Reset()
+	sh.Execute("crl.host http://127.0.0.1:1")
+	if !strings.Contains(out.String(), "URL configurée") {
+		t.Fatalf("la commande suivante a été consommée par la confirmation:\n%s", out.String())
+	}
+
+	// Avec --force, l'importation explicite fonctionne en non interactif.
+	out.Reset()
+	sh.Execute("mint.use 1 --force")
+	if !strings.Contains(out.String(), "importée") {
+		t.Fatalf("importation forcée absente:\n%s", out.String())
+	}
+	if builder.URL() == "http://previous.test/" {
+		t.Fatalf("builder n'a pas été remplacé par l'importation forcée: %q", builder.URL())
 	}
 }
 
@@ -955,8 +967,15 @@ func TestLaunchTempResponseIsPrivateAndCleaned(t *testing.T) {
 		}
 	}
 	sh.Close()
-	if _, err := os.Stat(dir); !os.IsNotExist(err) {
-		t.Fatalf("répertoire temporaire non supprimé : %v", err)
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		t.Fatalf("répertoire temporaire supprimé à la fermeture : il devrait être conservé")
+	}
+	for _, name := range []string{"headers.txt", "body.bin"} {
+		if info, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Fatalf("%s absent après fermeture : %v", name, err)
+		} else if info.Mode().Perm() != 0o600 {
+			t.Fatalf("%s droits = %o", name, info.Mode().Perm())
+		}
 	}
 }
 
@@ -1883,5 +1902,127 @@ func TestTargetHeaderColonSyntaxReachesHTTPServer(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("la requête avec en-têtes n'a pas atteint le serveur")
+	}
+}
+
+func TestCrlShowIDShowsCaptureNotBuilder(t *testing.T) {
+	sh, out, _, hist, builder := newTestShell(t, "")
+	_ = builder.SetURL("http://actif.test/builder")
+	_ = builder.SetMethod("POST")
+	hist.AddRequest(mint.BridgeEvent{
+		Type: "request", FlowID: "flow-show", Timestamp: time.Now(),
+		Method: "GET", URL: "http://capture.test/capture-un",
+		Headers: []mint.Header{{Name: "X-Capture", Value: "oui"}},
+	})
+	// crl.show 1 doit afficher la capture #1, jamais le constructeur actif.
+	sh.Execute("crl.show 1")
+	text := out.String()
+	if !strings.Contains(text, "http://capture.test/capture-un") {
+		t.Fatalf("crl.show 1 n'affiche pas la capture #1:\n%s", text)
+	}
+	if strings.Contains(text, "http://actif.test/builder") {
+		t.Fatalf("crl.show 1 affiche le constructeur actif au lieu de la capture:\n%s", text)
+	}
+}
+
+func TestCrlLaunchChainingNonInteractive(t *testing.T) {
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skip("curl absent")
+	}
+	sh, out, _, _, _ := newTestShell(t, "")
+	srv := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("chaine-ok"))
+	}))
+	defer srv.Close()
+
+	// Chaînage « & » en mode non interactif (entrée ligne par ligne).
+	sh.Execute(fmt.Sprintf("crl.host %s & crl.method GET & crl.launch", srv.URL+"/chaine"))
+	text := out.String()
+	if !strings.Contains(text, "200 OK") || !strings.Contains(text, "chaine-ok") {
+		t.Fatalf("chaînage & non interactif échoué:\n%s", text)
+	}
+}
+
+func TestCrlHostQuotedURLPreservesQueryAmpersand(t *testing.T) {
+	sh, _, _, _, builder := newTestShell(t, "")
+	// URL citée contenant « ?a=1&b=2 » : les guillemets sont retirés, le « & »
+	// n'est pas un séparateur de commande.
+	sh.Execute(`crl.host "http://127.0.0.1:5003/echo?a=1&b=2"`)
+	if builder.URL() != "http://127.0.0.1:5003/echo?a=1&b=2" {
+		t.Fatalf("URL citée mal interprétée: %q", builder.URL())
+	}
+}
+
+func TestCrlBodyStaleIgnoredOnGET(t *testing.T) {
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skip("curl absent")
+	}
+	sh, out, _, _, builder := newTestShell(t, "")
+	srv := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		t.Logf("serveur a reçu %s body=%q", r.Method, string(body))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	sh.Execute("crl.method POST")
+	sh.Execute(fmt.Sprintf("crl.host %s", srv.URL+"/echo"))
+	sh.Execute(`crl.json {"a":1}`)
+	out.Reset()
+	sh.Execute("crl.method GET")
+	if !strings.Contains(out.String(), "Attention") {
+		t.Fatalf("passage à GET devrait signaler le corps résiduel:\n%s", out.String())
+	}
+	out.Reset()
+	sh.Execute("crl.launch")
+	text := out.String()
+	if !strings.Contains(text, "corps 0 octets") {
+		t.Fatalf("le corps résiduel ne devrait pas être envoyé avec GET:\n%s", text)
+	}
+	// Le constructeur est inchangé : le corps est toujours configuré.
+	if !builder.BodySet() {
+		t.Fatal("le constructeur devrait conserver son corps après le lancement GET")
+	}
+	// On peut volontairement reconfigurer un corps après le passage à GET.
+	out.Reset()
+	sh.Execute(`crl.body texte-volontaire`)
+	if !builder.BodySet() || string(builder.Body()) != "texte-volontaire" {
+		t.Fatalf("reconfiguration du corps après GET échouée: %q", string(builder.Body()))
+	}
+}
+
+func TestCrlScriptResultsJSONMode(t *testing.T) {
+	store, err := crlhistory.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	sh, _, _, _, _ := newTestShell(t, "")
+	sh.crlHist = store
+	sh.jsonMode = true
+	_ = sh.builder.SetURL("http://127.0.0.1:1")
+	sh.builder.SetMethod("GET")
+	sh.Execute("crl.launch")
+	if len(sh.scriptResults) != 1 {
+		t.Fatalf("attendu 1 résultat de script, obtenu %d", len(sh.scriptResults))
+	}
+	r := sh.scriptResults[0]
+	if r.OK || !r.NetworkError || r.URL != "http://127.0.0.1:1" {
+		t.Fatalf("résultat de script inattendu: %+v", r)
+	}
+}
+
+func TestCrlTableID(t *testing.T) {
+	sh, out, _, hist, _ := newTestShell(t, "")
+	hist.AddRequest(mint.BridgeEvent{
+		Type: "request", FlowID: "flow-tab", Timestamp: time.Now(),
+		Method: "POST", URL: "http://table.test/une",
+		Headers: []mint.Header{{Name: "X-Table", Value: "v"}},
+		Body:    []byte("corps-table"), BodySize: 11,
+	})
+	sh.Execute("crl.table 1")
+	text := out.String()
+	if !strings.Contains(text, "http://table.test/une") || !strings.Contains(text, "POST") {
+		t.Fatalf("crl.table 1 devrait résumer la capture #1:\n%s", text)
 	}
 }

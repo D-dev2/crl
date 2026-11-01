@@ -291,6 +291,7 @@ uniquement les captures ciblées et ne touchent jamais au constructeur.
 | `crl.param clear <cible>` | supprime tous les paramètres d'URL des captures ciblées |
 | `crl.json <JSON>` | définit directement un corps JSON valide et `Content-Type: application/json` |
 | `crl.json` | affiche l'état du corps JSON sans ouvrir d'éditeur |
+| `crl.json raw <texte>` | définit un corps brut sans validation JSON (JSON mal formé autorisé) |
 | `crl.json <id> edit` | édite le JSON de cette capture seulement ; `Ctrl+S` applique après validation, `Esc` annule |
 | `crl.json set <chemin> = <valeur JSON>` | modifie un champ précis du constructeur (objets imbriqués pris en charge) |
 | `crl.json delete <chemin>` | supprime une propriété précise du constructeur |
@@ -311,11 +312,16 @@ uniquement les captures ciblées et ne touchent jamais au constructeur.
 | `crl.show active body [offset]` | lit une page du corps actif |
 | `crl.show body [offset]` | lit une page du corps actif |
 | `crl.table` | affiche un tableau récapitulatif (URL masquée, noms d'en-têtes) |
+| `crl.table <id>` | résume la capture Mint d'identifiant `<id>` |
 | `crl.output [auto\|raw\|pretty]` | choisit le format d'affichage du corps des réponses ; sans argument, affiche le mode courant |
 | `crl.launch` | rejoue la sélection Mint si elle existe, sinon envoie le constructeur actif |
 | `crl.launch active` | envoie explicitement le constructeur actif |
 | `crl.launch <id>` | envoie uniquement cette capture, sans modifier la sélection |
 | `crl.launch <ids>\|selected` | rejoue les captures indiquées ou la sélection |
+| `crl.history` | liste les exécutions CRL (identifiants stables, distincts des captures Mint) |
+| `crl.history <id>` | détaille une exécution CRL (requête et réponse complètes, corps, en-têtes) |
+| `crl.history replay <id>` | rejoue une ancienne exécution CRL directement |
+| `crl.history export <id>` | archive une exécution dans un fichier JSON autonome |
 | `crl.launch all` | refusé : utilisez `mint.select all`, puis `crl.launch` |
 | `reset` | réinitialise le constructeur |
 | `clear` | efface l'écran en mode interactif |
@@ -355,8 +361,10 @@ Notes :
 - Un statut 403 ne signifie pas nécessairement qu'un en-tête d'authentification
   manque : le serveur peut refuser la requête pour une autre règle d'accès.
 - L'affichage du corps est limité à 32 Kio ; toute troncature est signalée et le
-  chemin du corps complet est affiché. Le fichier temporaire est supprimé au
-  prochain `crl.launch` ou à la fermeture du shell.
+  chemin du corps complet est affiché. Le fichier temporaire n'est plus supprimé
+  à la fermeture du shell : les données importantes sont conservées dans le
+  répertoire utilisateur `~/.crl-cli` (droits `0700`/`0600`, surchargeable avec
+  `CRCLI_DATA_DIR`) et consultables via `crl.history`.
 
 ## Commandes Mint
 
@@ -534,7 +542,59 @@ Une valeur invalide provoque un arrêt immédiat avec un message explicite.
 `mint.proxy.port <port>` modifie le port pour la session courante ; la variable
 `MINT_PORT` ne s'applique qu'au démarrage.
 
+## Mode script et exécution automatisée
+
+CRL-CLI peut être exécuté sans aucune invite interactive, ce qui le rend
+utilisable dans des scripts d'audit ou des pipelines CI :
+
+```bash
+crl -c 'crl.host http://127.0.0.1:5002/users & crl.method GET & crl.launch'
+crl --script audit.crl
+crl --json --script audit.crl
+```
+
+Options :
+
+| Option | Rôle |
+|---|---|
+| `-c <commande>` | exécute une seule commande CRL (chaînable avec ` & `), puis quitte |
+| `--script <fichier>` | exécute les commandes du fichier, une par ligne, puis quitte |
+| `--json` | produit un tableau JSON structuré sur la sortie standard (nécessite `-c` ou `--script`) |
+
+En mode script :
+- aucune invite ni confirmation bloquante n'est affichée ;
+- `mint.use` nécessite `--force` pour remplacer une configuration non vide ;
+- les diagnostics vont sur stderr, le JSON sur stdout ;
+- les codes de sortie sont `0` (succès), `1` (erreur de commande) et `2`
+  (erreur d'exécution, notamment réseau) ;
+- chaque requête `crl.launch` produit un résultat individuel avec statut,
+  durée, taille du corps et la distinction entre erreur réseau et statut HTTP
+  4xx/5xx.
+
+## Historique CRL et conservation des preuves
+
+Les exécutions de `crl.launch` sont consignées dans un historique CRL indépendant
+de Mint, avec des identifiants stables distincts des identifiants de captures
+Mint. Chaque exécution conserve la requête et la réponse complètes (méthode,
+URL, en-têtes, corps, statut, durée, erreurs), y compris l'authentification
+(Authorization, Cookie, Proxy-Authorization, X-API-Key) et les en-têtes
+personnalisés, sans masquage dans les vues détaillées.
+
+```text
+crl.history
+crl.history 3
+crl.history replay 3
+crl.history export 3
+```
+
+Les données sont persistées dans le répertoire utilisateur `~/.crl-cli`
+(surchargeable avec `CRCLI_DATA_DIR`, droits `0700` pour le répertoire et
+`0600` pour les fichiers). Elles ne sont pas supprimées à la fermeture du
+shell. `crl.history export <id>` produit un fichier JSON autonome lisible
+indépendamment du magasin.
+
 ## Affichage, couleurs et lisibilité
+
 
 Les couleurs sont activées automatiquement quand la sortie standard est un
 terminal. Elles restent désactivées pour les redirections, les pipes et les

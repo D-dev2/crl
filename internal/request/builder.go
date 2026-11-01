@@ -44,8 +44,13 @@ type Builder struct {
 	headers []Header
 	body    []byte
 	bodySet bool
-	proxy   string // "", "none", ou URL explicite
-	caFile  string
+	// bodyMethod est la méthode HTTP pour laquelle le corps a été configuré.
+	// Elle permet de distinguer un corps configuré volontairement pour la
+	// méthode courante d'un corps résiduel d'une méthode précédente (ex. un
+	// corps POST conservé après un passage à GET).
+	bodyMethod string
+	proxy      string // "", "none", ou URL explicite
+	caFile     string
 }
 
 // New crée un constructeur vide (GET, sans URL).
@@ -155,6 +160,7 @@ func (b *Builder) SetJSON(data string) error {
 	}
 	b.body = []byte(data)
 	b.bodySet = true
+	b.bodyMethod = b.method
 	return b.SetHeader("Content-Type", "application/json")
 }
 
@@ -162,6 +168,7 @@ func (b *Builder) SetJSON(data string) error {
 func (b *Builder) SetBody(body []byte) {
 	b.body = append([]byte(nil), body...)
 	b.bodySet = true
+	b.bodyMethod = b.method
 }
 
 // SetBodyText est la variante texte de SetBody.
@@ -173,6 +180,7 @@ func (b *Builder) SetBodyText(body string) {
 func (b *Builder) ClearBody() {
 	b.body = nil
 	b.bodySet = false
+	b.bodyMethod = ""
 }
 
 // Body retourne une copie du corps.
@@ -184,6 +192,9 @@ func (b *Builder) Body() []byte {
 
 // BodySet indique si un corps a été explicitement défini.
 func (b *Builder) BodySet() bool { return b.bodySet }
+
+// BodyMethod retourne la méthode pour laquelle le corps a été configuré.
+func (b *Builder) BodyMethod() string { return b.bodyMethod }
 
 // BodySize retourne la taille du corps.
 func (b *Builder) BodySize() int { return len(b.body) }
@@ -274,11 +285,12 @@ func (b *Builder) Clone() *Builder {
 		return nil
 	}
 	clone := &Builder{
-		method:  b.method,
-		rawURL:  b.rawURL,
-		bodySet: b.bodySet,
-		proxy:   b.proxy,
-		caFile:  b.caFile,
+		method:     b.method,
+		rawURL:     b.rawURL,
+		bodySet:    b.bodySet,
+		bodyMethod: b.bodyMethod,
+		proxy:      b.proxy,
+		caFile:     b.caFile,
 	}
 	clone.headers = append([]Header(nil), b.headers...)
 	clone.body = append([]byte(nil), b.body...)
@@ -314,6 +326,7 @@ func (b *Builder) Import(c CapturedRequest) error {
 		b.body = nil
 		b.bodySet = false
 	}
+	b.bodyMethod = c.Method
 	return nil
 }
 

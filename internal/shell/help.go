@@ -33,7 +33,7 @@ var commandHelp = []helpGroup{
 			{"crl.param [<nom>=<valeur>|clear]", "Afficher, ajouter ou effacer les paramètres d'URL du constructeur actif"},
 			{"crl.param set <id> add|set <nom>=<valeur>", "Ajouter ou remplacer un paramètre d'URL d'une capture ciblée"},
 			{"crl.param set <id> remove <nom>", "Supprimer un paramètre d'URL d'une capture ciblée"},
-			{"crl.json [<JSON>|clear]", "Définir ou effacer le JSON du constructeur actif"},
+			{"crl.json [<JSON>|clear|raw <texte>]", "Définir ou effacer le JSON du constructeur actif ; raw <texte> définit un corps brut sans validation JSON"},
 			{"crl.json set <id> add <JSON>", "Définir le corps JSON d'une capture ciblée"},
 			{"crl.json set <id> set <chemin> = <valeur>", "Modifier un champ JSON d'une capture ciblée"},
 			{"crl.json set <id> remove <chemin>", "Supprimer un champ JSON d'une capture ciblée"},
@@ -63,10 +63,20 @@ var commandHelp = []helpGroup{
 			{"mint.filter [<texte>|clear]", "Filtrer les captures"},
 			{"mint.watch [on|off]", "Activer ou suspendre les notifications automatiques"},
 			{"mint.events", "Afficher les notifications en attente"},
-			{"mint.use [<id>] [--force]", "Importer une capture dans le constructeur sans l'envoyer"},
+			{"mint.use [<id>] [--force]", "Importer une capture dans le constructeur sans l'envoyer (--force en mode non interactif)"},
 			{"mint.unselect <id>|all", "Retirer une capture de la sélection"},
 			{"mint.clear [--yes|-y]", "Effacer l'historique des captures"},
 			{"mint | mint.help", "Afficher l'aide détaillée de Mint"},
+		},
+	},
+	{
+		"EXÉCUTIONS CRL (historique indépendant de Mint)",
+		[]helpEntry{
+			{"crl.history", "Lister les exécutions CRL avec identifiants stables, distincts des captures Mint"},
+			{"crl.history <id>", "Afficher le détail d'une exécution (requête et réponse complètes)"},
+			{"crl.history replay <id>", "Rejouer une ancienne exécution CRL directement"},
+			{"crl.history export <id>", "Exporter une exécution dans un fichier JSON autonome"},
+			{"crl.table [id]", "Afficher un résumé du constructeur, d'une capture précise ou de la sélection"},
 		},
 	},
 	{
@@ -111,6 +121,15 @@ var commandHelp = []helpGroup{
 			{"clear", "Effacer l'écran interactif"},
 			{"help [commande]", "Afficher l'aide générale ou détaillée"},
 			{"exit | quit", "Quitter et arrêter proprement Mint"},
+		},
+	},
+	{
+		"MODE SCRIPT",
+		[]helpEntry{
+			{"crl -c '<commande>'", "Exécuter une commande CRL en mode script (sans invite)"},
+			{"crl --script <fichier>", "Exécuter les commandes d'un fichier, une par ligne"},
+			{"crl --json --script <fichier>", "Sortie JSON structurée, diagnostics sur stderr"},
+			{"Codes de sortie", "0 succès, 1 erreur de commande, 2 erreur d'exécution (réseau)"},
 		},
 	},
 }

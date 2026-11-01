@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 
+	"crl-cli/internal/crlhistory"
 	"crl-cli/internal/mint"
 	"crl-cli/internal/request"
 	"crl-cli/internal/shell"
@@ -20,6 +22,9 @@ const version = "0.3.1"
 
 func main() {
 	showVersion := flag.Bool("version", false, "afficher la version")
+	scriptCmd := flag.String("c", "", "exécuter une seule commande CRL (chaînable avec « & »)")
+	scriptFile := flag.String("script", "", "exécuter un fichier de commandes CRL, une commande par ligne")
+	jsonOut := flag.Bool("json", false, "sortie JSON structurée (mode script uniquement)")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "CRL-CLI %s — constructeur et rejeu de requêtes HTTP avec curl et Mint\n\n", version)
 		fmt.Fprintf(flag.CommandLine.Output(), "Usage : crl [options]\n\n")
@@ -52,6 +57,12 @@ func main() {
 		MaxBodyBytes:      cfg.MaxBodyBytes,
 		MaxTotalBodyBytes: cfg.MaxTotalBodyBytes,
 	})
+	crlHist, err := crlhistory.Open("")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Historique CRL : %v\n", err)
+		os.Exit(2)
+	}
+	defer crlHist.Close()
 	manager, err := mint.NewManager(cfg, history)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Initialisation de Mint : %v\n", err)
@@ -68,11 +79,15 @@ func main() {
 		}
 	})
 
+	scripting := *scriptCmd != "" || *scriptFile != ""
 	sh, err := shell.New(shell.Options{
 		In:            os.Stdin,
 		Out:           os.Stdout,
 		Builder:       request.New(),
 		Manager:       manager,
+		History:       crlHist,
+		ScriptMode:    scripting,
+		JSONMode:      *jsonOut,
 		Notifications: notifications,
 	})
 	if err != nil {
@@ -80,10 +95,45 @@ func main() {
 		os.Exit(2)
 	}
 
-	fmt.Printf("%s\n", termstyle.New(os.Stdout).BoldCyan("CRL-CLI "+version+" — constructeur de requêtes HTTP (curl)"))
-	fmt.Println("Tapez help pour les commandes CRL, mint.help pour Mint.")
-	if _, err := manager.ResolveMitmdump(); err != nil {
+	if !scripting {
+		fmt.Printf("%s\n", termstyle.New(os.Stdout).BoldCyan("CRL-CLI "+version+" — constructeur de requêtes HTTP (curl)"))
+		fmt.Println("Tapez help pour les commandes CRL, mint.help pour Mint.")
+	}
+	if _, err := manager.ResolveMitmdump(); err != nil && !scripting {
 		fmt.Println("Mint : mitmdump n'est pas détecté. Installez mitmproxy pour activer la capture.")
+	}
+
+	if scripting {
+		var lines []string
+		if *scriptCmd != "" {
+			lines = strings.Split(*scriptCmd, "\n")
+		} else {
+			data, err := os.ReadFile(*scriptFile)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Impossible de lire le script %q : %v\n", *scriptFile, err)
+				os.Exit(2)
+			}
+			lines = strings.Split(string(data), "\n")
+		}
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			sh.Execute(line)
+		}
+		if *jsonOut {
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			if err := enc.Encode(sh.ScriptResults()); err != nil {
+				fmt.Fprintf(os.Stderr, "Écriture JSON : %v\n", err)
+				os.Exit(2)
+			}
+		}
+		if code := sh.ScriptExitCode(); code != 0 {
+			os.Exit(code)
+		}
+		return
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
