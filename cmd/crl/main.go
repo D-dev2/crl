@@ -115,22 +115,16 @@ func main() {
 			}
 			lines = strings.Split(string(data), "\n")
 		}
-		for _, line := range lines {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-			sh.Execute(line)
-		}
+		results, code := sh.RunScript(lines, *jsonOut)
 		if *jsonOut {
 			enc := json.NewEncoder(os.Stdout)
 			enc.SetIndent("", "  ")
-			if err := enc.Encode(sh.ScriptResults()); err != nil {
+			if err := enc.Encode(results); err != nil {
 				fmt.Fprintf(os.Stderr, "Écriture JSON : %v\n", err)
 				os.Exit(2)
 			}
 		}
-		if code := sh.ScriptExitCode(); code != 0 {
+		if code != 0 {
 			os.Exit(code)
 		}
 		return

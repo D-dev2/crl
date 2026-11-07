@@ -100,6 +100,12 @@ type Shell struct {
 	scanner     *bufio.Scanner
 	ctx         context.Context
 
+	// termFd / termRestore permettent de quitter provisoirement le mode brut
+	// (éditeur externe nano) puis d'y revenir sans perdre le contrôle du
+	// terminal.
+	termFd      uintptr
+	termRestore func()
+
 	pal        palette
 	lastFailed bool
 	lastExit   int
@@ -339,6 +345,8 @@ func (s *Shell) runInteractive(ctx context.Context) error {
 		s.interactive = false
 		return s.runBatch(ctx)
 	}
+	s.termFd = f.Fd()
+	s.termRestore = restore
 	defer restore()
 
 	s.inputCh = readInput(s.in)
@@ -595,6 +603,40 @@ func (s *Shell) executeOne(line string) bool {
 		return false
 	}
 	cmd, rest := splitCommand(line)
+	// Handle "crl -c ..." or "crl --script ..." from inside interactive shell
+	if cmd == "crl" {
+		rtrim := strings.TrimSpace(rest)
+		if rtrim == "" {
+			s.printCrlHelp()
+			return false
+		}
+		// If it starts with flags, route to script handling
+		if strings.HasPrefix(rtrim, "-c") || strings.HasPrefix(rtrim, "--script") || strings.HasPrefix(rtrim, "script") {
+			return s.handleCrlScriptInline(rtrim)
+		}
+		s.printCrlHelp()
+		return false
+	}
+	if cmd == "crl.script" {
+		return s.handleCrlScriptInline(rest)
+	}
+	// File management aliases
+	if cmd == "ls" {
+		s.cmdLs(rest)
+		return false
+	}
+	if cmd == "mkdir" {
+		s.cmdMkdir(rest)
+		return false
+	}
+	if cmd == "touch" {
+		s.cmdTouch(rest)
+		return false
+	}
+	if cmd == "nano" {
+		s.cmdNano(rest)
+		return false
+	}
 	switch cmd {
 	case "help", "?":
 		s.printHelp(rest)
@@ -648,6 +690,32 @@ func (s *Shell) executeOne(line string) bool {
 		s.cmdRedirect(rest)
 	case "crl.redirect.credentials":
 		s.cmdRedirectCredentials(rest)
+	case "crl.script":
+		return s.handleCrlScriptInline(rest)
+	case "crl.ls":
+		s.cmdLs(rest)
+		return false
+	case "crl.mkdir":
+		s.cmdMkdir(rest)
+		return false
+	case "crl.touch":
+		s.cmdTouch(rest)
+		return false
+	case "crl.nano":
+		s.cmdNano(rest)
+		return false
+	case "ls":
+		s.cmdLs(rest)
+		return false
+	case "mkdir":
+		s.cmdMkdir(rest)
+		return false
+	case "touch":
+		s.cmdTouch(rest)
+		return false
+	case "nano":
+		s.cmdNano(rest)
+		return false
 	case "mint", "mint.help":
 		s.printMintHelp()
 	case "crl.help":
@@ -1542,7 +1610,17 @@ func updateJSONBuilder(b *request.Builder, operation, expression string) error {
 	if path == "" {
 		return fmt.Errorf("chemin JSON vide")
 	}
-	mutated, err := mutateJSONPath(root, strings.Split(path, "."), operation, value)
+	var parts []string
+	if strings.HasPrefix(path, "/") {
+		var err error
+		parts, err = jsonPointerTokens(path)
+		if err != nil {
+			return err
+		}
+	} else {
+		parts = strings.Split(path, ".")
+	}
+	mutated, err := mutateJSONPath(root, parts, operation, value)
 	if err != nil {
 		return err
 	}
@@ -1619,6 +1697,26 @@ func mutateJSONPath(current any, parts []string, operation string, value any) (a
 	default:
 		return current, fmt.Errorf("la racine JSON doit être un objet ou un tableau")
 	}
+}
+
+// jsonPointerTokens découpe un pointeur JSON (RFC 6902) en jetons de clé.
+// « / » sépare les niveaux ; « ~1 » encodage « / » et « ~0 » encodage « ~ ».
+// Un pointeur vide ou « / » désigne la racine (aucun jeton).
+func jsonPointerTokens(pointer string) ([]string, error) {
+	if pointer == "" || pointer == "/" {
+		return nil, nil
+	}
+	if !strings.HasPrefix(pointer, "/") {
+		return nil, fmt.Errorf("pointeur JSON invalide %q : doit commencer par '/'", pointer)
+	}
+	raw := strings.Split(pointer[1:], "/")
+	tokens := make([]string, 0, len(raw))
+	for _, tok := range raw {
+		tok = strings.ReplaceAll(tok, "~1", "/")
+		tok = strings.ReplaceAll(tok, "~0", "~")
+		tokens = append(tokens, tok)
+	}
+	return tokens, nil
 }
 
 func (s *Shell) cmdJSONDelete(rest string) {
@@ -4609,6 +4707,9 @@ func proxyResolutionText(res request.ProxyResolution) string {
 }
 
 func (s *Shell) confirm(question string) bool {
+	if s.scriptMode || s.jsonMode {
+		return false
+	}
 	answer := ""
 	if s.interactive && s.editor != nil && s.inputCh != nil {
 		s.editor.SetPrompt(s.pal.BoldYellow(question + " [y/N] "))
@@ -5024,4 +5125,242 @@ func parseTargetHeaderArgs(args []string) (name, value string, err error) {
 		return "", "", err
 	}
 	return name, value, nil
+}
+
+func (s *Shell) handleCrlScriptInline(rest string) bool {
+	jsonMode, lines, err := parseScriptSpec(rest)
+	if err != nil {
+		s.errorf("%v", err)
+		return false
+	}
+	results, code := s.RunScript(lines, jsonMode)
+	if jsonMode {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(results); err != nil {
+			fmt.Fprintf(os.Stderr, "Écriture JSON : %v\n", err)
+			return false
+		}
+	}
+	if code != 0 {
+		s.lastExit = code
+		s.lastFailed = true
+	}
+	return false
+}
+
+// parseScriptSpec analyse la spécification d'un script :
+//   - [--json] -c '<commande>'
+//   - [--json] --script <fichier>
+//
+// Les guillemets sont respectés afin de ne pas couper une commande ou un
+// chemin contenant des espaces.
+func parseScriptSpec(rest string) (jsonMode bool, lines []string, err error) {
+	rest = strings.TrimSpace(rest)
+	tokens := shellWords(rest)
+	var scriptCmd, scriptFile string
+	for i := 0; i < len(tokens); i++ {
+		switch tokens[i] {
+		case "--json":
+			jsonMode = true
+		case "-c":
+			i++
+			if i >= len(tokens) {
+				return false, nil, fmt.Errorf("-c attend une commande")
+			}
+			scriptCmd = tokens[i]
+		case "--script":
+			i++
+			if i >= len(tokens) {
+				return false, nil, fmt.Errorf("--script attend un chemin de fichier")
+			}
+			scriptFile = tokens[i]
+		default:
+			return false, nil, fmt.Errorf("argument inconnu %q : usage : crl.script [--json] -c '<commande>' | [--json] --script <fichier>", tokens[i])
+		}
+	}
+	if scriptCmd != "" && scriptFile != "" {
+		return false, nil, fmt.Errorf("-c et --script sont exclusifs")
+	}
+	if scriptCmd != "" {
+		lines = strings.Split(scriptCmd, "\n")
+		return jsonMode, lines, nil
+	}
+	if scriptFile != "" {
+		data, err := os.ReadFile(scriptFile)
+		if err != nil {
+			return false, nil, fmt.Errorf("impossible de lire le script %q : %w", scriptFile, err)
+		}
+		lines = strings.Split(string(data), "\n")
+		return jsonMode, lines, nil
+	}
+	return false, nil, fmt.Errorf("usage : crl.script [--json] -c '<commande>' | [--json] --script <fichier>")
+}
+
+// RunScript exécute une séquence de commandes CRL en mode script : non
+// interactif, séquentiel, sans confirmation bloquante. À la première erreur
+// (ou à une commande de sortie), la séquence s'arrête avant toute requête
+// suivante. Il ne quitte jamais le processus appelant. Les résultats de
+// crl.launch sont collectés dans s.scriptResults pour un rendu JSON ultérieur.
+func (s *Shell) RunScript(lines []string, jsonMode bool) ([]scriptResult, int) {
+	origScript := s.scriptMode
+	origJSON := s.jsonMode
+	origOut := s.out
+	s.scriptMode = true
+	s.jsonMode = jsonMode
+	if jsonMode {
+		// En mode JSON, la sortie standard ne doit contenir que le tableau
+		// final : les rendus de commandes sont écartés. Les diagnostics
+		// (errorf) écrivent déjà sur errOut (stderr).
+		s.out = &trackingWriter{w: io.Discard}
+	}
+	s.scriptResults = nil
+	s.lastExit = 0
+	defer func() {
+		s.scriptMode = origScript
+		s.jsonMode = origJSON
+		s.out = origOut
+	}()
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		chain := splitCommandChain(line)
+		if len(chain) == 0 {
+			continue
+		}
+		s.lastFailed = false
+		for _, part := range chain {
+			if s.executeOne(part) {
+				return s.scriptResults, s.lastExit
+			}
+			if s.lastFailed {
+				return s.scriptResults, s.lastExit
+			}
+		}
+	}
+	return s.scriptResults, s.lastExit
+}
+
+func (s *Shell) printScriptJSON() {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(s.ScriptResults()); err != nil {
+		fmt.Fprintf(os.Stderr, "Écriture JSON : %v\n", err)
+		os.Exit(2)
+	}
+}
+
+func (s *Shell) cmdLs(rest string) {
+	path := strings.TrimSpace(rest)
+	if path == "" {
+		path = "."
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		s.errorf("%v", err)
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() {
+			s.printf("%s/\n", name)
+		} else {
+			s.printf("%s\n", name)
+		}
+	}
+}
+
+func (s *Shell) cmdMkdir(rest string) {
+	path := strings.TrimSpace(rest)
+	if path == "" {
+		s.errorf("usage : crl.mkdir <chemin>")
+		return
+	}
+	if err := os.MkdirAll(path, 0755); err != nil {
+		s.errorf("%v", err)
+		return
+	}
+	s.printf("[CRL] Répertoire créé : %s\n", path)
+}
+
+func (s *Shell) cmdTouch(rest string) {
+	path := strings.TrimSpace(rest)
+	if path == "" {
+		s.errorf("usage : crl.touch <fichier>")
+		return
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		s.errorf("%v", err)
+		return
+	}
+	f.Close()
+	s.printf("[CRL] Fichier créé/actualisé : %s\n", path)
+}
+
+func (s *Shell) cmdNano(rest string) {
+	if !s.interactive {
+		s.errorf("crl.nano uniquement en mode terminal interactif")
+		return
+	}
+	path := strings.TrimSpace(rest)
+	if path == "" {
+		s.errorf("usage : crl.nano <fichier>")
+		return
+	}
+	// Nano prend le contrôle total du terminal : il est réservé au shell
+	// interactif en direct, jamais au mode script (non interactif).
+	if !s.interactive || s.scriptMode {
+		s.errorf("crl.nano uniquement en mode terminal interactif")
+		return
+	}
+	// Ensure file exists
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		f, err := os.Create(path)
+		if err != nil {
+			s.errorf("%v", err)
+			return
+		}
+		f.Close()
+	}
+	nanoPath, err := exec.LookPath("nano")
+	if err != nil {
+		s.errorf("nano non disponible")
+		return
+	}
+	if s.editor != nil {
+		s.editor.Reset()
+	}
+	// Quitte le mode brut du shell le temps de l'édition externe, puis
+	// restaure le mode brut et redessine le prompt. Sans cela nano laisse le
+	// terminal dans un état inutilisable pour le shell CRL-CLI.
+	if s.termRestore != nil {
+		s.termRestore()
+		s.termRestore = nil
+	}
+	cmd := exec.Command(nanoPath, path)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		if s.termFd != 0 {
+			if restore, errRaw := makeRaw(s.termFd); errRaw == nil {
+				s.termRestore = restore
+			}
+		}
+		s.errorf("%v", err)
+		return
+	}
+	if s.termFd != 0 {
+		if restore, errRaw := makeRaw(s.termFd); errRaw == nil {
+			s.termRestore = restore
+		}
+	}
+	if s.editor != nil {
+		s.editor.DrawPrompt()
+	}
+	s.printf("[CRL] Édition terminée : %s\n", path)
 }
