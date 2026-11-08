@@ -53,25 +53,27 @@ func (c HistoryConfig) normalized() HistoryConfig {
 type History struct {
 	mu sync.Mutex
 
-	cfg         HistoryConfig
-	byID        map[int]*Capture
-	byFlow      map[string]*Capture
-	order       []int
-	nextID      int
-	total       int64
-	filter      string
-	selected    int
-	selectedIDs []int
+	cfg          HistoryConfig
+	byID         map[int]*Capture
+	byFlow       map[string]*Capture
+	order        []int
+	nextID       int
+	total        int64
+	filter       string
+	excludedExts map[string]bool
+	selected     int
+	selectedIDs  []int
 }
 
 // NewHistory crée un historique vide.
 func NewHistory(cfg HistoryConfig) *History {
 	cfg = cfg.normalized()
 	return &History{
-		cfg:    cfg,
-		byID:   make(map[int]*Capture),
-		byFlow: make(map[string]*Capture),
-		nextID: 1,
+		cfg:          cfg,
+		byID:         make(map[int]*Capture),
+		byFlow:       make(map[string]*Capture),
+		nextID:       1,
+		excludedExts: make(map[string]bool),
 	}
 }
 
@@ -290,6 +292,9 @@ func (h *History) listLocked(applyFilter bool) []Capture {
 				continue
 			}
 		}
+		if h.isExcludedExt(c.Request.Path) {
+			continue
+		}
 		out = append(out, c.snapshot())
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
@@ -308,6 +313,116 @@ func (h *History) Filter() string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.filter
+}
+
+// extFromPath extrait l'extension d'un chemin URL (sans la query ni le fragment),
+// en minuscules, sans le point. Retourne une chaîne vide si aucune extension.
+func extFromPath(path string) string {
+	i := strings.LastIndexByte(path, '/')
+	base := path
+	if i >= 0 {
+		base = path[i+1:]
+	}
+	dot := strings.LastIndexByte(base, '.')
+	if dot <= 0 || dot == len(base)-1 {
+		return ""
+	}
+	return strings.ToLower(base[dot+1:])
+}
+
+// normalizeExts nettoie une liste d'extensions : retire le point devant,
+// met en minuscules, ignore les vides.
+func normalizeExts(exts []string) []string {
+	out := make([]string, 0, len(exts))
+	for _, e := range exts {
+		e = strings.TrimPrefix(e, ".")
+		e = strings.ToLower(strings.TrimSpace(e))
+		if e != "" {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// isExcludedExt indique si le chemin doit être exclu par extension.
+func (h *History) isExcludedExt(path string) bool {
+	if len(h.excludedExts) == 0 {
+		return false
+	}
+	ext := extFromPath(path)
+	if ext == "" {
+		return false
+	}
+	return h.excludedExts[ext]
+}
+
+// AddExcludedExts ajoute des extensions à la liste d'exclusion.
+func (h *History) AddExcludedExts(exts []string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, e := range normalizeExts(exts) {
+		h.excludedExts[e] = true
+	}
+}
+
+// RemoveExcludedExts retire des extensions de la liste d'exclusion.
+func (h *History) RemoveExcludedExts(exts []string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, e := range normalizeExts(exts) {
+		delete(h.excludedExts, e)
+	}
+}
+
+// ClearExcludedExts vide la liste d'exclusion d'extensions.
+func (h *History) ClearExcludedExts() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.excludedExts = make(map[string]bool)
+}
+
+// ExcludedExts retourne la liste triée des extensions exclues.
+func (h *History) ExcludedExts() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]string, 0, len(h.excludedExts))
+	for e := range h.excludedExts {
+		out = append(out, e)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ExcludedCount retourne le nombre d'extensions exclues.
+func (h *History) ExcludedCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.excludedExts)
+}
+
+// Count retourne le nombre total de captures (filtres exclus, rien n'est effacé).
+func (h *History) Count() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.order)
+}
+
+// UpdateRequest met à jour la requête d'une capture existante (URL, méthode,
+// en-têtes et corps). Le corps de réponse n'est pas touché.
+func (h *History) UpdateRequest(id int, url, method string, headers []Header, body []byte, bodyPresent bool) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	c, ok := h.byID[id]
+	if !ok {
+		return fmt.Errorf("capture %d introuvable", id)
+	}
+	c.Request.URL = url
+	c.Request.Method = method
+	c.Request.Headers = cloneHeaders(headers)
+	c.Request.Body = append([]byte(nil), body...)
+	c.Request.BodySize = int64(len(body))
+	h.byID[id] = c
+	return nil
 }
 
 // Select définit la capture active. La sélection est indépendante du filtre.

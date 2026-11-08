@@ -51,6 +51,7 @@ type Builder struct {
 	bodyMethod string
 	proxy      string // "", "none", ou URL explicite
 	caFile     string
+	form       *multipartForm // formulaire multipart/form-data, le cas échéant
 }
 
 // New crée un constructeur vide (GET, sans URL).
@@ -161,6 +162,7 @@ func (b *Builder) SetJSON(data string) error {
 	b.body = []byte(data)
 	b.bodySet = true
 	b.bodyMethod = b.method
+	b.form = nil
 	return b.SetHeader("Content-Type", "application/json")
 }
 
@@ -169,6 +171,7 @@ func (b *Builder) SetBody(body []byte) {
 	b.body = append([]byte(nil), body...)
 	b.bodySet = true
 	b.bodyMethod = b.method
+	b.form = nil
 }
 
 // SetBodyText est la variante texte de SetBody.
@@ -181,6 +184,63 @@ func (b *Builder) ClearBody() {
 	b.body = nil
 	b.bodySet = false
 	b.bodyMethod = ""
+	b.form = nil
+}
+
+// formOrNew retourne le formulaire existant ou en crée un nouveau.
+func (b *Builder) formOrNew() *multipartForm {
+	if b.form == nil {
+		b.form = &multipartForm{}
+	}
+	return b.form
+}
+
+// AddFormPart ajoute une partie au formulaire multipart (crée le formulaire si nécessaire).
+func (b *Builder) AddFormPart(p FormPart) {
+	b.formOrNew().addPart(p)
+	b.body = nil
+	b.bodySet = false
+}
+
+// RemoveFormPart retire toutes les parties portant le nom donné. Retourne le nombre retiré.
+func (b *Builder) RemoveFormPart(name string) int {
+	if b.form == nil {
+		return 0
+	}
+	return b.form.removePart(name)
+}
+
+// FormParts retourne une copie des parties du formulaire.
+func (b *Builder) FormParts() []FormPart {
+	if b.form == nil {
+		return nil
+	}
+	return b.form.list()
+}
+
+// ClearForm supprime le formulaire multipart.
+func (b *Builder) ClearForm() {
+	b.form = nil
+	b.body = nil
+	b.bodySet = false
+}
+
+// HasForm indique si un formulaire multipart est configuré.
+func (b *Builder) HasForm() bool {
+	return b.form != nil && len(b.form.parts) > 0
+}
+
+// PrepareMultipart construit le corps multipart si un formulaire est configuré,
+// met à jour le corps et le Content-Type du constructeur.
+func (b *Builder) PrepareMultipart() {
+	if b.form == nil || len(b.form.parts) == 0 {
+		return
+	}
+	body, contentType := b.BuildMultipart()
+	b.body = body
+	b.bodySet = true
+	b.bodyMethod = b.method
+	b.SetHeader("Content-Type", contentType)
 }
 
 // Body retourne une copie du corps.
@@ -278,7 +338,6 @@ func (b *Builder) Reset() {
 	*b = Builder{method: "GET"}
 }
 
-// Clone retourne une copie indépendante du constructeur. Les en-têtes, y
 // compris les doublons et les valeurs exactes, et le corps sont dupliqués.
 func (b *Builder) Clone() *Builder {
 	if b == nil {
@@ -291,6 +350,7 @@ func (b *Builder) Clone() *Builder {
 		bodyMethod: b.bodyMethod,
 		proxy:      b.proxy,
 		caFile:     b.caFile,
+		form:       b.form,
 	}
 	clone.headers = append([]Header(nil), b.headers...)
 	clone.body = append([]byte(nil), b.body...)
@@ -327,6 +387,12 @@ func (b *Builder) Import(c CapturedRequest) error {
 		b.bodySet = false
 	}
 	b.bodyMethod = c.Method
+	b.form = nil
+	// L'importation remplace complètement le constructeur : le proxy explicite
+	// et le certificat CA de la configuration précédente ne doivent pas
+	// subsister après une capture Mint.
+	b.proxy = ""
+	b.caFile = ""
 	return nil
 }
 

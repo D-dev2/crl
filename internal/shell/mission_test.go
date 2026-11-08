@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -527,5 +528,402 @@ func TestMissionShellJSONDashC(t *testing.T) {
 	results := sh.ScriptResults()
 	if len(results) != 1 || !results[0].OK || results[0].StatusCode != 200 {
 		t.Fatalf("résultat JSON inattendu : %+v", results)
+	}
+}
+
+// Test 11: crl -c depuis le terminal Linux (lancement binaire, pas le shell).
+func TestMissionCRLDashCFromTerminal(t *testing.T) {
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skip("curl absent")
+	}
+	if !vampiReachable() {
+		t.Skipf("VAmPI joindre sur %s", vampiAddr)
+	}
+	root := moduleRoot(t)
+	bin := filepath.Join(t.TempDir(), "crl")
+	cmd := exec.Command("go", "build", "-trimpath", "-o", bin, "./cmd/crl")
+	cmd.Dir = root
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build binaire échoué: %v\n%s", err, string(out))
+	}
+	out, err := exec.Command(bin, "-c", "crl.host http://127.0.0.1:5002/ & crl.method GET & crl.launch").CombinedOutput()
+	if err != nil {
+		t.Fatalf("crl -c depuis terminal échoué: %v\n%s", err, string(out))
+	}
+	if !strings.Contains(string(out), "200 OK") {
+		t.Fatalf("crl -c n'a pas reçu 200 OK:\n%s", string(out))
+	}
+}
+
+// Test 12: crl.script --script <fichier> depuis le shell CRL.
+func TestMissionScriptFile(t *testing.T) {
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skip("curl absent")
+	}
+	if !vampiReachable() {
+		t.Skipf("VAmPI joindre sur %s", vampiAddr)
+	}
+	sh, _, _, _, _ := newTestShell(t, "")
+	withCRLHist(t, sh)
+	sh.jsonMode = true
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "audit.crl")
+	if err := os.WriteFile(scriptPath, []byte("crl.host http://127.0.0.1:5002/\n& crl.method GET\n& crl.launch\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if exit := sh.Execute(fmt.Sprintf("crl.script --json --script %s", scriptPath)); exit {
+		t.Fatal("crl.script --json --script a quitté le shell")
+	}
+	results := sh.ScriptResults()
+	if len(results) != 1 || !results[0].OK || results[0].StatusCode != 200 {
+		t.Fatalf("résultat --script inattendu : %+v", results)
+	}
+}
+
+// Test 13: crl.nano uniquement en mode interactif (erreur en mode non interactif).
+func TestMissionNanoNonInteractive(t *testing.T) {
+	sh, _, _, _, _ := newTestShell(t, "")
+	// newTestShell utilise un strings.NewReader : non interactif.
+	sh.Execute("crl.nano test.txt")
+	if !sh.lastFailed {
+		t.Fatal("crl.nano en mode non interactif devrait échouer")
+	}
+}
+
+func hasHeader(c mint.Capture, name, value string) bool {
+	for _, h := range c.Request.Headers {
+		if strings.EqualFold(h.Name, name) && h.Value == value {
+			return true
+		}
+	}
+	return false
+}
+
+func addPlainCaptures(t *testing.T, hist *mint.History, n int) []int {
+	t.Helper()
+	ids := make([]int, n)
+	for i := 0; i < n; i++ {
+		c, _ := hist.AddRequest(mint.BridgeEvent{
+			Type:      "request",
+			FlowID:    fmt.Sprintf("plain-%d", i),
+			Timestamp: time.Now(),
+			Method:    "GET",
+			URL:       fmt.Sprintf("http://example.test/%d", i),
+		})
+		ids[i] = c.ID
+	}
+	return ids
+}
+
+// Test 1: modification sans ID touche uniquement le constructeur.
+func TestTargetNoIDOnlyBuilder(t *testing.T) {
+	sh, _, _, hist, builder := newTestShell(t, "")
+	addPlainCaptures(t, hist, 13)
+	if exit := sh.Execute("crl.head X-Content-Type-Options: nosniff"); exit {
+		t.Fatal("crl.head sans ID a quitté le shell")
+	}
+	found := false
+	for _, h := range builder.Headers() {
+		if h.Name == "X-Content-Type-Options" && h.Value == "nosniff" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("constructeur n'a pas le header X-Content-Type-Options")
+	}
+	for _, id := range []int{11, 12, 13} {
+		c, ok := hist.Get(id)
+		if !ok {
+			t.Fatalf("capture %d absente", id)
+		}
+		if hasHeader(c, "X-Content-Type-Options", "nosniff") {
+			t.Fatalf("capture %d modifiée sans ID", id)
+		}
+	}
+}
+
+// Test 2: modification ciblant 11 ne touche ni 12 ni 13.
+func TestTargetID11(t *testing.T) {
+	sh, _, _, hist, _ := newTestShell(t, "")
+	addPlainCaptures(t, hist, 13)
+	if exit := sh.Execute("crl.head set 11 add X-Content-Type-Options: nosniff"); exit {
+		t.Fatal("crl.head set 11 a quitté le shell")
+	}
+	c11, _ := hist.Get(11)
+	c12, _ := hist.Get(12)
+	c13, _ := hist.Get(13)
+	if !hasHeader(c11, "X-Content-Type-Options", "nosniff") {
+		t.Fatal("capture 11 n'a pas le header")
+	}
+	if hasHeader(c12, "X-Content-Type-Options", "nosniff") {
+		t.Fatal("capture 12 modifiée à tort")
+	}
+	if hasHeader(c13, "X-Content-Type-Options", "nosniff") {
+		t.Fatal("capture 13 modifiée à tort")
+	}
+}
+
+// Test 3: modification ciblant 12,11 touche uniquement ces deux captures.
+func TestTargetID12_11(t *testing.T) {
+	sh, _, _, hist, _ := newTestShell(t, "")
+	addPlainCaptures(t, hist, 13)
+	if exit := sh.Execute("crl.head set 12,11 add X-Test: valeur"); exit {
+		t.Fatal("crl.head set 12,11 a quitté le shell")
+	}
+	c11, _ := hist.Get(11)
+	c12, _ := hist.Get(12)
+	c13, _ := hist.Get(13)
+	if !hasHeader(c11, "X-Test", "valeur") || !hasHeader(c12, "X-Test", "valeur") {
+		t.Fatal("captures 11 et 12 n'ont pas le header X-Test")
+	}
+	if hasHeader(c13, "X-Test", "valeur") {
+		t.Fatal("capture 13 modifiée à tort")
+	}
+}
+
+// Test 4: crl.launch 12 11 envoie exactement deux requêtes.
+func TestLaunchTwoCaptures(t *testing.T) {
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skip("curl absent")
+	}
+	sh, _, _, hist, _ := newTestShell(t, "")
+	addPlainCaptures(t, hist, 10) // IDs 1-10
+	var count int32
+	srv := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&count, 1)
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+	hist.AddRequest(mint.BridgeEvent{Type: "request", FlowID: "srv-11", Method: "GET", URL: srv.URL + "/a"})
+	hist.AddRequest(mint.BridgeEvent{Type: "request", FlowID: "srv-12", Method: "GET", URL: srv.URL + "/b"})
+	if exit := sh.Execute("crl.launch 12 11"); exit {
+		t.Fatal("crl.launch 12 11 a quitté le shell")
+	}
+	time.Sleep(300 * time.Millisecond)
+	if got := atomic.LoadInt32(&count); got != 2 {
+		t.Fatalf("crl.launch 12 11 a envoyé %d requêtes au lieu de 2", got)
+	}
+}
+
+// Test 5: le chaînage && n'exécute aucune commande deux fois.
+func TestChainNoDoubleExec(t *testing.T) {
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skip("curl absent")
+	}
+	sh, _, _, _, builder := newTestShell(t, "")
+	var count int32
+	srv := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&count, 1)
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+	if exit := sh.Execute(fmt.Sprintf("crl.host %s/ && crl.method GET && crl.launch", srv.URL)); exit {
+		t.Fatal("chaîne && a quitté le shell")
+	}
+	time.Sleep(300 * time.Millisecond)
+	if got := atomic.LoadInt32(&count); got != 1 {
+		t.Fatalf("&& a envoyé %d requêtes au lieu de 1", got)
+	}
+	if builder.URL() != srv.URL+"/" {
+		t.Fatal("constructeur n'a pas l'URL attendue")
+	}
+}
+
+// Test 6: filtres excluent extensions sans supprimer l'historique.
+func TestFilterExcludesExtensions(t *testing.T) {
+	sh, _, _, hist, _ := newTestShell(t, "")
+	addPlainCaptures(t, hist, 5)
+	hist.AddRequest(mint.BridgeEvent{Type: "request", FlowID: "f1", Method: "GET", URL: "http://example.test/style.css"})
+	hist.AddRequest(mint.BridgeEvent{Type: "request", FlowID: "f2", Method: "GET", URL: "http://example.test/app.js"})
+	hist.AddRequest(mint.BridgeEvent{Type: "request", FlowID: "f3", Method: "GET", URL: "http://example.test/img.png"})
+	hist.AddRequest(mint.BridgeEvent{Type: "request", FlowID: "f4", Method: "GET", URL: "http://example.test/api/data"})
+	total := hist.Count()
+	if exit := sh.Execute("mint.filter exclude .css .js .png"); exit {
+		t.Fatal("mint.filter exclude a quitté le shell")
+	}
+	if hist.Count() != total {
+		t.Fatal("l'historique a été effacé par le filtre")
+	}
+	if len(hist.List()) != 6 {
+		t.Fatalf("%d captures listées au lieu de 6 (extensions non exclues)", len(hist.List()))
+	}
+}
+
+// Test 7: extensions peuvent être réactivées.
+func TestFilterIncludeReactivates(t *testing.T) {
+	sh, _, _, hist, _ := newTestShell(t, "")
+	addPlainCaptures(t, hist, 5)
+	hist.AddRequest(mint.BridgeEvent{Type: "request", FlowID: "f1", Method: "GET", URL: "http://example.test/app.js"})
+	hist.AddRequest(mint.BridgeEvent{Type: "request", FlowID: "f2", Method: "GET", URL: "http://example.test/api/data"})
+	if exit := sh.Execute("mint.filter exclude .js"); exit {
+		t.Fatal("mint.filter exclude .js a quitté le shell")
+	}
+	if len(hist.List()) != 6 {
+		t.Fatalf("%d captures après exclusion .js", len(hist.List()))
+	}
+	if exit := sh.Execute("mint.filter include .js"); exit {
+		t.Fatal("mint.filter include .js a quitté le shell")
+	}
+	if len(hist.List()) != 7 {
+		t.Fatalf("%d captures après réactivation .js", len(hist.List()))
+	}
+}
+
+// Test 8: formulaire multipart simple correctement envoyé.
+func TestMultipartSimpleSent(t *testing.T) {
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skip("curl absent")
+	}
+	sh, _, _, _, builder := newTestShell(t, "")
+	var received []byte
+	var receivedCT string
+	srv := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedCT = r.Header.Get("Content-Type")
+		received, _ = io.ReadAll(r.Body)
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+	if exit := sh.Execute(fmt.Sprintf("crl.host %s/upload", srv.URL)); exit {
+		t.Fatal("crl.host a quitté le shell")
+	}
+	if exit := sh.Execute("crl.method POST"); exit {
+		t.Fatal("crl.method a quitté le shell")
+	}
+	if exit := sh.Execute(`crl.form add username admin`); exit {
+		t.Fatal("crl.form add a quitté le shell")
+	}
+	if exit := sh.Execute("crl.launch"); exit {
+		t.Fatal("crl.launch a quitté le shell")
+	}
+	time.Sleep(300 * time.Millisecond)
+	if !bytes.Contains(received, []byte("username")) || !bytes.Contains(received, []byte("admin")) {
+		t.Fatalf("champ multipart absent: %q", string(received))
+	}
+	if !strings.Contains(receivedCT, "multipart/form-data") {
+		t.Fatalf("Content-Type multipart absent: %q", receivedCT)
+	}
+	if builder.Form() == nil || len(builder.FormParts()) != 1 {
+		t.Fatal("formulaire multipart absent du constructeur")
+	}
+}
+
+// Test 9: boundary valide et stable après modification.
+func TestMultipartBoundaryValid(t *testing.T) {
+	sh, _, _, _, builder := newTestShell(t, "")
+	if exit := sh.Execute(`crl.form add username admin`); exit {
+		t.Fatal("crl.form add a quitté le shell")
+	}
+	f := builder.Form()
+	if f == nil {
+		t.Fatal("formulaire absent")
+	}
+	boundary := f.BoundaryValue()
+	if boundary == "" || !strings.HasPrefix(boundary, "----") {
+		t.Fatalf("boundary invalide: %q", boundary)
+	}
+	if exit := sh.Execute(`crl.form add role tester`); exit {
+		t.Fatal("crl.form add role a quitté le shell")
+	}
+	if f.BoundaryValue() != boundary {
+		t.Fatal("boundary a changé après modification")
+	}
+	if !strings.Contains(builder.FormParts()[1].Name, "role") {
+		t.Fatal("deuxième champ absent")
+	}
+}
+
+// Test 10: fichier binaire uploadé reste intact.
+func TestMultipartFileIntact(t *testing.T) {
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skip("curl absent")
+	}
+	sh, _, _, _, _ := newTestShell(t, "")
+	binary := []byte{0x00, 0x01, 0x02, 0xff, 0xfe, 0xfd, 0x00}
+	tmp := filepath.Join(t.TempDir(), "bin.dat")
+	if err := os.WriteFile(tmp, binary, 0644); err != nil {
+		t.Fatal(err)
+	}
+	var received []byte
+	srv := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received, _ = io.ReadAll(r.Body)
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+	if exit := sh.Execute(fmt.Sprintf("crl.host %s/upload", srv.URL)); exit {
+		t.Fatal("crl.host a quitté le shell")
+	}
+	if exit := sh.Execute("crl.method POST"); exit {
+		t.Fatal("crl.method a quitté le shell")
+	}
+	if exit := sh.Execute(fmt.Sprintf(`crl.form add file @%s application/octet-stream`, tmp)); exit {
+		t.Fatal("crl.form add file a quitté le shell")
+	}
+	if exit := sh.Execute("crl.launch"); exit {
+		t.Fatal("crl.launch a quitté le shell")
+	}
+	time.Sleep(300 * time.Millisecond)
+	if !bytes.Contains(received, binary) {
+		t.Fatalf("fichier binaire corrompu: %q", string(received))
+	}
+}
+
+// Test 11: capture multipart importée puis rejouée conserve son contenu.
+func TestMultipartImportReplay(t *testing.T) {
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skip("curl absent")
+	}
+	sh, _, _, hist, builder := newTestShell(t, "")
+	var received []byte
+	srv := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received, _ = io.ReadAll(r.Body)
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+	multipartBody := []byte("----boundary123\r\nContent-Disposition: form-data; name=\"username\"\r\n\r\nimported\r\n----boundary123--\r\n")
+	hist.AddRequest(mint.BridgeEvent{
+		Type:     "request",
+		FlowID:   "mp",
+		Method:   "POST",
+		URL:      srv.URL + "/upload",
+		Headers:  []mint.Header{{Name: "Content-Type", Value: "multipart/form-data; boundary=----boundary123"}},
+		Body:     multipartBody,
+		BodySize: int64(len(multipartBody)),
+	})
+	if exit := sh.Execute("mint.use 1 --force"); exit {
+		t.Fatal("mint.use a quitté le shell")
+	}
+	if !bytes.Equal(builder.Body(), multipartBody) {
+		t.Fatalf("body multipart altéré à l'import: %q", string(builder.Body()))
+	}
+	if exit := sh.Execute("crl.launch active"); exit {
+		t.Fatal("crl.launch active a quitté le shell")
+	}
+	time.Sleep(300 * time.Millisecond)
+	if !bytes.Equal(received, multipartBody) {
+		t.Fatalf("rejeu multipart corrompu: %q", string(received))
+	}
+}
+
+// Test 12: headers et corps correctement associés.
+func TestHeadersBodyAssociated(t *testing.T) {
+	sh, _, _, _, builder := newTestShell(t, "")
+	if exit := sh.Execute(`crl.form add username admin`); exit {
+		t.Fatal("crl.form add a quitté le shell")
+	}
+	if exit := sh.Execute(`crl.head add X-Custom: header`); exit {
+		t.Fatal("crl.head add a quitté le shell")
+	}
+	builder.PrepareMultipart()
+	hasMultipartCT := false
+	for _, h := range builder.Headers() {
+		if strings.EqualFold(h.Name, "Content-Type") && strings.HasPrefix(h.Value, "multipart/form-data") {
+			hasMultipartCT = true
+		}
+	}
+	if !hasMultipartCT {
+		t.Fatal("Content-Type multipart manquant")
+	}
+	if builder.Form() == nil || len(builder.FormParts()) != 1 {
+		t.Fatal("formulaire multipart absent")
 	}
 }

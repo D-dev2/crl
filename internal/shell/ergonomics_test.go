@@ -238,16 +238,21 @@ func TestReplayUsesOnlySelectionOrExplicitTarget(t *testing.T) {
 		t.Fatal("un rejeu individuel a modifié la sélection")
 	}
 
+	// crl.launch sans argument envoie le constructeur actif, pas la sélection.
+	sh.Execute(fmt.Sprintf("crl.host %s/builder", srv.URL))
 	sh.Execute("crl.launch")
-	if count() != 4 {
-		t.Fatalf("crl.launch n'a pas rejoué les 3 captures sélectionnées : %d", count())
+	if count() != 2 {
+		t.Fatalf("crl.launch sans argument a envoyé %d requête(s) au lieu du constructeur", count())
+	}
+	if len(sh.history.SelectedMany()) != 3 {
+		t.Fatal("crl.launch sans argument a modifié la sélection")
 	}
 	out.Reset()
 	sh.Execute("crl.launch all")
 	if !strings.Contains(out.String(), "n'est pas une cible valide") || !strings.Contains(out.String(), "mint.select all") {
 		t.Fatalf("crl.launch all n'a pas été refusé clairement :\n%s", out.String())
 	}
-	if count() != 4 {
+	if count() != 2 {
 		t.Fatal("crl.launch all a envoyé des requêtes")
 	}
 	if len(sh.history.SelectedMany()) != 3 {
@@ -259,7 +264,7 @@ func TestReplayUsesOnlySelectionOrExplicitTarget(t *testing.T) {
 		t.Fatal("mint.select remove 2 n'a pas retiré uniquement la capture 2")
 	}
 	sh.Execute("mint.replay")
-	if count() != 6 {
+	if count() != 4 {
 		t.Fatalf("mint.replay n'a pas rejoué les deux captures restantes : %d", count())
 	}
 	sh.Execute("mint.select clear")
@@ -271,13 +276,13 @@ func TestReplayUsesOnlySelectionOrExplicitTarget(t *testing.T) {
 	if !strings.Contains(out.String(), "aucune capture sélectionnée") {
 		t.Fatalf("mint.replay sans sélection aurait dû échouer :\n%s", out.String())
 	}
-	if count() != 6 {
+	if count() != 4 {
 		t.Fatal("mint.replay sans sélection a envoyé une requête")
 	}
 
 	_ = builder.SetURL(srv.URL + "/active")
 	sh.Execute("crl.launch")
-	if count() != 7 || lastPath() != "/active" {
+	if count() != 5 || lastPath() != "/active" {
 		t.Fatalf("crl.launch sans sélection n'a pas envoyé le constructeur : %v", pathSnapshot())
 	}
 	sh.Execute("mint.select 1 2 3")
@@ -285,7 +290,7 @@ func TestReplayUsesOnlySelectionOrExplicitTarget(t *testing.T) {
 	if len(sh.history.SelectedMany()) != 3 {
 		t.Fatal("crl.launch 1 a modifié la sélection")
 	}
-	if count() != 8 || lastPath() != "/one" {
+	if count() != 6 || lastPath() != "/one" {
 		t.Fatalf("crl.launch 1 n'a pas envoyé uniquement la capture 1 : %v", pathSnapshot())
 	}
 }

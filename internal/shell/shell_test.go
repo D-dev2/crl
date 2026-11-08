@@ -1579,7 +1579,7 @@ func TestCrlLaunchIndividualCapture(t *testing.T) {
 	}
 }
 
-func TestCrlLaunchNoArgumentReplaysSelection(t *testing.T) {
+func TestCrlLaunchNoArgumentReplaysBuilder(t *testing.T) {
 	if _, err := exec.LookPath("curl"); err != nil {
 		t.Skip("curl absent")
 	}
@@ -1587,7 +1587,7 @@ func TestCrlLaunchNoArgumentReplaysSelection(t *testing.T) {
 
 	srv := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok-selection"))
+		_, _ = w.Write([]byte("ok-builder"))
 	}))
 	defer srv.Close()
 
@@ -1600,11 +1600,17 @@ func TestCrlLaunchNoArgumentReplaysSelection(t *testing.T) {
 	})
 
 	sh.Execute("mint.select 1")
+	// Le constructeur actif a sa propre URL, différente de la sélection Mint.
+	sh.Execute(fmt.Sprintf("crl.host %s/builder", srv.URL))
 	out.Reset()
 	sh.Execute("crl.launch")
 	text := out.String()
-	if !strings.Contains(text, "200") && !strings.Contains(text, "ok-selection") {
-		t.Fatalf("crl.launch sans argument devrait rejouer la sélection:\n%s", text)
+	if !strings.Contains(text, "200") && !strings.Contains(text, "ok-builder") {
+		t.Fatalf("crl.launch sans argument devrait envoyer le constructeur actif:\n%s", text)
+	}
+	// La sélection Mint ne doit pas être modifiée ni détournée.
+	if sel := hist.SelectedMany(); len(sel) != 1 || sel[0].ID != 1 {
+		t.Fatalf("crl.launch sans argument a modifié la sélection : %#v", sel)
 	}
 }
 
@@ -1796,10 +1802,14 @@ func TestLaunchAllRejectedAndSelectionReplayScoped(t *testing.T) {
 		t.Fatalf("crl.launch all a modifié la sélection : %#v", selected)
 	}
 
-	// Sans argument : uniquement la sélection 1,2.
+	// Sans argument : uniquement le constructeur actif, jamais la sélection.
 	reset()
+	sh.Execute(fmt.Sprintf("crl.host %s/builder", srv.URL))
 	sh.Execute("crl.launch")
-	assertCounts(map[string]int{"/one": 1, "/two": 1})
+	assertCounts(map[string]int{"/builder": 1})
+	if selected := hist.SelectedMany(); len(selected) != 2 || selected[0].ID != 1 || selected[1].ID != 2 {
+		t.Fatalf("crl.launch sans argument a modifié la sélection : %#v", selected)
+	}
 
 	// Une cible explicite ne rejoue que cette capture et ne change pas la sélection.
 	reset()
@@ -1818,9 +1828,15 @@ func TestLaunchAllRejectedAndSelectionReplayScoped(t *testing.T) {
 	sh.Execute("mint.select all")
 	reset()
 	out.Reset()
+	// crl.launch sans argument envoie toujours le constructeur actif, pas la sélection.
 	sh.Execute("crl.launch")
-	assertCounts(map[string]int{"/one": 1, "/two": 1, "/three": 1, "/unauth": 1, "/fail": 1})
+	assertCounts(map[string]int{"/builder": 1})
 	text := out.String()
+
+	// mint.replay all envoie toutes les captures, y compris 401/500.
+	reset()
+	sh.Execute("mint.replay all")
+	text = out.String()
 	if !strings.Contains(text, "401 Unauthorized") || !strings.Contains(text, "500 Internal Server Error") {
 		t.Fatalf("les réponses HTTP 401/500 ne sont pas des réponses :\n%s", text)
 	}

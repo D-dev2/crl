@@ -4,12 +4,12 @@ package shell
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/url"
 	"os"
 	"os/exec"
@@ -665,6 +665,8 @@ func (s *Shell) executeOne(line string) bool {
 		s.cmdJSONCommand(rest)
 	case "crl.body":
 		s.cmdBodyCommand(rest)
+	case "crl.form":
+		s.cmdForm(rest)
 	case "crl.cookie":
 		s.cmdCookie(rest)
 	case "crl.param":
@@ -1586,14 +1588,8 @@ func updateJSONBuilder(b *request.Builder, operation, expression string) error {
 	if !b.BodySet() || len(body) == 0 {
 		body = []byte("{}")
 	}
-	var root any
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.UseNumber()
-	if err := decoder.Decode(&root); err != nil {
-		return fmt.Errorf("JSON existant invalide: %w", err)
-	}
 	path := ""
-	var value any
+	var value *jsonValue
 	if operation == "set" {
 		eq := strings.Index(expression, "=")
 		if eq < 0 {
@@ -1601,31 +1597,21 @@ func updateJSONBuilder(b *request.Builder, operation, expression string) error {
 		}
 		path = strings.TrimSpace(expression[:eq])
 		raw := strings.TrimSpace(expression[eq+1:])
-		if err := json.Unmarshal([]byte(raw), &value); err != nil {
+		if !json.Valid([]byte(raw)) {
+			return fmt.Errorf("valeur JSON invalide")
+		}
+		v, err := parseJSONOrdered([]byte(raw))
+		if err != nil {
 			return fmt.Errorf("valeur JSON invalide: %w", err)
 		}
+		value = v
 	} else {
 		path = strings.TrimSpace(expression)
 	}
 	if path == "" {
 		return fmt.Errorf("chemin JSON vide")
 	}
-	var parts []string
-	if strings.HasPrefix(path, "/") {
-		var err error
-		parts, err = jsonPointerTokens(path)
-		if err != nil {
-			return err
-		}
-	} else {
-		parts = strings.Split(path, ".")
-	}
-	mutated, err := mutateJSONPath(root, parts, operation, value)
-	if err != nil {
-		return err
-	}
-	root = mutated
-	encoded, err := json.MarshalIndent(root, "", "  ")
+	encoded, err := updateOrderedJSON(body, operation, path, value)
 	if err != nil {
 		return err
 	}
@@ -1825,6 +1811,113 @@ func (s *Shell) cmdBodyCommand(rest string) {
 	}
 	s.builder.SetBodyText(trim)
 	s.printf("[CRL] Corps brut configuré (%d octets).\n", s.builder.BodySize())
+}
+
+func (s *Shell) cmdForm(rest string) {
+	args := strings.Fields(rest)
+	if len(args) == 0 {
+		s.printForm()
+		return
+	}
+	switch strings.ToLower(args[0]) {
+	case "add":
+		if len(args) < 3 {
+			s.errorf("usage : crl.form add <nom> <valeur|@fichier> [content-type]")
+			return
+		}
+		name := args[1]
+		raw := args[2]
+		contentType := ""
+		if len(args) >= 4 {
+			contentType = args[3]
+		}
+		if strings.HasPrefix(raw, "@") {
+			filePath := raw[1:]
+			if contentType == "" {
+				contentType = mimeTypeByExtension(filePath)
+			}
+			data, err := os.ReadFile(filePath)
+			if err != nil {
+				s.errorf("impossible de lire %q : %v", filePath, err)
+				return
+			}
+			s.builder.AddFormPart(request.FormPart{
+				Name:        name,
+				FileName:    filepath.Base(filePath),
+				ContentType: contentType,
+				FilePath:    filePath,
+				Data:        data,
+				IsFile:      true,
+			})
+			s.printf("[CRL] Champ fichier ajouté : %s = %s (%s)\n", name, filepath.Base(filePath), contentType)
+		} else {
+			s.builder.AddFormPart(request.FormPart{
+				Name:        name,
+				Value:       raw,
+				ContentType: contentType,
+			})
+			s.printf("[CRL] Champ ajouté : %s\n", name)
+		}
+	case "remove":
+		if len(args) < 2 {
+			s.errorf("usage : crl.form remove <nom>")
+			return
+		}
+		if s.builder.Form() == nil {
+			s.printf("[CRL] Aucun formulaire configuré.\n")
+			return
+		}
+		n := s.builder.RemoveFormPart(args[1])
+		if n == 0 {
+			s.printf("[CRL] Champ %q absent du formulaire.\n", args[1])
+		} else {
+			s.printf("[CRL] %d champ(s) retiré(s) : %s\n", n, args[1])
+		}
+	case "list":
+		s.printForm()
+	case "clear":
+		s.builder.ClearForm()
+		s.printf("[CRL] Formulaire vidé.\n")
+	default:
+		s.errorf("usage : crl.form <add|remove|list|clear> ...")
+	}
+}
+
+func (s *Shell) printForm() {
+	if s.builder.Form() == nil || len(s.builder.FormParts()) == 0 {
+		s.printf("[CRL] Aucun formulaire multipart configuré.\n")
+		return
+	}
+	f := s.builder.Form()
+	s.printf("[CRL] Formulaire multipart (%d partie(s), boundary=%q) :\n", len(s.builder.FormParts()), f.BoundaryValue())
+	for i, p := range s.builder.FormParts() {
+		size := len(p.Data)
+		if size == 0 && p.IsFile && p.FilePath != "" {
+			if d, err := os.ReadFile(p.FilePath); err == nil {
+				size = len(d)
+			}
+		}
+		if p.IsFile {
+			s.printf("  %d. %s = %s (fichier, %s, %d octets)\n", i+1, p.Name, p.FileName, p.ContentType, size)
+		} else {
+			ct := ""
+			if p.ContentType != "" {
+				ct = " (" + p.ContentType + ")"
+			}
+			s.printf("  %d. %s = %s%s\n", i+1, p.Name, p.Value, ct)
+		}
+	}
+}
+
+func mimeTypeByExtension(path string) string {
+	ext := strings.ToLower(filepath.Ext(path))
+	if ext == "" {
+		return "application/octet-stream"
+	}
+	if ct := mime.TypeByExtension(ext); ct != "" {
+		return ct
+	}
+	return "application/octet-stream"
 }
 
 func (s *Shell) cmdBodyTarget(id, op, value string) {
@@ -2056,7 +2149,9 @@ func (s *Shell) cmdShow(rest string) {
 			s.printf("%s\n", s.headerLine(h.Name, h.Value, "    "))
 		}
 	}
-	if s.builder.BodySet() {
+	if s.builder.Form() != nil && len(s.builder.FormParts()) > 0 {
+		s.printForm()
+	} else if s.builder.BodySet() {
 		s.printf("\n  %s\n", p.BoldCyan(fmt.Sprintf("Corps (%d octets)", s.builder.BodySize())))
 		rendered, truncated := display.RenderBody(display.MaskBody(s.builder.Body()), 4096)
 		s.printIndented(rendered, "    ")
@@ -2188,6 +2283,24 @@ func (s *Shell) showCapture(c mint.Capture, offset int) {
 			}
 			if offset > 0 {
 				s.printf("│   [page brute depuis l'octet %d]\n", offset)
+			}
+		}
+		if request.IsMultipartContentType(ctype) && len(body) > 0 {
+			parts, err := request.ParseMultipart(body, ctype)
+			if err == nil && len(parts) > 0 {
+				s.printf("│\n")
+				s.printf("│ FORMULAIRE MULTIPART (%d partie(s))\n", len(parts))
+				for i, p := range parts {
+					if p.IsFile {
+						s.printf("│   %d. %s = %s (fichier, %s, %d octets)\n", i+1, p.Name, p.FileName, p.ContentType, len(p.Data))
+					} else {
+						ct := ""
+						if p.ContentType != "" {
+							ct = " (" + p.ContentType + ")"
+						}
+						s.printf("│   %d. %s = %s%s\n", i+1, p.Name, p.Value, ct)
+					}
+				}
 			}
 		}
 	} else {
@@ -2615,10 +2728,8 @@ func (s *Shell) cmdLaunch(rest string) {
 		s.cmdMintReplay(rest)
 		return
 	}
-	if rest == "" && s.history != nil && len(s.history.SelectedMany()) > 0 {
-		s.cmdMintReplay("")
-		return
-	}
+	// Sans ID : le constructeur actif uniquement, même si une sélection Mint
+	// existe. Une sélection ne doit jamais détourner crl.launch sans cible.
 	if s.builder.URL() == "" {
 		s.errorf("aucune URL configurée : utilisez crl.host <url>")
 		return
@@ -2627,6 +2738,7 @@ func (s *Shell) cmdLaunch(rest string) {
 		s.errorf("curl introuvable dans PATH. Installez curl puis relancez CRL-CLI")
 		return
 	}
+	s.builder.PrepareMultipart()
 	res := s.proxyResolution()
 	if _, err := s.builder.CurlArgs(res); err != nil {
 		s.errorf("%v", err)
@@ -3616,15 +3728,28 @@ func (s *Shell) applyCaptureChanges(captures []mint.Capture, change func(*reques
 	ok, failed := 0, 0
 	for _, c := range captures {
 		b, err := s.requestBuilderFor(c)
-		if err == nil {
-			err = change(b)
-		}
 		if err != nil {
 			failed++
 			s.printf("[ERREUR] Requête #%d : %s\n", c.ID, sanitizeTerminal(err.Error()))
-		} else {
-			ok++
+			continue
 		}
+		if err = change(b); err != nil {
+			failed++
+			s.printf("[ERREUR] Requête #%d : %s\n", c.ID, sanitizeTerminal(err.Error()))
+			continue
+		}
+		mintHeaders := make([]mint.Header, len(b.Headers()))
+		for i, h := range b.Headers() {
+			mintHeaders[i] = mint.Header{Name: h.Name, Value: h.Value}
+		}
+		if s.history != nil {
+			if err := s.history.UpdateRequest(c.ID, b.URL(), b.Method(), mintHeaders, b.Body(), b.BodySet()); err != nil {
+				failed++
+				s.printf("[ERREUR] Requête #%d : %s\n", c.ID, sanitizeTerminal(err.Error()))
+				continue
+			}
+		}
+		ok++
 	}
 	s.printf("[CRL] Modifications : %d requête(s) réussie(s), %d échec(s).\n", ok, failed)
 }
@@ -4105,20 +4230,52 @@ func (s *Shell) cmdMintSelected() {
 }
 
 func (s *Shell) cmdMintFilter(rest string) {
-	switch {
-	case rest == "":
-		filter := s.history.Filter()
-		if filter == "" {
-			s.printf("[Mint] Aucun filtre actif (%d capture(s) au total).\n", len(s.history.List()))
-		} else {
-			s.printf("[Mint] Filtre actif : %q (%d capture(s) correspondante(s)).\n", filter, len(s.history.Filtered()))
+	args := strings.Fields(rest)
+	if len(args) == 0 {
+		s.printFilterStatus()
+		return
+	}
+	switch strings.ToLower(args[0]) {
+	case "exclude":
+		if len(args) < 2 {
+			s.errorf("usage : mint.filter exclude <ext> [ext...]")
+			return
 		}
-	case strings.EqualFold(rest, "clear"), strings.EqualFold(rest, "--clear"), strings.EqualFold(rest, "off"):
+		s.history.AddExcludedExts(args[1:])
+		s.printFilterStatus()
+	case "include":
+		if len(args) < 2 {
+			s.errorf("usage : mint.filter include <ext> [ext...]")
+			return
+		}
+		s.history.RemoveExcludedExts(args[1:])
+		s.printFilterStatus()
+	case "list":
+		s.printFilterStatus()
+	case "clear":
+		s.history.ClearExcludedExts()
 		s.history.SetFilter("")
-		s.printf("[Mint] Filtre supprimé. L'historique est conservé (%d capture(s)).\n", len(s.history.List()))
+		s.printFilterStatus()
 	default:
+		// Filtre texte par hôte/chemin (comportement historique).
 		s.history.SetFilter(rest)
-		s.printf("[Mint] Filtre : %q (%d capture(s) correspondante(s)).\n", s.history.Filter(), len(s.history.Filtered()))
+		s.printFilterStatus()
+	}
+}
+
+func (s *Shell) printFilterStatus() {
+	textFilter := s.history.Filter()
+	exts := s.history.ExcludedExts()
+	s.printf("[Mint] Filtres actifs :\n")
+	if textFilter != "" {
+		s.printf("  texte : %q (%d capture(s) correspondante(s))\n", textFilter, len(s.history.Filtered()))
+	} else {
+		s.printf("  texte : aucun (%d capture(s) au total)\n", len(s.history.List()))
+	}
+	if len(exts) > 0 {
+		s.printf("  extensions exclues : %s\n", strings.Join(exts, ", "))
+	} else {
+		s.printf("  extensions exclues : aucune\n")
 	}
 }
 
@@ -4830,20 +4987,31 @@ func (s *Shell) printGeneralHelp() {
 
 func (s *Shell) printMintHelp() {
 	renderHelp(s.out, s.pal, "mint", unicodeTerminal(), s.helpWidth())
-	s.printf("\n[Mint] mint.replay sans cible rejoue la sélection ; mint.replay all cible explicitement tout l'historique.\n")
-	s.printf("[Mint] mint.use importe une capture dans le constructeur actif sans modifier la sélection ni envoyer la requête.\n")
+	s.printf("\n[Mint] Captures : chaque requête interceptée reçoit un identifiant (1, 2, 3…).\n")
+	s.printf("[Mint] mint.requests liste les captures ; mint.select <id…> sélectionne.\n")
+	s.printf("[Mint] mint.use <id> importe une capture dans le constructeur actif (remplace celui-ci, réponse exclue).\n")
+	s.printf("[Mint] mint.replay [id…] rejoue uniquement les captures ciblées (pas la sélection par défaut).\n")
+	s.printf("[Mint] mint.filter <texte> filtre par hôte/chemin ; sans effacer l'historique.\n")
+	s.printf("[Mint] mint.filter exclude .css .js .png exclut des extensions (insensible à la casse).\n")
+	s.printf("[Mint] mint.filter include .js réactive une extension exclue.\n")
+	s.printf("[Mint] mint.filter list affiche les filtres actifs ; mint.filter clear les vide.\n")
 }
 
 func (s *Shell) printCrlHelp() {
 	renderHelp(s.out, s.pal, "crl", unicodeTerminal(), s.helpWidth())
 	s.printf("\n[CRL] Constructeur actif : commandes sans ID (crl.host <url>, crl.method GET, crl.head …).\n")
-	s.printf("[CRL] Captures Mint : commandes avec ID (crl.host add 1 <url>, crl.head remove 1 <Nom>) ; elles ne modifient jamais le constructeur.\n")
-	s.printf("[CRL] Une sélection Mint ne détourne pas les commandes du constructeur ; crl.show selected inspecte la sélection.\n")
-	s.printf("[CRL] crl.launch : sans argument, rejoue la sélection Mint si elle existe, sinon envoie le constructeur actif.\n")
-	s.printf("[CRL] crl.launch <id> : envoie uniquement la capture indiquée, sans modifier la sélection.\n")
-	s.printf("[CRL] crl.launch active : envoie le constructeur actif.\n")
-	s.printf("[CRL] crl.launch all est refusé : utilisez mint.select all, puis crl.launch pour rejouer toute la sélection.\n")
-	s.printf("[CRL] Enchaînement : crl.host <url> & crl.method GET & crl.launch (un échec interrompt la suite).\n")
+	s.printf("[CRL] Elles ne modifient jamais les captures Mint, même si une sélection existe.\n")
+	s.printf("[CRL] Captures Mint : commandes avec ID (crl.head set 11 add X-Test: v, crl.method set 12 GET).\n")
+	s.printf("[CRL] Plusieurs cibles : crl.head set 12,11 add X-Test: v (liste séparée par des virgules).\n")
+	s.printf("[CRL] crl.launch : sans argument, envoie le constructeur actif ; avec des ID, rejoue uniquement ces captures.\n")
+	s.printf("[CRL] crl.launch <id> rejoue uniquement la capture indiquée, sans modifier la sélection.\n")
+	s.printf("[CRL] crl.launch 12 11 rejoue exactement les captures 12 et 11, sans les modifier.\n")
+	s.printf("[CRL] crl.show <id> [body [offset]] inspecte une capture ; crl.show inspecte le constructeur actif.\n")
+	s.printf("[CRL] Enchaînement : crl.host <url> && crl.method GET && crl.launch (un échec interrompt la suite).\n")
+	s.printf("[CRL] Formulaires multipart : crl.form add nom valeur | crl.form add fichier @/chemin [type]\n")
+	s.printf("[CRL] crl.form list | crl.form remove nom | crl.form clear\n")
+	s.printf("[CRL] Fichiers : crl.mkdir <chemin> | crl.touch <fichier> | crl.ls [chemin] | crl.nano <fichier>\n")
+	s.printf("[CRL] crl.script [--json] -c '<cmd>' | [--json] --script <fichier> (mode script non interactif).\n")
 }
 
 func (s *Shell) printf(format string, args ...interface{}) {
