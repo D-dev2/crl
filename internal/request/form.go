@@ -96,8 +96,9 @@ func IsMultipartContentType(contentType string) bool {
 	return strings.EqualFold(ct, "multipart/form-data")
 }
 
-// extractBoundary extrait le boundary d'un Content-Type multipart.
-func extractBoundary(contentType string) string {
+// ExtractBoundary retourne le boundary d'un Content-Type multipart, vide si
+// absent. Utilisé pour l'affichage et l'inspection des captures.
+func ExtractBoundary(contentType string) string {
 	_, params, err := mime.ParseMediaType(contentType)
 	if err != nil {
 		return ""
@@ -155,10 +156,10 @@ func (b *Builder) BuildMultipart() ([]byte, string) {
 	return body.Bytes(), contentType
 }
 
-// escapeQuote échappe les guillemets et anti-slashes pour un attribut quoted-string.
-// boundary extrait du Content-Type. Utile pour l'affichage d'une capture.
+// ParseMultipart découpe un corps multipart/form-data en parties (champs et
+// fichiers) à partir du boundary contenu dans le Content-Type.
 func ParseMultipart(body []byte, contentType string) ([]FormPart, error) {
-	boundary := extractBoundary(contentType)
+	boundary := ExtractBoundary(contentType)
 	if boundary == "" {
 		return nil, fmt.Errorf("boundary introuvable dans %q", contentType)
 	}
@@ -245,7 +246,7 @@ func parsePartHeaders(block []byte) FormPart {
 	p := FormPart{}
 	tp := textproto.NewReader(bufio.NewReader(bytes.NewReader(block)))
 	headers, err := tp.ReadMIMEHeader()
-	if err != nil {
+	if err != nil && len(headers) == 0 {
 		return p
 	}
 	disp := headers.Get("Content-Disposition")

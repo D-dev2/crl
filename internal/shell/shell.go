@@ -706,6 +706,18 @@ func (s *Shell) executeOne(line string) bool {
 	case "crl.nano":
 		s.cmdNano(rest)
 		return false
+	case "crl.rm":
+		s.cmdRm(rest)
+		return false
+	case "crl.rmdir":
+		s.cmdRmdir(rest)
+		return false
+	case "crl.edit":
+		s.cmdEdit(rest)
+		return false
+	case "crl.nvim":
+		s.cmdNvim(rest)
+		return false
 	case "ls":
 		s.cmdLs(rest)
 		return false
@@ -717,6 +729,9 @@ func (s *Shell) executeOne(line string) bool {
 		return false
 	case "nano":
 		s.cmdNano(rest)
+		return false
+	case "rm":
+		s.cmdRm(rest)
 		return false
 	case "mint", "mint.help":
 		s.printMintHelp()
@@ -1795,11 +1810,18 @@ func (s *Shell) cmdJSON(rest string) {
 }
 
 func (s *Shell) cmdBodyCommand(rest string) {
+	trim := strings.TrimSpace(rest)
+	// Conversion de format du corps actif : crl.body format <fmt>
+	if strings.HasPrefix(strings.ToLower(trim), "format ") {
+		fmtName := strings.TrimSpace(trim[7:])
+		s.cmdBodyFormatActive(fmtName)
+		return
+	}
 	if idSpec, op, value, ok := parseTargetOpSpec(rest); ok {
 		s.cmdBodyTarget(idSpec, op, value)
 		return
 	}
-	trim := stripQuotes(strings.TrimSpace(rest))
+	trim = stripQuotes(trim)
 	if trim == "" {
 		s.showBodyState()
 		return
@@ -1946,10 +1968,70 @@ func (s *Shell) cmdBodyTarget(id, op, value string) {
 			return
 		}
 		s.openTextArea("body", b, captures[0].ID, b.Body())
+	case "format":
+		if value == "" {
+			s.errorf("usage : crl.body set <id> format <json|yaml|xml|multipart|form|text>")
+			return
+		}
+		s.cmdBodyFormatTarget(id, value)
 	}
 	for _, c := range captures {
 		s.requestBodyReplaced[c.ID] = true
 	}
+}
+
+func (s *Shell) cmdBodyFormatActive(fmtName string) {
+	f, err := request.ParseBodyFormat(fmtName)
+	if err != nil {
+		s.errorf("%v", err)
+		return
+	}
+	if err := s.builder.ConvertBody(f); err != nil {
+		s.errorf("%v", err)
+		return
+	}
+	s.printf("[CRL] Corps converti en %s (%d octets, Content-Type: %s)\n", f, s.builder.BodySize(), s.builder.ContentType())
+}
+
+func (s *Shell) cmdBodyFormatTarget(idSpec, fmtName string) {
+	f, err := request.ParseBodyFormat(fmtName)
+	if err != nil {
+		s.errorf("%v", err)
+		return
+	}
+	captures, err := s.resolveTargets(idSpec)
+	if err != nil {
+		s.errorf("%v", err)
+		return
+	}
+	ok, failed := 0, 0
+	for _, c := range captures {
+		b, err := s.requestBuilderFor(c)
+		if err != nil {
+			failed++
+			s.printf("[ERREUR] Requête #%d : %s\n", c.ID, sanitizeTerminal(err.Error()))
+			continue
+		}
+		if err := b.ConvertBody(f); err != nil {
+			failed++
+			s.printf("[ERREUR] Requête #%d : %s\n", c.ID, sanitizeTerminal(err.Error()))
+			continue
+		}
+		mintHeaders := make([]mint.Header, len(b.Headers()))
+		for i, h := range b.Headers() {
+			mintHeaders[i] = mint.Header{Name: h.Name, Value: h.Value}
+		}
+		if s.history != nil {
+			if err := s.history.UpdateRequest(c.ID, b.URL(), b.Method(), mintHeaders, b.Body(), b.BodySet()); err != nil {
+				failed++
+				s.printf("[ERREUR] Requête #%d : %s\n", c.ID, sanitizeTerminal(err.Error()))
+				continue
+			}
+		}
+		s.requestBodyReplaced[c.ID] = true
+		ok++
+	}
+	s.printf("[CRL] Conversion : %d requête(s) convertie(s) en %s, %d échec(s).\n", ok, f, failed)
 }
 
 func (s *Shell) cmdBody(rest string) {
@@ -1975,10 +2057,10 @@ func (s *Shell) showJSONState() {
 func (s *Shell) showBodyState() {
 	body := s.builder.Body()
 	if !s.builder.BodySet() || len(body) == 0 {
-		s.printf("[CRL] Aucun corps configuré. usage : crl.body <texte>\n")
+		s.printf("[CRL] Aucun corps configuré. usage : crl.body <texte> | crl.body format <fmt>\n")
 		return
 	}
-	s.printf("[CRL] Corps actuel (%d octets) :\n", len(body))
+	s.printf("[CRL] Corps actuel (%d octets, Content-Type: %s) :\n", len(body), s.builder.ContentType())
 	s.printIndented(string(body), "  ")
 }
 
@@ -2158,6 +2240,17 @@ func (s *Shell) cmdShow(rest string) {
 		if truncated {
 			s.printf("    […] Corps limité à 4 Kio.\n")
 		}
+		if ctype := s.builder.ContentType(); request.IsMultipartContentType(ctype) && s.builder.Form() == nil {
+			if boundary := request.ExtractBoundary(ctype); boundary != "" {
+				s.printf("    %s\n", p.BoldCyan(fmt.Sprintf("Boundary %q", boundary)))
+			}
+			if parts, err := request.ParseMultipart(s.builder.Body(), ctype); err == nil && len(parts) > 0 {
+				s.printf("\n    %s\n", p.BoldCyan(fmt.Sprintf("Formulaire multipart (%d partie(s))", len(parts))))
+				for _, line := range multipartPartLines(parts, "      ") {
+					s.printf("%s\n", line)
+				}
+			}
+		}
 	} else {
 		s.printf("\n  %s\n", p.BoldCyan("Corps (vide / non défini)"))
 	}
@@ -2203,6 +2296,33 @@ func (s *Shell) showActiveBody(offset int) {
 	if end < len(body) {
 		s.printf("Suite : crl.show body %d\n", end)
 	}
+}
+
+// multipartPartLines formate les parties d'un formulaire multipart avec le
+// préfixe d'indentation donné, pour un affichage cohérent entre crl.show et
+// mint.request.show.
+func multipartPartLines(parts []request.FormPart, prefix string) []string {
+	lines := make([]string, 0, len(parts))
+	for i, p := range parts {
+		if p.IsFile {
+			ct := p.ContentType
+			if ct == "" {
+				ct = "application/octet-stream"
+			}
+			lines = append(lines, fmt.Sprintf("%s%d. %s = %s (fichier, %s, %d octets)", prefix, i+1, p.Name, p.FileName, ct, len(p.Data)))
+		} else {
+			ct := ""
+			if p.ContentType != "" {
+				ct = " (" + p.ContentType + ")"
+			}
+			val := p.Value
+			if val == "" {
+				val = string(p.Data)
+			}
+			lines = append(lines, fmt.Sprintf("%s%d. %s = %s%s", prefix, i+1, p.Name, val, ct))
+		}
+	}
+	return lines
 }
 
 func (s *Shell) showCapture(c mint.Capture, offset int) {
@@ -2251,6 +2371,11 @@ func (s *Shell) showCapture(c mint.Capture, offset int) {
 	}
 	if ctype != "" {
 		s.printf("%s\n", s.headerLine("Type de contenu", sanitizeTerminal(ctype), "│ "))
+		if request.IsMultipartContentType(ctype) {
+			if boundary := request.ExtractBoundary(ctype); boundary != "" {
+				s.printf("%s\n", s.headerLine("Boundary", sanitizeTerminal(boundary), "│ "))
+			}
+		}
 	}
 
 	body := b.Body()
@@ -2285,30 +2410,22 @@ func (s *Shell) showCapture(c mint.Capture, offset int) {
 				s.printf("│   [page brute depuis l'octet %d]\n", offset)
 			}
 		}
-		if request.IsMultipartContentType(ctype) && len(body) > 0 {
-			parts, err := request.ParseMultipart(body, ctype)
-			if err == nil && len(parts) > 0 {
-				s.printf("│\n")
-				s.printf("│ FORMULAIRE MULTIPART (%d partie(s))\n", len(parts))
-				for i, p := range parts {
-					if p.IsFile {
-						s.printf("│   %d. %s = %s (fichier, %s, %d octets)\n", i+1, p.Name, p.FileName, p.ContentType, len(p.Data))
-					} else {
-						ct := ""
-						if p.ContentType != "" {
-							ct = " (" + p.ContentType + ")"
-						}
-						s.printf("│   %d. %s = %s%s\n", i+1, p.Name, p.Value, ct)
-					}
-				}
-			}
-		}
 	} else {
 		rendered, _ := display.RenderBody(displayBody, 0)
 		bodyWidth := max(10, width-4)
 		for _, line := range strings.Split(rendered, "\n") {
 			for _, wline := range display.WrapText(sanitizeTerminal(line), bodyWidth) {
 				s.printf("│   %s\n", wline)
+			}
+		}
+	}
+	if request.IsMultipartContentType(ctype) && len(body) > 0 {
+		parts, err := request.ParseMultipart(body, ctype)
+		if err == nil && len(parts) > 0 {
+			s.printf("│\n")
+			s.printf("│ FORMULAIRE MULTIPART (%d partie(s))\n", len(parts))
+			for _, line := range multipartPartLines(parts, "│   ") {
+				s.printf("%s\n", line)
 			}
 		}
 	}
@@ -3466,6 +3583,24 @@ func (s *Shell) cmdMintShow(rest string) {
 		s.printf("    %s\n", p.BoldCyan(fmt.Sprintf("Corps (%d octets%s)", len(c.Request.Body), truncatedSuffix(c.Request.BodyTruncated, c.Request.BodySize))))
 		rendered, _ := display.RenderBody(display.MaskBody(c.Request.Body), 8192)
 		s.printIndented(rendered, "      ")
+		if len(c.Request.Body) > 0 {
+			var ctype string
+			for _, h := range c.Request.Headers {
+				if strings.EqualFold(h.Name, "Content-Type") {
+					ctype = h.Value
+				}
+			}
+			if request.IsMultipartContentType(ctype) {
+				parts, err := request.ParseMultipart(c.Request.Body, ctype)
+				if err == nil && len(parts) > 0 {
+					s.printf("      \n")
+					s.printf("      FORMULAIRE MULTIPART (%d partie(s), boundary=%s)\n", len(parts), request.ExtractBoundary(ctype))
+					for _, line := range multipartPartLines(parts, "      ") {
+						s.printf("%s\n", line)
+					}
+				}
+			}
+		}
 	}
 
 	if c.Response != nil {
@@ -3717,7 +3852,7 @@ func parseTargetOpSpec(rest string) (idSpec string, op string, value string, ok 
 	}
 	opTok := raw[:tokEnd]
 	op = strings.ToLower(opTok)
-	if op != "add" && op != "remove" && op != "set" && op != "edit" {
+	if op != "add" && op != "remove" && op != "set" && op != "edit" && op != "format" {
 		return "", "", "", false
 	}
 	value = strings.TrimSpace(raw[tokEnd:])
@@ -4977,8 +5112,8 @@ func (s *Shell) printGeneralHelp() {
 	fmt.Fprintf(s.out, "  %s\n", p.Dim("   mint.select 1 2 3      — sélectionner les captures 1, 2 et 3"))
 	fmt.Fprintf(s.out, "  %s\n", p.Dim("   mint.select all        — sélectionner toutes les captures"))
 	fmt.Fprintf(s.out, "  %s\n", p.Dim("   crl.launch 2           — rejouer uniquement la capture 2"))
-	fmt.Fprintf(s.out, "  %s\n", p.Dim("   crl.launch             — rejouer la sélection, sinon envoyer le constructeur actif"))
-	fmt.Fprintf(s.out, "  %s\n", p.Dim("   crl.launch all         — refusé : utilisez mint.select all puis crl.launch"))
+	fmt.Fprintf(s.out, "  %s\n", p.Dim("   crl.launch             — envoyer le constructeur actif configuré"))
+	fmt.Fprintf(s.out, "  %s\n", p.Dim("   crl.launch all         — refusé : utiliser mint.select all puis mint.replay"))
 	fmt.Fprintf(s.out, "  %s\n", p.Dim("   crl.host <url> & crl.method GET & crl.launch — enchaîner des commandes avec « & »"))
 	fmt.Fprintf(s.out, "\n%s\n", p.Dim("Utilisez crl.help ou mint.help pour la liste complète des commandes de chaque catégorie."))
 	fmt.Fprintf(s.out, "\n")
@@ -4990,7 +5125,7 @@ func (s *Shell) printMintHelp() {
 	s.printf("\n[Mint] Captures : chaque requête interceptée reçoit un identifiant (1, 2, 3…).\n")
 	s.printf("[Mint] mint.requests liste les captures ; mint.select <id…> sélectionne.\n")
 	s.printf("[Mint] mint.use <id> importe une capture dans le constructeur actif (remplace celui-ci, réponse exclue).\n")
-	s.printf("[Mint] mint.replay [id…] rejoue uniquement les captures ciblées (pas la sélection par défaut).\n")
+	s.printf("[Mint] mint.replay [id…] rejoue les captures ciblées ; sans argument, rejoue la sélection.\n")
 	s.printf("[Mint] mint.filter <texte> filtre par hôte/chemin ; sans effacer l'historique.\n")
 	s.printf("[Mint] mint.filter exclude .css .js .png exclut des extensions (insensible à la casse).\n")
 	s.printf("[Mint] mint.filter include .js réactive une extension exclue.\n")
@@ -5431,13 +5566,23 @@ func (s *Shell) cmdLs(rest string) {
 		s.errorf("%v", err)
 		return
 	}
-	for _, e := range entries {
-		name := e.Name()
-		if e.IsDir() {
-			s.printf("%s/\n", name)
-		} else {
-			s.printf("%s\n", name)
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].IsDir() == entries[j].IsDir() {
+			return strings.ToLower(entries[i].Name()) < strings.ToLower(entries[j].Name())
 		}
+		return entries[i].IsDir()
+	})
+	for _, e := range entries {
+		info, err := e.Info()
+		size := "-"
+		if err == nil {
+			size = display.FormatBytes(info.Size())
+		}
+		typ := "file"
+		if e.IsDir() {
+			typ = "dir"
+		}
+		s.printf("%-30s %-6s %s\n", e.Name(), typ, size)
 	}
 }
 
@@ -5531,4 +5676,186 @@ func (s *Shell) cmdNano(rest string) {
 		s.editor.DrawPrompt()
 	}
 	s.printf("[CRL] Édition terminée : %s\n", path)
+}
+
+// openExternalEditor lance l'éditeur externe sur le fichier, en séparant bien
+// le binaire et ses arguments (aucune construction de ligne de commande).
+// Le terminal brut est suspendu pendant l'édition puis restauré.
+func (s *Shell) openExternalEditor(path, editorName string) {
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		f, err := os.Create(path)
+		if err != nil {
+			s.errorf("%v", err)
+			return
+		}
+		f.Close()
+	}
+	if s.editor != nil {
+		s.editor.Reset()
+	}
+	if s.termRestore != nil {
+		s.termRestore()
+		s.termRestore = nil
+	}
+	cmd := exec.Command(editorName, path)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		if s.termFd != 0 {
+			if restore, errRaw := makeRaw(s.termFd); errRaw == nil {
+				s.termRestore = restore
+			}
+		}
+		s.errorf("%v", err)
+		return
+	}
+	if s.termFd != 0 {
+		if restore, errRaw := makeRaw(s.termFd); errRaw == nil {
+			s.termRestore = restore
+		}
+	}
+	if s.editor != nil {
+		s.editor.DrawPrompt()
+	}
+	s.printf("[CRL] Édition terminée : %s\n", path)
+}
+
+func (s *Shell) cmdEdit(rest string) {
+	path := strings.TrimSpace(rest)
+	if path == "" {
+		s.errorf("usage : crl.edit <fichier>")
+		return
+	}
+	editor := resolveEditor()
+	if editor == "" {
+		s.errorf("aucun éditeur disponible : définissez $VISUAL ou $EDITOR, ou installez nano/neovim")
+		return
+	}
+	s.openExternalEditor(path, editor)
+}
+
+func (s *Shell) cmdNvim(rest string) {
+	if !s.interactive {
+		s.errorf("crl.nvim uniquement en mode terminal interactif")
+		return
+	}
+	path := strings.TrimSpace(rest)
+	if path == "" {
+		s.errorf("usage : crl.nvim <fichier>")
+		return
+	}
+	if _, err := exec.LookPath("nvim"); err != nil {
+		s.errorf("neovim non disponible")
+		return
+	}
+	if s.editor != nil {
+		s.editor.Reset()
+	}
+	s.openExternalEditor(path, "nvim")
+}
+
+func (s *Shell) cmdRm(rest string) {
+	force := false
+	target := ""
+	for _, arg := range strings.Fields(rest) {
+		switch arg {
+		case "--yes", "-y":
+			force = true
+		default:
+			if target != "" {
+				s.errorf("usage : crl.rm <fichier> [--yes|-y]")
+				return
+			}
+			target = arg
+		}
+	}
+	if target == "" {
+		s.errorf("usage : crl.rm <fichier> [--yes|-y]")
+		return
+	}
+	if !force {
+		if s.scriptMode || s.jsonMode {
+			s.errorf("suppression refusée : utilisez crl.rm <fichier> --yes en mode script")
+			return
+		}
+		question := fmt.Sprintf("[CRL] Supprimer le fichier %q ?", target)
+		if !s.confirm(question) {
+			s.printf("[CRL] Suppression annulée.\n")
+			return
+		}
+	}
+	if err := os.Remove(target); err != nil {
+		s.errorf("%v", err)
+		return
+	}
+	s.printf("[CRL] Fichier supprimé : %s\n", target)
+}
+
+func (s *Shell) cmdRmdir(rest string) {
+	force := false
+	recursive := false
+	target := ""
+	for _, arg := range strings.Fields(rest) {
+		switch arg {
+		case "--yes", "-y":
+			force = true
+		case "--recursive", "-r", "-R":
+			recursive = true
+		default:
+			if target != "" {
+				s.errorf("usage : crl.rmdir <dossier> [--recursive] [--yes|-y]")
+				return
+			}
+			target = arg
+		}
+	}
+	if target == "" {
+		s.errorf("usage : crl.rmdir <dossier> [--recursive] [--yes|-y]")
+		return
+	}
+	if !force {
+		if s.scriptMode || s.jsonMode {
+			s.errorf("suppression refusée : utilisez crl.rmdir <dossier> --yes en mode script")
+			return
+		}
+		question := fmt.Sprintf("[CRL] Supprimer le dossier %q ?", target)
+		if !s.confirm(question) {
+			s.printf("[CRL] Suppression annulée.\n")
+			return
+		}
+	}
+	var err error
+	if recursive {
+		err = os.RemoveAll(target)
+	} else {
+		err = os.Remove(target)
+	}
+	if err != nil {
+		s.errorf("%v", err)
+		return
+	}
+	if recursive {
+		s.printf("[CRL] Dossier supprimé (récursif) : %s\n", target)
+	} else {
+		s.printf("[CRL] Dossier supprimé : %s\n", target)
+	}
+}
+
+// resolveEditor retourne l'éditeur à utiliser : $VISUAL, puis $EDITOR, puis
+// neovim ou nano selon leur disponibilité.
+func resolveEditor() string {
+	if v := strings.TrimSpace(os.Getenv("VISUAL")); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(os.Getenv("EDITOR")); v != "" {
+		return v
+	}
+	if _, err := exec.LookPath("nvim"); err == nil {
+		return "nvim"
+	}
+	if _, err := exec.LookPath("nano"); err == nil {
+		return "nano"
+	}
+	return ""
 }

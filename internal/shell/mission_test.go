@@ -927,3 +927,502 @@ func TestHeadersBodyAssociated(t *testing.T) {
 		t.Fatal("formulaire multipart absent")
 	}
 }
+
+// Test 13: mint.request.show affiche la structure multipart d'une capture.
+func TestMintRequestShowMultipart(t *testing.T) {
+	sh, out, _, hist, _ := newTestShell(t, "")
+	body := []byte("------b123\r\nContent-Disposition: form-data; name=\"username\"\r\n\r\nadmin\r\n------b123\r\nContent-Disposition: form-data; name=\"avatar\"; filename=\"a.png\"\r\nContent-Type: image/png\r\n\r\n\x89PNG\r\n------b123--\r\n")
+	hist.AddRequest(mint.BridgeEvent{
+		Type: "request", FlowID: "mp", Method: "POST",
+		URL:     "http://example.test/upload",
+		Headers: []mint.Header{{Name: "Content-Type", Value: "multipart/form-data; boundary=----b123"}},
+		Body:    body, BodySize: int64(len(body)),
+	})
+	if exit := sh.Execute("mint.request.show 1"); exit {
+		t.Fatal("mint.request.show a quitté le shell")
+	}
+	text := out.String()
+	for _, want := range []string{"FORMULAIRE MULTIPART", "boundary=----b123", "username = admin", "avatar = a.png (fichier", "image/png"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("mint.request.show multipart manquant %q:\n%s", want, text)
+		}
+	}
+}
+
+// Test 14: crl.show affiche le boundary et les parties multipart d'une capture.
+func TestCrlShowMultipartBoundary(t *testing.T) {
+	sh, out, _, hist, _ := newTestShell(t, "")
+	body := []byte("------b123\r\nContent-Disposition: form-data; name=\"username\"\r\n\r\nadmin\r\n------b123--\r\n")
+	hist.AddRequest(mint.BridgeEvent{
+		Type: "request", FlowID: "mp", Method: "POST",
+		URL:     "http://example.test/upload",
+		Headers: []mint.Header{{Name: "Content-Type", Value: "multipart/form-data; boundary=----b123"}},
+		Body:    body, BodySize: int64(len(body)),
+	})
+	if exit := sh.Execute("crl.show 1"); exit {
+		t.Fatal("crl.show a quitté le shell")
+	}
+	text := out.String()
+	for _, want := range []string{"Boundary", "----b123", "FORMULAIRE MULTIPART", "username = admin"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("crl.show multipart manquant %q:\n%s", want, text)
+		}
+	}
+}
+
+// Test 13: JSON → YAML → JSON roundtrip sur le constructeur actif.
+func TestBodyFormatJSONYAMLJSON(t *testing.T) {
+	sh, _, _, _, builder := newTestShell(t, "")
+	if exit := sh.Execute(`crl.body {"name": "admin", "role": "administrator", "active": true, "count": 3}`); exit {
+		t.Fatal("crl.body a quitté le shell")
+	}
+	if exit := sh.Execute("crl.body format yaml"); exit {
+		t.Fatal("crl.body format yaml a quitté le shell")
+	}
+	if builder.ContentType() != "application/yaml" {
+		t.Fatalf("Content-Type attendu application/yaml, obtenu %q", builder.ContentType())
+	}
+	if exit := sh.Execute("crl.body format json"); exit {
+		t.Fatal("crl.body format json a quitté le shell")
+	}
+	if builder.ContentType() != "application/json" {
+		t.Fatalf("Content-Type attendu application/json, obtenu %q", builder.ContentType())
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(builder.Body(), &decoded); err != nil {
+		t.Fatalf("corps invalide après JSON→YAML→JSON: %v", err)
+	}
+	if decoded["name"] != "admin" || decoded["role"] != "administrator" || decoded["active"] != true || decoded["count"] != float64(3) {
+		t.Fatalf("valeurs altérées après roundtrip: %#v", decoded)
+	}
+}
+
+// Test 14: JSON → XML → JSON roundtrip sur le constructeur actif.
+func TestBodyFormatJSONXMLJSON(t *testing.T) {
+	sh, _, _, _, builder := newTestShell(t, "")
+	if exit := sh.Execute(`crl.body {"user": "alice", "n": 7}`); exit {
+		t.Fatal("crl.body a quitté le shell")
+	}
+	if exit := sh.Execute("crl.body format xml"); exit {
+		t.Fatal("crl.body format xml a quitté le shell")
+	}
+	if builder.ContentType() != "application/xml" {
+		t.Fatalf("Content-Type attendu application/xml, obtenu %q", builder.ContentType())
+	}
+	if exit := sh.Execute("crl.body format json"); exit {
+		t.Fatal("crl.body format json a quitté le shell")
+	}
+	if builder.ContentType() != "application/json" {
+		t.Fatalf("Content-Type attendu application/json, obtenu %q", builder.ContentType())
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(builder.Body(), &decoded); err != nil {
+		t.Fatalf("corps invalide après JSON→XML→JSON: %v", err)
+	}
+	root, _ := decoded["root"].(map[string]any)
+	if root["user"] != "alice" || root["n"] != float64(7) {
+		t.Fatalf("valeurs altérées après JSON→XML→JSON: %#v", decoded)
+	}
+}
+
+// Test 15: YAML → JSON et XML → JSON sur le constructeur actif.
+func TestBodyFormatYAMLXMLToJSON(t *testing.T) {
+	sh, _, _, _, builder := newTestShell(t, "")
+	if exit := sh.Execute(`crl.body format json`); exit {
+		t.Fatal("crl.body format json a quitté le shell")
+	}
+	// YAML source (non-JSON) → JSON.
+	if exit := sh.Execute(`crl.body "key: valeur
+liste:
+  - a
+  - b"`); exit {
+		t.Fatal("crl.body YAML a quitté le shell")
+	}
+	if exit := sh.Execute("crl.body format json"); exit {
+		t.Fatal("crl.body format json a quitté le shell")
+	}
+	if builder.ContentType() != "application/json" {
+		t.Fatalf("Content-Type attendu application/json, obtenu %q", builder.ContentType())
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(builder.Body(), &decoded); err != nil {
+		t.Fatalf("YAML→JSON invalide: %v", err)
+	}
+	if decoded["key"] != "valeur" {
+		t.Fatalf("YAML→JSON valeur incorrecte: %#v", decoded)
+	}
+}
+
+// Test 16: JSON → multipart → JSON avec plusieurs champs et un fichier.
+func TestBodyFormatJSONMultipartJSON(t *testing.T) {
+	sh, _, _, _, builder := newTestShell(t, "")
+	if exit := sh.Execute(`crl.body {"username": "admin", "role": "admin"}`); exit {
+		t.Fatal("crl.body a quitté le shell")
+	}
+	if exit := sh.Execute("crl.body format multipart"); exit {
+		t.Fatal("crl.body format multipart a quitté le shell")
+	}
+	if builder.ContentType() == "" || !strings.HasPrefix(builder.ContentType(), "multipart/form-data") {
+		t.Fatalf("Content-Type multipart attendu, obtenu %q", builder.ContentType())
+	}
+	parts := builder.FormParts()
+	if len(parts) != 2 {
+		t.Fatalf("attendu 2 parties multipart, obtenu %d", len(parts))
+	}
+	if exit := sh.Execute("crl.body format json"); exit {
+		t.Fatal("crl.body format json a quitté le shell")
+	}
+	if builder.ContentType() != "application/json" {
+		t.Fatalf("Content-Type attendu application/json, obtenu %q", builder.ContentType())
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(builder.Body(), &decoded); err != nil {
+		t.Fatalf("multipart→JSON invalide: %v", err)
+	}
+	if decoded["username"] != "admin" || decoded["role"] != "admin" {
+		t.Fatalf("multipart→JSON valeurs incorrectes: %#v", decoded)
+	}
+}
+
+// Test 17: Multipart avec champs répétés et fichiers (noms et MIME préservés).
+func TestBodyFormatMultipartFieldsAndFiles(t *testing.T) {
+	sh, _, _, _, builder := newTestShell(t, "")
+	if exit := sh.Execute(`crl.form add username admin`); exit {
+		t.Fatal("crl.form add a quitté le shell")
+	}
+	if exit := sh.Execute(`crl.form add username operateur`); exit {
+		t.Fatal("crl.form add username répété a quitté le shell")
+	}
+	binary := []byte{0x00, 0x01, 0x02, 0xff}
+	tmp := filepath.Join(t.TempDir(), "bin.dat")
+	if err := os.WriteFile(tmp, binary, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if exit := sh.Execute(fmt.Sprintf(`crl.form add upload @%s application/octet-stream`, tmp)); exit {
+		t.Fatal("crl.form add file a quitté le shell")
+	}
+	parts := builder.FormParts()
+	if len(parts) != 3 {
+		t.Fatalf("attendu 3 parties, obtenu %d", len(parts))
+	}
+	// Vérifier le fichier préservé.
+	foundFile := false
+	for _, p := range parts {
+		if p.IsFile && p.FileName == "bin.dat" && p.ContentType == "application/octet-stream" {
+			if !bytes.Equal(p.Data, binary) {
+				t.Fatalf("données fichier altérées: %q", p.Data)
+			}
+			foundFile = true
+		}
+	}
+	if !foundFile {
+		t.Fatal("fichier multipart absent ou altéré")
+	}
+	if exit := sh.Execute("crl.body format json"); exit {
+		t.Fatal("crl.body format json a quitté le shell")
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(builder.Body(), &decoded); err != nil {
+		t.Fatalf("multipart avec fichier→JSON invalide: %v", err)
+	}
+	// Le fichier est représenté de manière réversible (base64 + métadonnées).
+	fileInfo, ok := decoded["upload"].(map[string]any)
+	if !ok {
+		t.Fatalf("fichier non représenté: %#v", decoded)
+	}
+	if fileInfo["filename"] != "bin.dat" || fileInfo["content_type"] != "application/octet-stream" {
+		t.Fatalf("métadonnées fichier altérées: %#v", fileInfo)
+	}
+	// Les champs répétés forment un tableau.
+	usernames, ok := decoded["username"].([]any)
+	if !ok || len(usernames) != 2 {
+		t.Fatalf("champs répétés non préservés: %#v", decoded["username"])
+	}
+}
+
+// Test 18: Conversion ciblant une capture précise sans toucher aux autres.
+func TestBodyFormatTargetSingleCapture(t *testing.T) {
+	sh, _, _, hist, _ := newTestShell(t, "")
+	addPlainCaptures(t, hist, 13)
+	jsonBody := `{"target": true}`
+	hist.AddRequest(mint.BridgeEvent{
+		Type: "request", FlowID: "t1", Method: "POST",
+		URL:     "http://example.test/a",
+		Headers: []mint.Header{{Name: "Content-Type", Value: "application/json"}},
+		Body:    []byte(jsonBody), BodySize: int64(len(jsonBody)),
+	})
+	hist.AddRequest(mint.BridgeEvent{
+		Type: "request", FlowID: "t2", Method: "POST",
+		URL:     "http://example.test/b",
+		Headers: []mint.Header{{Name: "Content-Type", Value: "application/json"}},
+		Body:    []byte(`{"other": true}`), BodySize: 14,
+	})
+	if exit := sh.Execute("crl.body set 14 format yaml"); exit {
+		t.Fatal("crl.body set 14 format yaml a quitté le shell")
+	}
+	c14, _ := hist.Get(14)
+	c15, _ := hist.Get(15)
+	if !strings.Contains(string(c14.Request.Body), "target:") {
+		t.Fatalf("capture 14 non convertie en YAML: %q", string(c14.Request.Body))
+	}
+	if c15.Request.Body == nil || string(c15.Request.Body) != `{"other": true}` {
+		t.Fatalf("capture 15 modifiée à tort: %q", string(c15.Request.Body))
+	}
+	if c14.Request.Headers == nil || !hasHeaderContentType(c14, "application/yaml") {
+		t.Fatalf("Content-Type capture 14 non mis à jour: %#v", c14.Request.Headers)
+	}
+}
+
+func hasHeaderContentType(c mint.Capture, ct string) bool {
+	for _, h := range c.Request.Headers {
+		if strings.EqualFold(h.Name, "Content-Type") && h.Value == ct {
+			return true
+		}
+	}
+	return false
+}
+
+// Test 19: Conversion refusée en cas de perte (fichier vers form-urlencoded), body original conservé.
+func TestBodyFormatRefusesLossy(t *testing.T) {
+	sh, _, _, _, builder := newTestShell(t, "")
+	binary := []byte{0xde, 0xad, 0xbe, 0xef}
+	tmp := filepath.Join(t.TempDir(), "bin.dat")
+	if err := os.WriteFile(tmp, binary, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if exit := sh.Execute(fmt.Sprintf(`crl.form add upload @%s application/octet-stream`, tmp)); exit {
+		t.Fatal("crl.form add file a quitté le shell")
+	}
+	if exit := sh.Execute("crl.body format form"); exit {
+		t.Fatal("crl.body format form a quitté le shell (devrait échouer ou conserver)")
+	}
+	// La conversion multipart→form avec fichier doit être refusée : le body original
+	// (multipart) doit être conservé et le formulaire inchangé.
+	if !builder.HasForm() || len(builder.FormParts()) == 0 {
+		t.Fatalf("formulaire multipart perdu alors que conversion refusée: %q", builder.ContentType())
+	}
+}
+
+// Test 20: Transmission réelle du nouveau Content-Type et body à un serveur HTTP local.
+func TestBodyFormatTransmittedToServer(t *testing.T) {
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skip("curl absent")
+	}
+	sh, _, _, _, _ := newTestShell(t, "")
+	var received []byte
+	var receivedCT string
+	srv := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedCT = r.Header.Get("Content-Type")
+		received, _ = io.ReadAll(r.Body)
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+	if exit := sh.Execute(fmt.Sprintf("crl.host %s/submit", srv.URL)); exit {
+		t.Fatal("crl.host a quitté le shell")
+	}
+	if exit := sh.Execute("crl.method POST"); exit {
+		t.Fatal("crl.method a quitté le shell")
+	}
+	if exit := sh.Execute(`crl.body {"champ": "valeur avec espaces & spéciaux"}`); exit {
+		t.Fatal("crl.body a quitté le shell")
+	}
+	if exit := sh.Execute("crl.body format form"); exit {
+		t.Fatal("crl.body format form a quitté le shell")
+	}
+	if exit := sh.Execute("crl.launch"); exit {
+		t.Fatal("crl.launch a quitté le shell")
+	}
+	time.Sleep(300 * time.Millisecond)
+	if receivedCT != "application/x-www-form-urlencoded" {
+		t.Fatalf("Content-Type transmis incorrect: %q", receivedCT)
+	}
+	if !strings.Contains(string(received), "champ=") {
+		t.Fatalf("body form-urlencoded absent: %q", string(received))
+	}
+}
+
+// Test 21: crl.ls affiche les fichiers et dossiers avec type et taille.
+func TestFileLs(t *testing.T) {
+	sh, out, _, _, _ := newTestShell(t, "")
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "sous"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "fichier.txt"), []byte("hello"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if exit := sh.Execute("crl.ls " + dir); exit {
+		t.Fatal("crl.ls a quitté le shell")
+	}
+	text := out.String()
+	if !strings.Contains(text, "sous") || !strings.Contains(text, "fichier.txt") {
+		t.Fatalf("crl.ls ne liste pas les entrées: %q", text)
+	}
+	if !strings.Contains(text, "dir") || !strings.Contains(text, "file") {
+		t.Fatalf("crl.ls n'affiche pas le type: %q", text)
+	}
+	if !strings.Contains(text, "octets") {
+		t.Fatalf("crl.ls n'affiche pas la taille: %q", text)
+	}
+}
+
+// Test 22: crl.mkdir crée un dossier, crl.touch crée un fichier.
+func TestFileMkdirTouch(t *testing.T) {
+	sh, out, _, _, _ := newTestShell(t, "")
+	root := t.TempDir()
+	sub := filepath.Join(root, "a", "b")
+	if exit := sh.Execute("crl.mkdir " + sub); exit {
+		t.Fatal("crl.mkdir a quitté le shell")
+	}
+	if _, err := os.Stat(sub); os.IsNotExist(err) {
+		t.Fatal("dossier imbriqué non créé par crl.mkdir")
+	}
+	f := filepath.Join(root, "note.crl")
+	if exit := sh.Execute("crl.touch " + f); exit {
+		t.Fatal("crl.touch a quitté le shell")
+	}
+	if _, err := os.Stat(f); os.IsNotExist(err) {
+		t.Fatal("fichier non créé par crl.touch")
+	}
+	text := out.String()
+	if !strings.Contains(text, "Répertoire créé") || !strings.Contains(text, "Fichier créé/actualisé") {
+		t.Fatalf("sortie inattendue: %q", text)
+	}
+}
+
+// Test 23: crl.rm supprime un fichier (--yes requis en non interactif).
+func TestFileRm(t *testing.T) {
+	sh, _, _, _, _ := newTestShell(t, "")
+	root := t.TempDir()
+	f := filepath.Join(root, "a.txt")
+	if err := os.WriteFile(f, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Sans --yes en non interactif, la suppression est refusée.
+	if exit := sh.Execute("crl.rm " + f); exit {
+		t.Fatal("crl.rm a quitté le shell")
+	}
+	if _, err := os.Stat(f); os.IsNotExist(err) {
+		t.Fatal("fichier supprimé sans --yes")
+	}
+	// Avec --yes, le fichier est supprimé.
+	if exit := sh.Execute("crl.rm " + f + " --yes"); exit {
+		t.Fatal("crl.rm --yes a quitté le shell")
+	}
+	if _, err := os.Stat(f); !os.IsNotExist(err) {
+		t.Fatal("fichier non supprimé par crl.rm --yes")
+	}
+}
+
+// Test 24: crl.rmdir supprime un dossier vide, refuse un dossier non vide sans --recursive.
+func TestFileRmdir(t *testing.T) {
+	sh, _, _, _, _ := newTestShell(t, "")
+	root := t.TempDir()
+	empty := filepath.Join(root, "vide")
+	nonempty := filepath.Join(root, "plein")
+	if err := os.MkdirAll(empty, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(nonempty, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nonempty, "f.txt"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if exit := sh.Execute("crl.rmdir " + empty + " --yes"); exit {
+		t.Fatal("crl.rmdir --yes a quitté le shell")
+	}
+	if _, err := os.Stat(empty); !os.IsNotExist(err) {
+		t.Fatal("dossier vide non supprimé par crl.rmdir")
+	}
+	// Dossier non vide refusé sans --recursive.
+	if exit := sh.Execute("crl.rmdir " + nonempty + " --yes"); exit {
+		t.Fatal("crl.rmdir --yes a quitté le shell")
+	}
+	if _, err := os.Stat(nonempty); os.IsNotExist(err) {
+		t.Fatal("dossier non vide supprimé sans --recursive")
+	}
+	// Avec --recursive, le dossier non vide est supprimé.
+	if exit := sh.Execute("crl.rmdir --recursive " + nonempty + " --yes"); exit {
+		t.Fatal("crl.rmdir --recursive --yes a quitté le shell")
+	}
+	if _, err := os.Stat(nonempty); !os.IsNotExist(err) {
+		t.Fatal("dossier non vide non supprimé par crl.rmdir --recursive")
+	}
+}
+
+// Test 25: crl.edit utilise $EDITOR et préserve le contenu.
+func TestFileEdit(t *testing.T) {
+	sh, out, _, _, _ := newTestShell(t, "")
+	dir := t.TempDir()
+	fakeEditor := filepath.Join(dir, "ed.sh")
+	if err := os.WriteFile(fakeEditor, []byte("#!/bin/sh\nprintf 'modifie-par-editeur' > \"$1\"\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	oldPath := os.Getenv("PATH")
+	os.Setenv("PATH", dir+string(os.PathListSeparator)+oldPath)
+	defer os.Setenv("PATH", oldPath)
+	os.Setenv("EDITOR", "ed.sh")
+	defer os.Unsetenv("EDITOR")
+
+	target := filepath.Join(t.TempDir(), "note.txt")
+	if err := os.WriteFile(target, []byte("original"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if exit := sh.Execute("crl.edit " + target); exit {
+		t.Fatal("crl.edit a quitté le shell")
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("fichier cible non écrit: %v", err)
+	}
+	if string(data) != "modifie-par-editeur" {
+		t.Fatalf("contenu non préservé/modifié: %q", string(data))
+	}
+	text := out.String()
+	if !strings.Contains(text, "Édition terminée") {
+		t.Fatalf("crl.edit n'a pas signalé la fin: %q", text)
+	}
+}
+
+// Test 26: crl.edit sans éditeur disponible retourne une erreur explicite.
+func TestFileEditNoEditor(t *testing.T) {
+	sh, _, _, _, _ := newTestShell(t, "")
+	os.Unsetenv("VISUAL")
+	os.Unsetenv("EDITOR")
+	defer os.Unsetenv("VISUAL")
+	defer os.Unsetenv("EDITOR")
+	target := filepath.Join(t.TempDir(), "x.txt")
+	if err := os.WriteFile(target, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if exit := sh.Execute("crl.edit " + target); exit {
+		t.Fatal("crl.edit a quitté le shell")
+	}
+	if !sh.lastFailed {
+		t.Fatal("crl.edit devrait échouer sans éditeur")
+	}
+}
+
+// Test 27: crl.script --script exécute un fichier .crl créé depuis CRL.
+func TestFileScriptExecution(t *testing.T) {
+	sh, _, _, _, builder := newTestShell(t, "")
+	root := t.TempDir()
+	scriptsDir := filepath.Join(root, "scripts", "vampi")
+	if exit := sh.Execute("crl.mkdir " + scriptsDir); exit {
+		t.Fatal("crl.mkdir a quitté le shell")
+	}
+	auth := filepath.Join(scriptsDir, "auth.crl")
+	if exit := sh.Execute("crl.touch " + auth); exit {
+		t.Fatal("crl.touch a quitté le shell")
+	}
+	if err := os.WriteFile(auth, []byte("crl.host http://example.test/\ncrl.method GET\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if exit := sh.Execute("crl.script --script " + auth); exit {
+		t.Fatal("crl.script --script a quitté le shell")
+	}
+	if builder.URL() != "http://example.test/" || builder.Method() != "GET" {
+		t.Fatalf("script non exécuté: url=%q method=%q", builder.URL(), builder.Method())
+	}
+}
